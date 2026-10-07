@@ -703,7 +703,7 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
  * so 1.5 means the colored picture is practically indistinguishable from the photo.
  * Lower = more colors. Measured on real photos, 1.5 gives roughly 80-480 colors depending on detail.
  */
-export const AUTO_COLOR_TARGET = 1.5;
+export const AUTO_COLOR_TARGET = 1.3;
 
 /**
  * Smallest color count whose average error is at most AUTO_COLOR_TARGET, +15% headroom.
