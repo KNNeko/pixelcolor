@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+    <meta name="theme-color" content="#f3f1ff" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon-192.png" />
+    <title>Pixel Color</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- Library -->
+    <section class="screen on" id="screen-home">
+      <header>
+        <b>Pixel Color</b>
+        <button class="icon-btn" id="btn-settings" data-ic="set"></button>
+      </header>
+      <div class="view">
+        <div id="library-bar">
+          <input type="text" id="library-search" />
+          <select id="library-sort"></select>
+          <button class="icon-btn" id="btn-new-folder" data-ic="folderPlus"></button>
+        </div>
+        <div id="folder-crumb"></div>
+        <div id="library-grid"></div>
+        <div id="library-empty" class="hero" hidden>
+          <img src="icon-192.png" alt="" />
+          <h2 data-i="hero"></h2>
+        </div>
+      </div>
+      <label class="fab"
+        ><input id="file-input" type="file" accept="image/*" hidden /><span data-ic="plus"></span
+      ></label>
+    </section>
+
+    <!-- Settings -->
+    <section class="screen" id="screen-settings">
+      <header>
+        <button class="icon-btn" id="settings-back" data-ic="back"></button>
+        <b data-i="sets"></b>
+        <span class="header-spacer"></span>
+      </header>
+      <div class="view" id="settings-list"></div>
+    </section>
+
+    <!-- New canvas wizard -->
+    <section class="screen" id="screen-wizard">
+      <header>
+        <button class="icon-btn" id="wiz-back"></button>
+        <b id="wiz-title"></b>
+        <button class="icon-btn" id="wiz-undo"></button>
+        <button class="icon-btn primary" id="wiz-next"></button>
+      </header>
+      <div id="wiz-main">
+        <div id="wiz-stage">
+          <canvas id="crop-canvas"></canvas>
+          <canvas id="adjust-canvas" hidden></canvas>
+          <div id="preview-wrap" hidden>
+            <canvas id="preview-canvas"></canvas>
+            <div id="preview-info"></div>
+            <button class="chip" id="preview-gray"></button>
+            <button class="chip" id="preview-fit" data-i="e_fit" hidden></button>
+          </div>
+        </div>
+        <div id="wiz-panel">
+          <div class="panel" id="panel-crop"></div>
+          <div class="panel" id="panel-adjust" hidden></div>
+          <div class="panel" id="panel-pixel" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Coloring -->
+    <section class="screen" id="screen-play">
+      <div id="play-wrap">
+        <canvas id="play-canvas"></canvas>
+        <div id="play-top">
+          <button class="icon-btn" id="play-back" data-ic="back"></button>
+          <i></i>
+          <span id="play-progress">0%</span>
+          <i></i>
+          <button class="icon-btn" id="play-panel-toggle" data-ic="panel"></button>
+          <button class="icon-btn" id="play-more" data-ic="more"></button>
+        </div>
+        <div id="part-chips"></div>
+        <canvas id="minimap" width="84" height="84"></canvas>
+      </div>
+      <div id="play-dock">
+        <div id="toolbar"></div>
+        <div id="split-bar" hidden></div>
+        <div id="palette"></div>
+      </div>
+    </section>
+
+    <!-- Overlays -->
+    <div class="overlay" id="modal" hidden></div>
+    <div class="overlay" id="busy" hidden>
+      <div class="sheet"><b id="busy-text"></b></div>
+    </div>
+    <div class="overlay" id="timelapse" hidden>
+      <div class="sheet">
+        <b data-i="tlapse"></b>
+        <canvas id="timelapse-canvas"></canvas>
+        <div class="field">
+          <span data-i="secs"></span><b id="tl-duration-value">20</b>
+          <div class="range" id="tl-duration" data-min="5" data-max="120" data-v="20" data-step="1"></div>
+        </div>
+        <div class="chips">
+          <button class="chip" id="tl-preview" data-i="prev"></button>
+          <button class="chip" id="tl-video" data-i="vid"></button>
+          <button class="chip" id="tl-gif" data-i="gif"></button>
+          <button class="chip" id="tl-close" data-i="close"></button>
+        </div>
+      </div>
+    </div>
+    <div id="toast"></div>
+
+    <script type="module" src="js/main.js"></script>
+  </body>
+</html>

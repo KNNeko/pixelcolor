@@ -1,0 +1,9 @@
+{
+  "name": "pixel-color",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "format": "prettier --write --print-width 120 \"js/**/*.js\" \"tests/**/*.js\" sw.js style.css index.html"
+  }
+}
