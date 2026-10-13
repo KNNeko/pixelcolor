@@ -24,10 +24,11 @@ import {
   deleteCanvas,
   setFolder,
   deleteFolderEntry,
+  getSource,
 } from "./storage.js";
+import { startWizard } from "./wizard.js";
 import { renderThumbnails } from "./render.js";
 import { openGame } from "./game.js";
-import { startSplitMode } from "./parts.js";
 import { openTimelapse } from "./timelapse.js";
 import { openPngExport } from "./export-png.js";
 
@@ -205,7 +206,9 @@ async function openCanvasMenu(entry) {
       `<div class="actions">` +
       actionButton("play", "cont", "act-continue") +
       actionButton("film", "tlapse", "act-timelapse") +
-      actionButton("split", "split", "act-split") +
+      (entry.hasSource
+        ? actionButton("rot", "recreate", "act-recreate") + actionButton("plus", "copyp", "act-copy")
+        : "") +
       actionButton("image", "png", "act-png") +
       actionButton("pen", "ren", "act-rename") +
       actionButton("reset", "reset", "act-reset") +
@@ -230,11 +233,17 @@ async function openCanvasMenu(entry) {
     await openStored(entry.id);
     openTimelapse();
   };
-  sheet.querySelector("#act-split").onclick = async () => {
+  /** Reopens the stored photo in the wizard with this canvas's settings. */
+  const reopen = async (replace) => {
     closeSheet();
-    await openStored(entry.id);
-    startSplitMode();
+    const src = await getSource(entry.id);
+    if (!src) return toast(t("err"));
+    startWizard(src.image, { state: src.state, replaceId: replace ? entry.id : null, folderId: entry.folderId });
   };
+  if (entry.hasSource) {
+    sheet.querySelector("#act-recreate").onclick = () => confirmDialog(t("recq"), () => reopen(true));
+    sheet.querySelector("#act-copy").onclick = () => reopen(false);
+  }
   sheet.querySelector("#act-png").onclick = async () => {
     const { canvas, events } = await loadCanvas(entry.id);
     openPngExport(canvas, paintFromEvents(canvas, events));

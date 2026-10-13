@@ -96,6 +96,7 @@ svg.icon {
 section.screen {
   position: absolute;
   inset: 0;
+  overflow: hidden; /* never let scrollIntoView shift a whole screen */
   display: none;
   flex-direction: column;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -520,6 +521,49 @@ header b {
   touch-action: none;
   overflow: hidden;
 }
+/* before/after: the original photo is shown left of the divider */
+#compare-clip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+#wiz-stage #original-canvas {
+  object-fit: contain;
+}
+#compare-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: #fff;
+  box-shadow: 0 0 4px #0008;
+  pointer-events: none;
+}
+#compare-knob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 40px;
+  height: 40px;
+  margin: -20px 0 0 -20px;
+  border-radius: 50%;
+  border: 0;
+  background: #fff;
+  box-shadow: 0 1px 6px #0006;
+  pointer-events: auto;
+  touch-action: none;
+}
+#compare-knob:before {
+  content: "‹ ›";
+  color: #25214a;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 2px;
+}
 #preview-info {
   position: absolute;
   left: 10px;
@@ -578,14 +622,23 @@ header b {
 }
 #palette-strip span {
   flex: none;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  font-size: 10px;
+  min-width: 38px;
+  height: 38px;
+  padding: 0 3px;
+  border-radius: 10px;
+  font-size: 11px;
   font-weight: 700;
+  line-height: 1.1;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+}
+#palette-strip span i {
+  font-style: normal;
+  font-size: 9px;
+  font-weight: 600;
+  opacity: 0.85;
 }
 #style-list {
   max-height: 250px;
@@ -854,6 +907,7 @@ header b {
   padding-bottom: calc(18px + env(safe-area-inset-bottom));
 }
 #busy {
+  z-index: 15; /* above the time-lapse window, which comes later in the page */
   align-items: center;
 }
 #busy .sheet {
@@ -903,9 +957,13 @@ header b {
   font-size: 24px;
   font-weight: 700;
 }
+#timelapse .sheet {
+  max-height: 96%;
+}
 #timelapse .sheet canvas {
   width: 100%;
-  max-height: 40vh;
+  height: 64vh;
+  max-height: 64vh;
   object-fit: contain;
   image-rendering: pixelated;
   background: var(--field);

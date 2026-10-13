@@ -1,13 +1,15 @@
 // Palette ordering for the color picker. Pure functions (tested in tests/colorsort.test.js).
 //
-// "By color" = color families in rainbow order, each one running from dark to light:
-//   red (dark red -> pink), orange/brown (brown -> tan), yellow, green, teal, blue, purple, magenta,
-//   and finally pure grays.
+// "By color" = one continuous strip through the color families in rainbow order:
+//   dark red -> light red -> (darkening) -> dark orange... -> light yellow -> ... and so on around the circle.
 // 1. Every color gets a hue angle in OKLCH (a hue scale where equal steps look equally different);
-//    the angle decides the family. Grayish colors keep their slight tint, so a beige gray stays with the browns.
+//    the angle decides the family (red, orange/brown, yellow, green, teal, blue, purple, magenta, then pure grays).
+//    Grayish colors keep their slight tint, so a beige gray stays with the browns.
 // 2. Each family is split by saturation into rows (vivid / medium / muted), so peach and beige-gray don't alternate.
 // 3. Inside a row the order is the shortest path from its darkest to its lightest color (OKLab distance),
-//    so it still goes dark -> light, but neighbouring colors are as similar as possible (no speckles).
+//    so neighbouring colors are as similar as possible.
+// 4. Rows alternate direction (snake): up in lightness, then down, then up..., so each row starts
+//    where the previous one ended (light next to light, dark next to dark).
 
 /** OKLCH chroma below which a color counts as pure gray (no usable hue). */
 const GRAY_CHROMA = 0.015;
@@ -146,6 +148,8 @@ export function paletteOrder(pal, mode, counts) {
   const K = pal.length / 3;
   const order = [...Array(K).keys()];
   if (mode === "cnt") return order.sort((i, j) => counts[j] - counts[i] || i - j);
-  if (mode === "col") return colorFamilies(pal).flat();
+  // snake: odd rows are reversed, so the strip goes dark -> light, light -> dark, dark -> light...
+  // and every row meets the next one at the same lightness (no jump)
+  if (mode === "col") return colorFamilies(pal).flatMap((row, i) => (i % 2 ? [...row].reverse() : row));
   return order;
 }

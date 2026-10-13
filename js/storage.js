@@ -1,10 +1,12 @@
 // IndexedDB storage.
 //
-// Database "pxc3", version 2. Object stores:
+// Database "pxc3", version 3. Object stores:
 //   p   canvases  { id, fid, name, W, H, mode, pal, idx, done, parts:[{id,n}], pm }   (pixel data, rarely rewritten)
 //   m   library   { id, name, W, H, pct, done, fid, ts }  or folders { id, folder:1, name, ts }   (small, listed often)
 //   ev  events    { id, seq, cells: Int32Array, values: Uint16Array }   one record per paint action, append-only
 //   th  thumbnails{ id, main, parts:[...] }   Blob (new) or data-URL string (migrated), loaded lazily
+//   src source    { id, image: Blob (JPEG), state }   the photo + wizard settings, for "recreate" / "copy"
+//                 (not included in backups: photos are large; canvases made before v3 have none)
 //
 // Version 1 kept events inside "p" and thumbnails inside "m", so every autosave rewrote everything and
 // opening the library loaded every thumbnail. The upgrade below moves them out without losing anything.
@@ -13,11 +15,12 @@
 // them into readable names for the rest of the app.
 
 const DB_NAME = "pxc3";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const CANVASES = "p";
 const LIBRARY = "m";
 const EVENTS = "ev";
 const THUMBS = "th";
+const SOURCES = "src";
 
 const dbPromise = new Promise((resolve, reject) => {
   const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -33,6 +36,7 @@ const dbPromise = new Promise((resolve, reject) => {
       db.createObjectStore(THUMBS, { keyPath: "id" });
       if (e.oldVersion >= 1) migrateFromV1(tx);
     }
+    if (e.oldVersion < 3) db.createObjectStore(SOURCES, { keyPath: "id" });
   };
   req.onsuccess = () => resolve(req.result);
   req.onerror = () => reject(req.error);
@@ -144,8 +148,24 @@ function fromMeta(m) {
 
 /** All library entries (canvases and folders). Small records only: no pixels, no thumbnails. */
 export async function listLibrary() {
-  const all = await run([LIBRARY], "readonly", (tx) => tx.objectStore(LIBRARY).getAll());
-  return all.map(toMeta);
+  let all;
+  let withSource;
+  await run([LIBRARY, SOURCES], "readonly", (tx) => {
+    const a = tx.objectStore(LIBRARY).getAll();
+    a.onsuccess = () => (all = a.result);
+    const b = tx.objectStore(SOURCES).getAllKeys();
+    b.onsuccess = () => (withSource = new Set(b.result));
+  });
+  return all.map((rec) => ({ ...toMeta(rec), hasSource: withSource.has(rec.id) }));
+}
+
+/* ---------- source photo (for recreate / copy) ---------- */
+
+export const putSource = (id, image, state) =>
+  run([SOURCES], "readwrite", (tx) => tx.objectStore(SOURCES).put({ id, image, state }));
+
+export async function getSource(id) {
+  return (await run([SOURCES], "readonly", (tx) => tx.objectStore(SOURCES).get(id))) || null;
 }
 
 export const putLibraryEntry = (meta) =>
@@ -185,7 +205,8 @@ export async function renameCanvas(id, name) {
 }
 
 export async function deleteCanvas(id) {
-  await run([CANVASES, LIBRARY, EVENTS, THUMBS], "readwrite", (tx) => {
+  await run([CANVASES, LIBRARY, EVENTS, THUMBS, SOURCES], "readwrite", (tx) => {
+    tx.objectStore(SOURCES).delete(id);
     tx.objectStore(CANVASES).delete(id);
     tx.objectStore(LIBRARY).delete(id);
     tx.objectStore(THUMBS).delete(id);

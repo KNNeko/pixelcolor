@@ -1,11 +1,20 @@
-// Time-lapse: replays the paint event log into a picture; preview, video (MediaRecorder) or GIF.
+// Time-lapse: replays the paint event log into a picture; preview, MP4 video or GIF.
+//
+// MP4: frames are encoded with the browser's own video encoder (WebCodecs; H.264, or VP9 if there is no
+// H.264 encoder) and packed into an .mp4 file
+// by mp4-muxer (js/vendor). This works on old Chrome versions that cannot record MP4 with MediaRecorder,
+// and is faster than real time. If WebCodecs is missing, it falls back to MediaRecorder (real time, WebM).
+// GIF: at most 256 colors, so the palette is built from the canvas's own colors (exact when it has
+// 255 or fewer, otherwise reduced to the best 255 by weighted k-means) plus white for unpainted cells.
 import { $, toast, setBusy, setBusyText, download, createCanvas, yieldToBrowser } from "./ui.js";
 import { t } from "./i18n.js";
 import { game, PixelBuffer, commitStroke } from "./game.js";
+import { srgbToLab } from "./engine.js";
 
 const WHITE = 0xffffffff;
 const replay = {
   buffer: null,
+  values: null, // current value of every cell: 0 = unpainted, k + 1 = color k
   event: 0, // next event to apply
   cell: 0, // cells of that event already applied
   timeline: [0], // cumulative weight before each event
@@ -20,6 +29,7 @@ function resetReplay() {
   replay.buffer = new PixelBuffer(width, height);
   replay.buffer.pixels.fill(WHITE);
   replay.buffer.markAll();
+  replay.values = new Uint16Array(width * height);
   replay.event = 0;
   replay.cell = 0;
   replay.timeline = [0];
@@ -27,7 +37,11 @@ function resetReplay() {
 }
 
 function applyCells(e, from, to) {
-  for (let k = from; k < to; k++) replay.buffer.set(e.cells[k], e.values[k] ? game.colorPixel[e.values[k] - 1] : WHITE);
+  for (let k = from; k < to; k++) {
+    const v = e.values[k];
+    replay.values[e.cells[k]] = v;
+    replay.buffer.set(e.cells[k], v ? game.colorPixel[v - 1] : WHITE);
+  }
 }
 
 /** Advances the replay to fraction f (0..1) of the timeline. Only moves forward. */
@@ -65,6 +79,7 @@ function drawFrame(out) {
 }
 
 const durationMs = () => $("#tl-duration").value * 1000;
+const showProgress = (label, f) => setBusyText(`${label} ${Math.round(f * 100)}%`);
 
 export function openTimelapse() {
   if (!game.canvas || !game.events.length) return toast(t("empty"));
@@ -74,7 +89,7 @@ export function openTimelapse() {
   resetReplay();
   seek(1);
   const view = $("#timelapse-canvas");
-  const c = outputCanvas(480);
+  const c = outputCanvas(720);
   view.width = c.width;
   view.height = c.height;
   drawFrame(view);
@@ -101,44 +116,123 @@ $("#tl-preview").onclick = () => {
   frame();
 };
 
-$("#tl-video").onclick = async () => {
-  if (!window.MediaRecorder) return toast("MediaRecorder?");
-  replay.stopped = true;
-  const total = durationMs();
-  const out = outputCanvas(1080);
+/* ---------- video ---------- */
+
+const FPS = 30;
+const HOLD_LAST_FRAME = 0.8; // seconds the finished picture stays on screen
+
+/**
+ * First video configuration this browser can encode into MP4: H.264 (high -> main -> baseline profile),
+ * or VP9 if there is no H.264 encoder. Returns { config, muxerCodec } or null.
+ */
+async function findVideoConfig(width, height) {
+  if (!window.VideoEncoder) return null;
+  const options = [
+    ["avc1.640028", "avc"],
+    ["avc1.4d0028", "avc"],
+    ["avc1.420028", "avc"],
+    ["avc1.42001f", "avc"],
+    ["vp09.00.40.08", "vp9"],
+  ];
+  for (const [codec, muxerCodec] of options) {
+    const config = { codec, width, height, bitrate: 6e6, framerate: FPS };
+    if (muxerCodec === "avc") config.avc = { format: "avc" };
+    try {
+      if ((await VideoEncoder.isConfigSupported(config)).supported) return { config, muxerCodec };
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}
+
+async function encodeMp4(out, { config, muxerCodec }) {
+  const { Muxer, ArrayBufferTarget } = await import("./vendor/mp4-muxer.mjs");
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: muxerCodec, width: out.width, height: out.height },
+    fastStart: "in-memory",
+  });
+  let failure = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => (failure = e),
+  });
+  encoder.configure(config);
+  const moving = Math.round((durationMs() / 1000) * FPS);
+  const total = moving + Math.round(HOLD_LAST_FRAME * FPS);
+  resetReplay();
+  for (let i = 0; i < total; i++) {
+    if (failure) throw failure;
+    seek(Math.min(1, i / moving));
+    drawFrame(out);
+    const frame = new VideoFrame(out, { timestamp: Math.round((i * 1e6) / FPS), duration: Math.round(1e6 / FPS) });
+    encoder.encode(frame, { keyFrame: i % (FPS * 2) === 0 });
+    frame.close();
+    while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 5));
+    if (i % 5 === 0) {
+      showProgress(t("vid"), i / total);
+      await yieldToBrowser();
+    }
+  }
+  await encoder.flush();
+  if (failure) throw failure;
+  encoder.close();
+  muxer.finalize();
+  return new Blob([muxer.target.buffer], { type: "video/mp4" });
+}
+
+/** Fallback for browsers without WebCodecs: records the canvas in real time. */
+async function recordRealtime(out) {
+  if (!window.MediaRecorder) throw new Error("No video support in this browser");
   const mime = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm"].find((m) =>
     MediaRecorder.isTypeSupported(m),
   );
-  const recorder = new MediaRecorder(out.captureStream(30), { mimeType: mime, videoBitsPerSecond: 8e6 });
+  const recorder = new MediaRecorder(out.captureStream(FPS), { mimeType: mime, videoBitsPerSecond: 6e6 });
   const chunks = [];
   recorder.ondataavailable = (e) => chunks.push(e.data);
   const finished = new Promise((resolve) => (recorder.onstop = resolve));
-  setBusy(true, t("vid"));
   resetReplay();
   drawFrame(out);
   recorder.start();
+  const total = durationMs();
   const start = performance.now();
   await new Promise((resolve) => {
     const frame = () => {
       const f = Math.min(1, (performance.now() - start) / total);
       seek(f);
       drawFrame(out);
+      showProgress(t("vid"), f);
       if (f < 1) requestAnimationFrame(frame);
-      else setTimeout(resolve, 600); // hold the last frame a moment
+      else setTimeout(resolve, HOLD_LAST_FRAME * 1000);
     };
     frame();
   });
   recorder.stop();
   await finished;
+  return new Blob(chunks, { type: mime.split(";")[0] });
+}
+
+$("#tl-video").onclick = async () => {
+  replay.stopped = true;
+  const out = outputCanvas(1080);
+  setBusy(true, t("vid") + " 0%");
+  await yieldToBrowser();
+  try {
+    const found = await findVideoConfig(out.width, out.height);
+    const blob = found ? await encodeMp4(out, found) : await recordRealtime(out);
+    download(blob, "timelapse." + (blob.type.includes("mp4") ? "mp4" : "webm"));
+  } catch (e) {
+    toast(t("err") + ": " + (e.message || e));
+  }
   setBusy(false);
-  download(new Blob(chunks, { type: mime.split(";")[0] }), "timelapse." + (mime.includes("mp4") ? "mp4" : "webm"));
 };
 
 /* ---------- GIF ---------- */
 
 /**
  * Appends one GIF frame (graphic control + image descriptor + LZW image data) to bytes.
- * frame: Uint8Array of color indices into the global 216-color "web safe" palette. delay in 1/100 s.
+ * frame: Uint8Array of indices into the global palette. delay in 1/100 s.
  */
 function encodeGifFrame(bytes, frame, width, height, delay) {
   const word = (n) => bytes.push(n & 255, n >> 8);
@@ -202,35 +296,99 @@ function encodeGifFrame(bytes, frame, width, height, delay) {
   bytes.push(0);
 }
 
+/**
+ * GIF palette for the current canvas: 255 colors + white (index 255, unpainted cells).
+ * Returns { table: 768 RGB bytes, lut: Uint8Array mapping cell value (0 or k + 1) -> GIF index }.
+ */
+function gifPalette() {
+  const pal = game.canvas.palette;
+  const K = pal.length / 3;
+  const lut = new Uint8Array(K + 1);
+  const table = new Uint8Array(768);
+  table.set([255, 255, 255], 255 * 3);
+  lut[0] = 255;
+  if (K <= 255) {
+    table.set(pal.subarray(0, K * 3));
+    for (let k = 0; k < K; k++) lut[k + 1] = k;
+    return { table, lut };
+  }
+  // weighted k-means in Lab: colors covering many cells pull the 255 GIF colors towards themselves
+  const N = 255;
+  const lab = new Float32Array(K * 3);
+  for (let k = 0; k < K; k++) srgbToLab(pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2], lab, k * 3);
+  const weight = game.totalOfColor.map((n) => n + 1);
+  const order = [...Array(K).keys()].sort((a, b) => weight[b] - weight[a]);
+  const centers = new Float32Array(N * 3);
+  for (let c = 0; c < N; c++) centers.set(lab.subarray(order[c] * 3, order[c] * 3 + 3), c * 3);
+  const assign = new Int32Array(K);
+  const nearest = (k) => {
+    let best = 0;
+    let bestD = Infinity;
+    for (let c = 0; c < N; c++) {
+      const a = lab[k * 3] - centers[c * 3];
+      const b = lab[k * 3 + 1] - centers[c * 3 + 1];
+      const d3 = lab[k * 3 + 2] - centers[c * 3 + 2];
+      const d = a * a + b * b + d3 * d3;
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    return best;
+  };
+  for (let it = 0; it < 10; it++) {
+    for (let k = 0; k < K; k++) assign[k] = nearest(k);
+    const sum = new Float64Array(N * 4);
+    for (let k = 0; k < K; k++) {
+      const c = assign[k];
+      for (let j = 0; j < 3; j++) sum[c * 4 + j] += lab[k * 3 + j] * weight[k];
+      sum[c * 4 + 3] += weight[k];
+    }
+    for (let c = 0; c < N; c++)
+      if (sum[c * 4 + 3]) for (let j = 0; j < 3; j++) centers[c * 3 + j] = sum[c * 4 + j] / sum[c * 4 + 3];
+  }
+  // final GIF colors: weighted RGB average of the canvas colors in each group (so they stay real colors)
+  const rgb = new Float64Array(N * 4);
+  for (let k = 0; k < K; k++) {
+    const c = assign[k];
+    for (let j = 0; j < 3; j++) rgb[c * 4 + j] += pal[k * 3 + j] * weight[k];
+    rgb[c * 4 + 3] += weight[k];
+    lut[k + 1] = c;
+  }
+  for (let c = 0; c < N; c++)
+    if (rgb[c * 4 + 3]) for (let j = 0; j < 3; j++) table[c * 3 + j] = Math.round(rgb[c * 4 + j] / rgb[c * 4 + 3]);
+  return { table, lut };
+}
+
 $("#tl-gif").onclick = async () => {
   replay.stopped = true;
-  const FPS = 10;
-  const frames = $("#tl-duration").value * FPS;
-  const out = outputCanvas(480);
-  const { width: w, height: h } = out;
-  const ctx = out.getContext("2d", { willReadFrequently: true });
-  // header + logical screen + 256-entry global palette (6x6x6 color cube) + loop forever
-  const header = [71, 73, 70, 56, 57, 97, w & 255, w >> 8, h & 255, h >> 8, 0xf7, 0, 0];
-  for (let i = 0; i < 256; i++)
-    header.push(i < 216 ? ((i / 36) | 0) * 51 : 0, i < 216 ? (((i / 6) | 0) % 6) * 51 : 0, i < 216 ? (i % 6) * 51 : 0);
+  const GIF_FPS = 10;
+  const frames = $("#tl-duration").value * GIF_FPS;
+  const { width: W, height: H } = game.canvas;
+  const { width: w, height: h } = outputCanvas(480);
+  setBusy(true, "GIF 0%");
+  await yieldToBrowser();
+  const { table, lut } = gifPalette();
+  // which cell every output pixel shows (nearest cell: no blending, so colors stay exact)
+  const cellOf = new Int32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = Math.min(H - 1, Math.floor((y * H) / h)) * W;
+    for (let x = 0; x < w; x++) cellOf[y * w + x] = row + Math.min(W - 1, Math.floor((x * W) / w));
+  }
+  // header + logical screen + 256-color global palette + loop forever
+  const header = [71, 73, 70, 56, 57, 97, w & 255, w >> 8, h & 255, h >> 8, 0xf7, 0, 0, ...table];
   header.push(33, 255, 11, ..."NETSCAPE2.0".split("").map((c) => c.charCodeAt()), 3, 1, 0, 0, 0);
   const chunks = [new Uint8Array(header)];
-  setBusy(true, "GIF");
   resetReplay();
+  const indices = new Uint8Array(w * h);
   for (let i = 1; i <= frames; i++) {
     seek(i / frames);
-    drawFrame(out);
-    const rgba = ctx.getImageData(0, 0, w, h).data;
-    const indices = new Uint8Array(w * h);
-    for (let j = 0; j < indices.length; j++) {
-      const p = j * 4;
-      indices[j] = Math.round(rgba[p] / 51) * 36 + Math.round(rgba[p + 1] / 51) * 6 + Math.round(rgba[p + 2] / 51);
-    }
+    for (let o = 0; o < indices.length; o++) indices[o] = lut[replay.values[cellOf[o]]];
     const bytes = [];
-    encodeGifFrame(bytes, indices, w, h, i === frames ? 250 : 100 / FPS);
+    encodeGifFrame(bytes, indices, w, h, i === frames ? 250 : 100 / GIF_FPS);
     chunks.push(new Uint8Array(bytes));
-    if (i % 4 === 0) {
-      setBusyText("GIF " + Math.round((i / frames) * 100) + "%");
+    if (i % 3 === 0) {
+      showProgress("GIF", i / frames);
       await yieldToBrowser();
     }
   }

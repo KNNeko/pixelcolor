@@ -18,6 +18,7 @@ import {
 import { t } from "./i18n.js";
 import { boxScale, applyAdjustments, STYLE_GROUPS, NO_ADJUST } from "./engine.js";
 import { openGame, saveGame } from "./game.js";
+import { putSource, deleteCanvas } from "./storage.js";
 import { library } from "./library.js";
 
 const ADJUSTMENTS = [
@@ -92,8 +93,12 @@ $("#file-input").onchange = async (e) => {
   if (file) startWizard(file);
 };
 
-/** Opens the wizard for an image File/Blob (from the + button or shared from the gallery). */
-export async function startWizard(file) {
+/**
+ * Opens the wizard for an image File/Blob (from the + button or shared from the gallery).
+ * restore = { state, replaceId?, folderId } reopens a stored canvas's photo with its old settings
+ * (see sourceState) at the pixelize step; with replaceId the result replaces that canvas.
+ */
+export async function startWizard(file, restore = null) {
   let image;
   try {
     image = await createImageBitmap(file, { imageOrientation: "from-image" });
@@ -123,14 +128,66 @@ export async function startWizard(file) {
     previewZoom: 1,
     previewX: 0,
     previewY: 0,
+    compare: 0.5, // before/after divider position (0..1 of the preview width)
+    replaceId: restore?.replaceId || null,
+    folderId: restore ? restore.folderId : null,
   };
   history = [];
+  originalKey = "";
   $("#wiz-undo").disabled = true;
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   resetOrientation();
   showScreen("screen-wizard");
-  goToStep(1);
+  if (restore) applyState(restore.state);
+  goToStep(restore ? 3 : 1);
   translateWizard();
+}
+
+/** Everything needed to rebuild this canvas later: orientation, touch-ups, crop, adjustments, pixelize settings. */
+function sourceState(params, scale) {
+  return {
+    rotation: wiz.rotation,
+    mirrored: wiz.mirrored,
+    strokes: wiz.strokes.map((s) => ({ ...s, radius: s.radius * scale, points: s.points.map((v) => v * scale) })),
+    rect: { x: wiz.rect.x * scale, y: wiz.rect.y * scale, w: wiz.rect.w * scale, h: wiz.rect.h * scale },
+    ratio: wiz.ratio,
+    adjust: { ...wiz.adjust },
+    params,
+  };
+}
+
+function applyState(st) {
+  wiz.rotation = st.rotation;
+  wiz.mirrored = st.mirrored;
+  wiz.strokes = st.strokes.map((s) => ({ ...s, points: [...s.points] }));
+  buildPhoto();
+  wiz.rect = { ...st.rect };
+  wiz.ratio = st.ratio;
+  highlightRatio();
+  wiz.adjust = { ...st.adjust };
+  ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
+  const p = st.params;
+  $("#px-width").value = p.width;
+  $("#px-height").value = p.height;
+  setSlider("colors", p.colors);
+  $("#colors-exact").value = p.colors;
+  setSlider("denoise", p.denoise);
+  setSlider("specks", p.specks);
+  wiz.style = p.style;
+  wiz.sized = true;
+}
+
+/** The (rotated-before) photo as a JPEG of at most 12 MP, and the factor it was scaled by. */
+async function encodeSourcePhoto() {
+  const im = wiz.image;
+  const scale = Math.min(1, Math.sqrt(MAX_SOURCE_PIXELS / (im.width * im.height)));
+  const c = createCanvas(Math.round(im.width * scale), Math.round(im.height * scale));
+  const x = c.getContext("2d");
+  x.fillStyle = "#fff";
+  x.fillRect(0, 0, c.width, c.height);
+  x.drawImage(im, 0, 0, c.width, c.height);
+  const blob = await new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.92));
+  return { blob, scale: c.width / im.width };
 }
 
 export function translateWizard() {
@@ -1000,6 +1057,8 @@ function showPreview() {
   const ctx = previewCanvas.getContext("2d");
   const K = pal.length / 3;
   const colors = [];
+  const counts = new Uint32Array(K);
+  for (let i = 0; i < idx.length; i++) counts[idx[i]]++;
   let strip = "";
   for (let k = 0; k < K; k++) {
     let r = pal[k * 3];
@@ -1007,7 +1066,7 @@ function showPreview() {
     let b = pal[k * 3 + 2];
     if (wiz.gray) r = g = b = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
     colors.push(0xff000000 | (b << 16) | (g << 8) | r);
-    strip += `<span style="background:rgb(${r},${g},${b});color:${0.3 * r + 0.59 * g + 0.11 * b > 140 ? "#000" : "#fff"}">${k + 1}</span>`;
+    strip += `<span style="background:rgb(${r},${g},${b});color:${0.3 * r + 0.59 * g + 0.11 * b > 140 ? "#000" : "#fff"}">${k + 1}<i>${counts[k]}</i></span>`;
   }
   previewCanvas.width = W;
   previewCanvas.height = H;
@@ -1018,7 +1077,56 @@ function showPreview() {
   $("#palette-strip").innerHTML = strip;
   $("#preview-info").textContent = `${K} ${t("ncol")} · ${W}×${H}`;
   $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
+  drawOriginal(W, H);
+  applyPreviewZoom();
 }
+
+/* ---------- step 3: before/after divider ----------
+   The original photo (cropped + adjusted) is drawn into #original-canvas with the same aspect ratio as the
+   pixel preview, positioned exactly like it, and clipped to the part left of the divider. */
+
+const originalCanvas = $("#original-canvas");
+let originalKey = "";
+
+function drawOriginal(W, H) {
+  originalCanvas.style.filter = wiz.gray ? "grayscale(1)" : "";
+  const key = JSON.stringify([wiz.rect, wiz.editVersion, wiz.adjust, W, H]);
+  if (key === originalKey) return;
+  originalKey = key;
+  const L = 1024;
+  const w = W >= H ? L : Math.max(1, Math.round((L * W) / H));
+  const h = W >= H ? Math.max(1, Math.round((L * H) / W)) : L;
+  const rgba = boxScale(sourcePixels(), w, h);
+  applyAdjustments(rgba, w, h, wiz.adjust);
+  originalCanvas.width = w;
+  originalCanvas.height = h;
+  originalCanvas.getContext("2d").putImageData(new ImageData(rgba, w, h), 0, 0);
+}
+
+function placeDivider() {
+  const x = Math.round((wiz.compare ?? 0.5) * previewWrap.clientWidth);
+  $("#compare-clip").style.width = x + "px";
+  $("#compare-line").style.left = x + "px";
+  const hide = !wiz.result;
+  $("#compare-clip").hidden = hide;
+  $("#compare-line").hidden = hide;
+}
+
+const knob = $("#compare-knob");
+knob.addEventListener("pointerdown", (e) => {
+  e.stopPropagation();
+  knob.setPointerCapture(e.pointerId);
+  knob.dragging = true;
+});
+knob.addEventListener("pointermove", (e) => {
+  if (!knob.dragging) return;
+  const r = previewWrap.getBoundingClientRect();
+  wiz.compare = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  placeDivider();
+});
+const knobUp = () => (knob.dragging = false);
+knob.addEventListener("pointerup", knobUp);
+knob.addEventListener("pointercancel", knobUp);
 
 $("#preview-gray").onclick = () => {
   wiz.gray = !wiz.gray;
@@ -1055,12 +1163,19 @@ async function createCanvasFromResult() {
       wiz.creating = false;
       return setBusy(false);
     }
+    const id = String(Date.now());
+    const { blob, scale } = await encodeSourcePhoto();
+    const state = sourceState(p, scale);
+    const replaceId = wiz.replaceId;
+    const folderId = wiz.folderId ?? library.folderId;
     wiz = {};
     history = [];
     photo = null;
+    if (replaceId) await deleteCanvas(replaceId);
+    await putSource(id, blob, state);
     const canvas = {
-      id: String(Date.now()),
-      folderId: library.folderId,
+      id,
+      folderId,
       name: `${r.width}×${r.height}`,
       width: r.width,
       height: r.height,
@@ -1101,6 +1216,8 @@ function applyPreviewZoom() {
   s.top = wiz.previewY + "px";
   s.width = w * z + "px";
   s.height = h * z + "px";
+  originalCanvas.style.cssText = s.cssText + (wiz.gray ? ";filter:grayscale(1)" : "");
+  placeDivider();
   $("#preview-fit").hidden = z < 1.01;
 }
 

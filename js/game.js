@@ -31,6 +31,7 @@ import {
   drawSplitOverlay,
 } from "./parts.js";
 import { openTimelapse } from "./timelapse.js";
+import { launchConfetti } from "./confetti.js";
 
 /** Off-screen canvas with direct pixel access that remembers which rectangle changed. */
 export class PixelBuffer {
@@ -332,7 +333,6 @@ export async function saveGame(withThumbs) {
       thumbs,
     });
     if (thumbs) g.thumbsStale = false;
-    toast(t("saved"));
   } catch (e) {
     g.unsaved = true;
     g.canvasChanged = g.canvasChanged || writeCanvas;
@@ -406,8 +406,17 @@ function cyclePaletteSort() {
   const modes = ["num", "col", "cnt"];
   settings.ps = modes[(modes.indexOf(settings.ps) + 1) % 3];
   saveSettings();
-  toast(t("s_" + settings.ps));
   renderPalette();
+}
+
+/**
+ * Scrolls the palette strip so the swatch is centered. Done by hand: scrollIntoView would also scroll
+ * the screen itself when the panel is hidden, pushing the top buttons out of reach.
+ */
+function scrollPaletteTo(btn) {
+  if (!btn || game.dockHidden) return;
+  const strip = $("#palette");
+  strip.scrollTo({ left: btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2, behavior: "smooth" });
 }
 
 /** Selects color number n (1-based, 0 = none). With highlighting on, only the two affected colors are redrawn. */
@@ -417,7 +426,7 @@ export function selectColor(n) {
   if (previous) updateSwatch(previous - 1);
   if (n) {
     updateSwatch(n - 1);
-    swatches[n - 1]?.scrollIntoView?.({ inline: "center", block: "nearest" });
+    scrollPaletteTo(swatches[n - 1]);
   }
   if (settings.hl && previous !== n) {
     const redraw = (k) => forEachCellOfColor(k, (i) => game.buffer.set(i, cellPixel(i)));
@@ -541,6 +550,7 @@ export function updateStatus() {
     game.canvas.done = true;
     markCanvasChanged();
     vibrate([80, 40, 80, 40, 300]);
+    launchConfetti();
     const sheet = openSheet(
       `<div class="finished">🎉 ${t("fin")}</div><div class="actions">${actionButton("film", "tlapse", "fin-timelapse")}${actionButton("image", "png", "fin-png")}${actionButton("check", "done", "fin-close")}</div>`,
     );
@@ -557,7 +567,6 @@ export function updateStatus() {
 function stampBrush([cx, cy]) {
   const r = game.brushSize >> 1;
   const W = game.canvas.width;
-  let wrong = false;
   for (let dy = -r; dy <= r; dy++)
     for (let dx = -r; dx <= r; dx++) {
       const x = cx + dx;
@@ -566,17 +575,9 @@ function stampBrush([cx, cy]) {
       const i = y * W + x;
       const right = game.canvas.target[i] + 1;
       if (game.paint[i] === right || !inCurrentPart(i)) continue;
-      if (right !== game.selected && !settings.wrong) {
-        wrong = true;
-        continue;
-      }
+      if (right !== game.selected && !settings.wrong) continue;
       paintCell(i, game.selected);
     }
-  if (wrong && !game.stroke.warned) {
-    game.stroke.warned = true;
-    vibrate(30);
-    toast(t("wrongt"));
-  }
   requestDraw();
 }
 
@@ -650,10 +651,18 @@ function wandFill(i) {
 }
 
 function tapCell([x, y]) {
-  const i = y * game.canvas.width + x;
+  const W = game.canvas.width;
+  const i = y * W + x;
   game.stroke = { cells: [], values: [] };
   if (game.tool === "bucket") bucketFill(i);
   else if (game.tool === "wand") wandFill(i);
+  // record the fill nearest-first, so the time-lapse shows it spreading in a circle from the tap
+  const s = game.stroke;
+  const order = s.cells.map((c, k) => k);
+  const dist = s.cells.map((c) => ((c % W) - x) ** 2 + (((c / W) | 0) - y) ** 2);
+  order.sort((a, b) => dist[a] - dist[b]);
+  s.cells = order.map((k) => s.cells[k]);
+  s.values = order.map((k) => s.values[k]);
   commitStroke();
 }
 
@@ -971,6 +980,14 @@ export const rawCellAt = (e) => [
 
 const brushActive = () => game.tool === "brush";
 
+function brushCanStartAt(c) {
+  if (!c || !game.selected) return false;
+  const i = c[1] * game.canvas.width + c[0];
+  const right = game.canvas.target[i] + 1;
+  if (game.paint[i] === right || !inCurrentPart(i)) return false;
+  return right === game.selected || !!settings.wrong;
+}
+
 playCanvas.oncontextmenu = (e) => e.preventDefault();
 playCanvas.addEventListener(
   "wheel",
@@ -999,15 +1016,13 @@ playCanvas.addEventListener("pointerdown", (e) => {
   input.moved = 0;
   if (game.splitting && e.button < 1) return splitPointerDown(e);
   input.panning = game.tool === "hand" || e.button > 0 || (brushActive() && !settings.slide);
+  // One finger moves the picture instead of painting when the brush would do nothing where it starts:
+  // no color chosen, outside the picture, an already finished cell, or a cell of another number.
+  if (!input.panning && brushActive() && !brushCanStartAt(cellAt(e))) input.panning = true;
   if (!input.panning && brushActive()) {
-    if (!game.selected) {
-      toast(t("nocol"));
-      input.panning = true;
-      return;
-    }
     game.stroke = { cells: [], values: [] };
     input.lastCell = cellAt(e);
-    if (input.lastCell) stampBrush(input.lastCell);
+    stampBrush(input.lastCell);
   }
 });
 

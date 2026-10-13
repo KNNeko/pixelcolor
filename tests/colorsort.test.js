@@ -97,6 +97,24 @@ test("peach skin tones and beige-grays get separate rows", () => {
   assert.deepEqual(rows, [peach.map((c) => c.join()), beige.map((c) => c.join())]);
 });
 
+test("by color is a snake: rows alternate dark->light and light->dark", () => {
+  const reds = [
+    [100, 0, 20],
+    [150, 20, 40],
+    [200, 40, 60],
+    [240, 70, 90],
+  ];
+  const blues = [
+    [10, 20, 110],
+    [30, 50, 160],
+    [60, 90, 210],
+    [110, 140, 240],
+  ];
+  const pal = makePalette(shuffle([...reds, ...blues]));
+  const out = paletteOrder(pal, "col", []).map((k) => rgb(pal, k));
+  assert.deepEqual(out, [...reds.map((c) => c.join()), ...[...blues].reverse().map((c) => c.join())]);
+});
+
 test("paletteOrder modes", () => {
   const pal = makePalette([0, 1, 2, 3].map((k) => [k * 60, 0, 0]));
   assert.deepEqual(paletteOrder(pal, "num", []), [0, 1, 2, 3]);

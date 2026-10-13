@@ -1,5 +1,5 @@
 // Service worker: offline cache (network first, cache as fallback) + "Share to Pixel Color" from the gallery.
-const VERSION = "pxc-v17";
+const VERSION = "pxc-v19";
 const SHARE_CACHE = "pxc-share"; // holds a shared image until the page picks it up
 const APP_FILES = [
   "./",
@@ -24,6 +24,8 @@ const APP_FILES = [
   "./js/game.js",
   "./js/parts.js",
   "./js/timelapse.js",
+  "./js/confetti.js",
+  "./js/vendor/mp4-muxer.mjs",
 ];
 
 self.addEventListener("install", (e) => {

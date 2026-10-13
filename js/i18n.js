@@ -189,6 +189,9 @@ export const STRINGS = {
   png_grid: "Grid lines|Линии сетки",
   png_save: "Save PNG|Сохранить PNG",
   maxparts: "Too many parts (max 250)|Слишком много частей (максимум 250)",
+  recreate: "Recreate|Пересоздать",
+  copyp: "Copy with new settings|Копия с другими параметрами",
+  recq: "Recreate this canvas with new settings? Its coloring progress will be lost.|Пересоздать холст с новыми настройками? Прогресс раскраски будет потерян.",
   share_err: "Could not open the shared image|Не удалось открыть присланное изображение",
 };
 
