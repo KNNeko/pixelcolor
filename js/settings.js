@@ -15,6 +15,7 @@ export const DEFAULTS = {
   mini: 1, // minimap
   vib: 1, // vibration
   wrong: 0, // allow painting wrong numbers
+  aim: 2, // brush aim assist: 0 off, 1 light, 2 medium, 3 strong
   grid: 1, // grid lines
   asv: 2, // autosave interval, minutes
   full: 1, // fullscreen

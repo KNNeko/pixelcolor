@@ -24,12 +24,15 @@ const ROWS = [
   ["mini", "toggle"],
   ["vib", "toggle"],
   ["wrong", "toggle"],
+  ["aim", "select", [0, 1, 2, 3]],
   ["grid", "toggle"],
   ["asv", "select", [1, 2, 5]],
   ["full", "toggle"],
 ];
 
-const optionLabel = (key, v) => (key === "lang" ? { en: "English", ru: "Русский" }[v] : key === "asv" ? v : t(v));
+const NUMERIC = ["asv", "aim"]; // selects whose value is stored as a number
+const optionLabel = (key, v) =>
+  key === "lang" ? { en: "English", ru: "Русский" }[v] : key === "asv" ? v : key === "aim" ? t("aim_" + v) : t(v);
 
 function renderSettings() {
   const list = $("#settings-list");
@@ -46,7 +49,7 @@ function renderSettings() {
     row.innerHTML = `<span>${t(key)}</span>${control}`;
     const input = row.querySelector("input,select");
     input.onchange = () => {
-      settings[key] = kind === "toggle" ? +input.checked : key === "asv" ? +input.value : input.value;
+      settings[key] = kind === "toggle" ? +input.checked : NUMERIC.includes(key) ? +input.value : input.value;
       saveSettings();
       if (key === "lang") {
         translatePage();

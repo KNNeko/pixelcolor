@@ -989,6 +989,48 @@ export const rawCellAt = (e) => [
 
 const brushActive = () => game.tool === "brush";
 
+/** Aim assist reach in screen pixels for settings.aim = 0..3 (off, light, medium, strong). */
+const AIM_REACH = [0, 8, 14, 20];
+
+/**
+ * Cell the brush should act on for a touch at screen point (px, py).
+ * Normally the cell under the finger. With aim assist on, if that cell is not one the selected color can
+ * paint, the nearest cell that is (within AIM_REACH pixels of the finger) is used instead: like a phone
+ * keyboard, the cells you probably mean have an invisible bigger hit area. The reach is in screen pixels,
+ * so the further out you zoom, the more cells it covers.
+ */
+function aimCell(px, py) {
+  const { width: W, height: H, target } = game.canvas;
+  const s = view.scale;
+  const fx = (px - view.x) / s;
+  const fy = (py - view.y) / s;
+  const cx = Math.floor(fx);
+  const cy = Math.floor(fy);
+  const under = cx >= 0 && cy >= 0 && cx < W && cy < H ? [cx, cy] : null;
+  const reach = AIM_REACH[settings.aim] || 0;
+  if (!reach || !game.selected || settings.wrong) return under;
+  const wanted = (x, y) => {
+    const i = y * W + x;
+    return target[i] + 1 === game.selected && game.paint[i] !== game.selected && inCurrentPart(i);
+  };
+  if (under && wanted(cx, cy)) return under;
+  const r = reach / s; // reach in cells
+  let best = null;
+  let bestD = r * r;
+  for (let y = Math.max(0, Math.floor(fy - r)); y <= Math.min(H - 1, Math.floor(fy + r)); y++)
+    for (let x = Math.max(0, Math.floor(fx - r)); x <= Math.min(W - 1, Math.floor(fx + r)); x++) {
+      // distance from the finger to the nearest point of the cell's square
+      const dx = Math.max(x - fx, 0, fx - (x + 1));
+      const dy = Math.max(y - fy, 0, fy - (y + 1));
+      const d = dx * dx + dy * dy;
+      if (d < bestD && wanted(x, y)) {
+        bestD = d;
+        best = [x, y];
+      }
+    }
+  return best || under;
+}
+
 function brushCanStartAt(c) {
   if (!c || !game.selected) return false;
   const i = c[1] * game.canvas.width + c[0];
@@ -1027,11 +1069,12 @@ playCanvas.addEventListener("pointerdown", (e) => {
   input.panning = game.tool === "hand" || e.button > 0 || (brushActive() && !settings.slide);
   // One finger moves the picture instead of painting when the brush would do nothing where it starts:
   // no color chosen, outside the picture, an already finished cell, or a cell of another number.
-  if (!input.panning && brushActive() && !brushCanStartAt(cellAt(e))) input.panning = true;
+  const start = brushActive() ? aimCell(e.offsetX, e.offsetY) : null;
+  if (!input.panning && brushActive() && !brushCanStartAt(start)) input.panning = true;
   if (!input.panning && brushActive()) {
     game.stroke = { cells: [], values: [] };
-    input.lastCell = cellAt(e);
-    stampBrush(input.lastCell);
+    input.lastCell = start;
+    stampBrush(start);
   }
 });
 
@@ -1062,9 +1105,15 @@ playCanvas.addEventListener("pointermove", (e) => {
     view.y += now[1] - old[1];
     requestDraw();
   } else if (game.stroke && brushActive()) {
-    const c = cellAt(e);
-    if (c && input.lastCell) brushLine(input.lastCell, c);
-    input.lastCell = c || input.lastCell;
+    // walk along the finger's path in steps of about half a cell, so aim assist sees every spot it passed
+    const dx = now[0] - old[0];
+    const dy = now[1] - old[1];
+    const steps = Math.max(1, Math.min(64, Math.ceil(Math.hypot(dx, dy) / Math.max(2, view.scale / 2))));
+    for (let n = 1; n <= steps; n++) {
+      const c = aimCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps);
+      if (c && input.lastCell) brushLine(input.lastCell, c);
+      input.lastCell = c || input.lastCell;
+    }
   }
 });
 
@@ -1077,7 +1126,7 @@ function pointerUp(e) {
     // brush without "sliding": a tap paints one stamp
     if (isTap && brushActive() && !settings.slide && game.selected) {
       game.stroke = { cells: [], values: [] };
-      stampBrush(c);
+      stampBrush(aimCell(e.offsetX, e.offsetY) || c);
       commitStroke();
     }
   } else if (brushActive()) commitStroke();
