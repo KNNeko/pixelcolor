@@ -903,9 +903,15 @@ function draw() {
   }
   if (game.hintCell != null) {
     const W = game.canvas.width;
-    ctx.strokeStyle = "#ff2d55";
+    // white outside, navy inside: readable on any picture
+    const hx = view.x + (game.hintCell % W) * s;
+    const hy = view.y + ((game.hintCell / W) | 0) * s;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#ffffff";
+    ctx.strokeRect(hx - 4, hy - 4, s + 8, s + 8);
     ctx.lineWidth = 3;
-    ctx.strokeRect(view.x + (game.hintCell % W) * s - 2, view.y + ((game.hintCell / W) | 0) * s - 2, s + 4, s + 4);
+    ctx.strokeStyle = "#23265a";
+    ctx.strokeRect(hx - 1.5, hy - 1.5, s + 3, s + 3);
     overlayUsed = true;
   }
   if (game.splitting) {
@@ -1048,7 +1054,7 @@ function draw2d(fades) {
 const minimapElement = $("#minimap");
 /** Scaled-down picture for the minimap; rebuilt only when the picture changed, a few times a second at most. */
 const minimapCache = { canvas: createCanvas(1, 1), version: -1, size: 0, background: "", time: 0, timer: 0 };
-/** Panel color of the current app theme as [r, g, b] (the minimap frame and shade use it). */
+/** Panel color of the current app theme as [r, g, b] (the minimap frame uses it). */
 const panelColor = { theme: "", rgb: [29, 31, 59] };
 function panelRgb() {
   const theme = document.documentElement.dataset.theme || "";
@@ -1133,19 +1139,14 @@ function drawMinimap() {
       }, 320);
   }
   mctx.drawImage(cache.canvas, 0, 0);
-  // Where you are: everything outside the visible area is shaded with the panel color, the visible area
-  // stays clear and gets a thin frame. At least 6 px, so it can still be found on a huge canvas.
+  // Where you are: a thin frame in the panel color around the visible area.
+  // At least 6 px, so it can still be found on a huge canvas.
   const min = 6 * dpr;
   const w = Math.max(min, (c - a) * k);
   const h = Math.max(min, (d - b) * k);
   const x = Math.max(0, Math.min(N - w, ox + ((a + c) / 2) * k - w / 2));
   const y = Math.max(0, Math.min(N - h, oy + ((b + d) / 2) * k - h / 2));
   const [pr, pg, pb] = panelRgb();
-  mctx.fillStyle = `rgba(${pr},${pg},${pb},0.55)`;
-  mctx.fillRect(0, 0, N, y);
-  mctx.fillRect(0, y + h, N, N - y - h);
-  mctx.fillRect(0, y, x, h);
-  mctx.fillRect(x + w, y, N - x - w, h);
   mctx.lineWidth = dpr;
   mctx.strokeStyle = `rgb(${pr},${pg},${pb})`;
   mctx.strokeRect(x - dpr / 2, y - dpr / 2, w + dpr, h + dpr);

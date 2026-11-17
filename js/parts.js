@@ -263,7 +263,7 @@ export function drawSplitOverlay(ctx) {
   const { width: W, height: H } = game.canvas;
   const s = split.snap;
   if (s > 0 && s * scale >= 8) {
-    ctx.strokeStyle = "rgba(255,45,85,.4)";
+    ctx.strokeStyle = "rgba(120,140,255,.5)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let x = 0; x <= W; x += s) {
@@ -286,9 +286,9 @@ export function drawSplitOverlay(ctx) {
     const Y = vy + r[1] * scale;
     const w = (r[2] - r[0] + 1) * scale;
     const h = (r[3] - r[1] + 1) * scale;
-    ctx.fillStyle = "rgba(255,45,85,.22)";
+    ctx.fillStyle = "rgba(120,140,255,.25)";
     ctx.fillRect(X, Y, w, h);
-    ctx.strokeStyle = "#ff2d55";
+    ctx.strokeStyle = "#8c9cff";
     ctx.lineWidth = 2;
     ctx.strokeRect(X, Y, w, h);
   }
