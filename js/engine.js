@@ -334,7 +334,7 @@ export function pickCellColors(rgba, W, H, k) {
       out[q + 1] = mg + (c[major + 1] - mg) * edge;
       out[q + 2] = mb + (c[major + 2] - mb) * edge;
       const share = (major ? n - countB : countB) / n;
-      if (edge > 0.5 && gap >= LINE_CONTRAST && share >= LINE_SHARE) {
+      if (edge > 0.2 && gap >= LINE_CONTRAST && share >= LINE_SHARE) {
         const i = y * W + x;
         minorShare[i] = share;
         for (let j = 0; j < 3; j++) {

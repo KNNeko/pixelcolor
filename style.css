@@ -673,12 +673,16 @@ header b {
   flex: 1;
   min-height: 0;
 }
+#play-gl,
 #play-canvas {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   touch-action: none;
+}
+#play-gl {
+  pointer-events: none;
 }
 #play-top {
   position: absolute;

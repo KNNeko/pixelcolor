@@ -12,6 +12,7 @@ export const STRINGS = {
   d_dither:
     "For pictures with compression artifacts or banding. In-between shades are built from dots of nearby colors, which hides the artifacts. More single cells to color.|Для картинок с артефактами сжатия и полосами на градиентах. Промежуточные оттенки набираются точками соседних цветов и прячут артефакты. Одиночных клеток больше.",
   clean: "Cleanliness|Чистота",
+  gl: "Fast drawing (WebGL)|Быстрая отрисовка (WebGL)",
   aim: "Brush aim assist|Помощь попадания кистью",
   aim_0: "Off|Выкл",
   aim_1: "Light|Слабая",

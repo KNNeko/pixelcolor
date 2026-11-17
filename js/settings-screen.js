@@ -28,6 +28,7 @@ const ROWS = [
   ["grid", "toggle"],
   ["asv", "select", [1, 2, 5]],
   ["full", "toggle"],
+  ["gl", "toggle"],
 ];
 
 const NUMERIC = ["asv", "aim"]; // selects whose value is stored as a number

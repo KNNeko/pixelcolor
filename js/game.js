@@ -32,8 +32,18 @@ import {
 } from "./parts.js";
 import { openTimelapse } from "./timelapse.js";
 import { launchConfetti } from "./confetti.js";
+import { createGlView } from "./glview.js";
 
-/** Off-screen canvas with direct pixel access that remembers which rectangle changed. */
+/** Smallest rectangle [x0, y0, x1, y1] containing both (either may be null). */
+const unionRect = (a, b) =>
+  !a ? b : !b ? a : [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+
+/**
+ * The picture as raw pixels (one per cell) that remembers which rectangle changed.
+ * Two things read it: the WebGL renderer (uploads the changed rectangle to a texture) and this.canvas, a 2D
+ * copy for everything that draws with the 2D API (minimap, time-lapse, the fallback renderer).
+ * Each of them asks for "what changed since I last looked" with take().
+ */
 export class PixelBuffer {
   constructor(width, height) {
     this.width = width;
@@ -42,10 +52,13 @@ export class PixelBuffer {
     this.ctx = this.canvas.getContext("2d");
     this.image = this.ctx.createImageData(width, height);
     this.pixels = new Uint32Array(this.image.data.buffer);
-    this.dirty = null; // [x0, y0, x1, y1]
+    this.dirty = null; // [x0, y0, x1, y1] changed since anyone looked
+    this.pending = { "2d": null, gl: null }; // changed, not yet seen by that reader
+    this.version = 0; // goes up on every change
   }
   set(i, value) {
     this.pixels[i] = value;
+    this.version++;
     const x = i % this.width;
     const y = (i / this.width) | 0;
     const d = this.dirty;
@@ -59,12 +72,22 @@ export class PixelBuffer {
   }
   markAll() {
     this.dirty = [0, 0, this.width - 1, this.height - 1];
+    this.version++;
   }
+  /** The rectangle that changed since this reader ("2d" or "gl") last asked, or null. */
+  take(reader) {
+    if (this.dirty) {
+      for (const name in this.pending) this.pending[name] = unionRect(this.pending[name], this.dirty);
+      this.dirty = null;
+    }
+    const rect = this.pending[reader];
+    this.pending[reader] = null;
+    return rect;
+  }
+  /** Brings this.canvas up to date. */
   flush() {
-    const d = this.dirty;
-    if (!d) return;
-    this.ctx.putImageData(this.image, 0, 0, d[0], d[1], d[2] - d[0] + 1, d[3] - d[1] + 1);
-    this.dirty = null;
+    const d = this.take("2d");
+    if (d) this.ctx.putImageData(this.image, 0, 0, d[0], d[1], d[2] - d[0] + 1, d[3] - d[1] + 1);
   }
 }
 
@@ -79,6 +102,8 @@ export const game = {
   canvasChanged: false, // the big pixel record (parts/mode/done) must be rewritten
   thumbsStale: false,
   buffer: null,
+  flags: null, // Uint8Array per cell for the WebGL renderer: bit 0 painted, bit 1 in another part
+  useGl: false, // this canvas is drawn by the WebGL renderer
 
   // colors as 32-bit pixels
   theme: null,
@@ -123,8 +148,13 @@ export const game = {
 
 const view = game.view;
 const screen = game.screen;
+// Two stacked canvases: #play-gl shows the picture (WebGL), #play-canvas above it takes the touches and
+// shows the few things drawn with the 2D API (hint frame, split rectangle). Without WebGL, #play-canvas
+// draws everything itself.
 const playCanvas = $("#play-canvas");
 const ctx = playCanvas.getContext("2d");
+const glCanvas = $("#play-gl");
+let glView; // created when the first canvas is opened; null = WebGL 2 is not available
 const PART_TINTS = ["#ff4d73", "#4da3ff", "#3ecf8e", "#ffb84d", "#a66bff", "#ff7ad9", "#4de0d0", "#c2e04d"];
 const SILHOUETTE_TINTS = { sg: 0, se: "#7a4a1c", sb: "#2c5fb3", sm: "#17866a", sr: "#c23a72", sv: "#6a46c8" };
 
@@ -265,6 +295,18 @@ export async function openGame(canvas, events, isNew = false) {
   game.splitting = false;
   floodQueue = floodSeen = null;
   game.buffer = new PixelBuffer(canvas.width, canvas.height);
+  if (glView === undefined)
+    glView = createGlView(glCanvas, () => {
+      // the GPU context came back after being lost: textures are gone, send everything again
+      if (!game.canvas) return;
+      game.useGl = !!settings.gl && glView.setCanvas(game.canvas.width, game.canvas.height, game.canvas.target);
+      if (game.useGl && !game.flags) game.flags = new Uint8Array(game.canvas.target.length);
+      game.buffer.markAll();
+      requestDraw();
+    });
+  game.useGl = !!(settings.gl && glView && glView.setCanvas(canvas.width, canvas.height, canvas.target));
+  game.flags = game.useGl ? new Uint8Array(N) : null;
+  minimapCache.version = -1;
   indexCellsByColor();
   recountProgress();
   updateColors();
@@ -286,7 +328,7 @@ export async function closeGame() {
   if (game.splitting) return stopSplitMode();
   commitStroke();
   await saveGame(true);
-  game.canvas = game.buffer = game.paint = null;
+  game.canvas = game.buffer = game.paint = game.flags = null;
   floodQueue = floodSeen = null;
   clearInterval(autosaveTimer);
   showScreen("screen-home");
@@ -780,6 +822,7 @@ export function handleResize() {
   }
   playCanvas.width = Math.round(screen.width * screen.dpr);
   playCanvas.height = Math.round(screen.height * screen.dpr);
+  if (glView) glView.resize(playCanvas.width, playCanvas.height);
   placeMinimap();
   draw();
 }
@@ -825,15 +868,83 @@ const smoothstep = (a, b, v) => {
   return x * x * (3 - 2 * x);
 };
 
+/** True where nothing separates two cells: painted, hidden (another part, not shown) or outside the picture. */
+function isFilled(x, y) {
+  const { width: W, height: H, partOf } = game.canvas;
+  if (x < 0 || y < 0 || x >= W || y >= H) return true;
+  const i = y * W + x;
+  return !!game.paint[i] || (game.part >= 0 && partOf[i] !== game.part && !settings.oth);
+}
+
+let overlayUsed = false; // something is drawn on the 2D canvas above the WebGL picture
+
 function draw() {
   drawQueued = false;
   if (!game.canvas || !game.buffer || !screen.width) return;
+  const s = view.scale;
+  // details fade in with zoom: flat cell color, then grid, then numbers
+  const numbersMode = game.canvas.mode === "n";
+  const fades = {
+    cell: numbersMode && settings.sil ? smoothstep(4, 16, s) : 0,
+    number: numbersMode ? smoothstep(10, 18, s) : 0,
+    grid: settings.grid ? smoothstep(5, 10, s) : 0,
+  };
+  const withGl = game.useGl && glView.ready && drawGl(fades);
+  if (glCanvas.hidden === withGl) glCanvas.hidden = !withGl;
+  ctx.setTransform(screen.dpr, 0, 0, screen.dpr, 0, 0);
+  ctx.globalAlpha = 1;
+  if (!withGl) {
+    draw2d(fades);
+    overlayUsed = true;
+  } else if (overlayUsed) {
+    ctx.clearRect(0, 0, screen.width, screen.height);
+    overlayUsed = false;
+  }
+  if (game.hintCell != null) {
+    const W = game.canvas.width;
+    ctx.strokeStyle = "#ff2d55";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(view.x + (game.hintCell % W) * s - 2, view.y + ((game.hintCell / W) | 0) * s - 2, s + 4, s + 4);
+    overlayUsed = true;
+  }
+  if (game.splitting) {
+    drawSplitOverlay(ctx);
+    overlayUsed = true;
+  }
+  drawMinimap();
+}
+
+/** WebGL path: send what changed to the GPU, draw the screen in one call. Returns false if it could not draw. */
+function drawGl(fades) {
+  const rect = game.buffer.take("gl");
+  if (rect) {
+    const { width: W, partOf } = game.canvas;
+    const { paint, flags, part } = game;
+    for (let y = rect[1]; y <= rect[3]; y++)
+      for (let i = y * W + rect[0], end = y * W + rect[2]; i <= end; i++)
+        flags[i] = (paint[i] ? 1 : 0) | (part >= 0 && partOf[i] !== part ? 2 : 0);
+    glView.upload(game.buffer.pixels, flags, rect);
+  }
+  return glView.draw({
+    x: view.x,
+    y: view.y,
+    scale: view.scale,
+    dpr: screen.dpr,
+    theme: game.theme,
+    cellFade: fades.cell,
+    gridFade: fades.grid,
+    numberFade: fades.number,
+    selected: settings.hl ? game.selected : 0,
+    showOthers: !!settings.oth,
+  });
+}
+
+/** Fallback without WebGL: the same picture drawn with the 2D canvas API (slow when many cells are visible). */
+function draw2d(fades) {
   const { width: W, height: H, target } = game.canvas;
   const theme = game.theme;
   const s = view.scale;
   game.buffer.flush();
-  ctx.setTransform(screen.dpr, 0, 0, screen.dpr, 0, 0);
-  ctx.globalAlpha = 1;
   if (theme.gradient) {
     const g = ctx.createLinearGradient(0, 0, screen.width * 0.35, screen.height);
     g.addColorStop(0, theme.gradient[0]);
@@ -848,7 +959,7 @@ function draw() {
   const y0 = Math.max(0, Math.floor(-view.y / s));
   const x1 = Math.min(W, Math.ceil((screen.width - view.x) / s));
   const y1 = Math.min(H, Math.ceil((screen.height - view.y) / s));
-  if (x1 <= x0 || y1 <= y0) return drawMinimap();
+  if (x1 <= x0 || y1 <= y0) return;
   ctx.drawImage(
     game.buffer.canvas,
     x0,
@@ -861,13 +972,7 @@ function draw() {
     (y1 - y0) * s,
   );
 
-  // details fade in with zoom: flat cell color, then grid, then numbers
-  const numbersMode = game.canvas.mode === "n";
-  const cellFade = numbersMode && settings.sil ? smoothstep(4, 16, s) : 0;
-  const numberFade = numbersMode ? smoothstep(10, 18, s) : 0;
-  const gridFade = smoothstep(5, 10, s);
-
-  if (cellFade > 0) {
+  if (fades.cell > 0) {
     for (let y = y0; y < y1; y++)
       for (let x = x0; x < x1; x++) {
         const i = y * W + x;
@@ -876,11 +981,11 @@ function draw() {
         if (outside && !settings.oth) continue;
         const X = view.x + x * s;
         const Y = view.y + y * s;
-        ctx.globalAlpha = cellFade;
+        ctx.globalAlpha = fades.cell;
         ctx.fillStyle = !outside && settings.hl && target[i] + 1 === game.selected ? theme.highlight : theme.cell;
         ctx.fillRect(X, Y, s, s);
         if (outside) {
-          ctx.globalAlpha = 0.62 * cellFade;
+          ctx.globalAlpha = 0.62 * fades.cell;
           ctx.fillStyle = theme.bg;
           ctx.fillRect(X, Y, s, s);
         }
@@ -888,25 +993,43 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
-  if (settings.grid && gridFade > 0) {
-    ctx.globalAlpha = gridFade;
+  if (fades.grid > 0) {
+    // a line only where at least one of the two cells it separates is still empty; neighbouring pieces of
+    // one line are joined into a single stroke
+    ctx.globalAlpha = fades.grid;
     ctx.strokeStyle = theme.grid;
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let x = x0; x <= x1; x++) {
-      ctx.moveTo(view.x + x * s, view.y + y0 * s);
-      ctx.lineTo(view.x + x * s, view.y + y1 * s);
+      let from = -1;
+      for (let y = y0; y <= y1; y++) {
+        const needed = y < y1 && !(isFilled(x - 1, y) && isFilled(x, y));
+        if (needed && from < 0) from = y;
+        if (!needed && from >= 0) {
+          ctx.moveTo(view.x + x * s, view.y + from * s);
+          ctx.lineTo(view.x + x * s, view.y + y * s);
+          from = -1;
+        }
+      }
     }
     for (let y = y0; y <= y1; y++) {
-      ctx.moveTo(view.x + x0 * s, view.y + y * s);
-      ctx.lineTo(view.x + x1 * s, view.y + y * s);
+      let from = -1;
+      for (let x = x0; x <= x1; x++) {
+        const needed = x < x1 && !(isFilled(x, y - 1) && isFilled(x, y));
+        if (needed && from < 0) from = x;
+        if (!needed && from >= 0) {
+          ctx.moveTo(view.x + from * s, view.y + y * s);
+          ctx.lineTo(view.x + x * s, view.y + y * s);
+          from = -1;
+        }
+      }
     }
     ctx.stroke();
     ctx.globalAlpha = 1;
   }
 
-  if (numberFade > 0) {
-    ctx.globalAlpha = numberFade;
+  if (fades.number > 0) {
+    ctx.globalAlpha = fades.number;
     ctx.font = `${s * 0.5}px system-ui`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -919,18 +1042,14 @@ function draw() {
       }
     ctx.globalAlpha = 1;
   }
-
-  if (game.hintCell != null) {
-    ctx.strokeStyle = "#ff2d55";
-    ctx.lineWidth = 3;
-    ctx.strokeRect(view.x + (game.hintCell % W) * s - 2, view.y + ((game.hintCell / W) | 0) * s - 2, s + 4, s + 4);
-  }
-  if (game.splitting) drawSplitOverlay(ctx);
-  drawMinimap();
 }
 
+const minimapElement = $("#minimap");
+/** Scaled-down picture for the minimap; rebuilt only when the picture changed, a few times a second at most. */
+const minimapCache = { canvas: createCanvas(1, 1), version: -1, size: 0, background: "", time: 0, timer: 0 };
+
 function drawMinimap() {
-  const mm = $("#minimap");
+  const mm = minimapElement;
   const { width: W, height: H } = game.canvas;
   const s = view.scale;
   const a = Math.max(0, -view.x / s);
@@ -938,7 +1057,7 @@ function drawMinimap() {
   const c = Math.min(W, (screen.width - view.x) / s);
   const d = Math.min(H, (screen.height - view.y) / s);
   const visible = settings.mini && !game.splitting && s >= 16 && (c - a) * (d - b) < 0.9 * W * H;
-  mm.hidden = !visible;
+  if (mm.hidden === visible) mm.hidden = !visible;
   if (!visible) return;
   const mctx = mm.getContext("2d");
   const dpr = devicePixelRatio || 1;
@@ -947,11 +1066,30 @@ function drawMinimap() {
   const k = Math.min(N / W, N / H);
   const ox = (N - W * k) / 2;
   const oy = (N - H * k) / 2;
-  mctx.fillStyle = game.theme.bg;
-  mctx.fillRect(0, 0, N, N);
-  mctx.imageSmoothingEnabled = k < 1;
-  mctx.imageSmoothingQuality = "high";
-  mctx.drawImage(game.buffer.canvas, ox, oy, W * k, H * k);
+
+  const cache = minimapCache;
+  const resized = cache.size !== N || cache.background !== game.theme.bg;
+  if (resized || cache.version !== game.buffer.version) {
+    const now = performance.now();
+    if (resized || cache.version < 0 || now - cache.time > 300) {
+      cache.canvas.width = cache.canvas.height = cache.size = N;
+      cache.background = game.theme.bg;
+      cache.version = game.buffer.version;
+      cache.time = now;
+      const cctx = cache.canvas.getContext("2d");
+      cctx.fillStyle = game.theme.bg;
+      cctx.fillRect(0, 0, N, N);
+      cctx.imageSmoothingEnabled = k < 1;
+      cctx.imageSmoothingQuality = "high";
+      game.buffer.flush();
+      cctx.drawImage(game.buffer.canvas, ox, oy, W * k, H * k);
+    } else if (!cache.timer)
+      cache.timer = setTimeout(() => {
+        cache.timer = 0;
+        if (game.canvas) requestDraw();
+      }, 320);
+  }
+  mctx.drawImage(cache.canvas, 0, 0);
   const rect = [ox + a * k, oy + b * k, Math.max(4, (c - a) * k), Math.max(4, (d - b) * k)];
   mctx.lineWidth = 3.2 * dpr;
   mctx.strokeStyle = "#fff";
@@ -1040,6 +1178,9 @@ function brushCanStartAt(c) {
 }
 
 playCanvas.oncontextmenu = (e) => e.preventDefault();
+// Chrome on Android holds back a finger's first few pixels of movement while it decides whether the page
+// wants the touch. Claiming the touch right away makes painting and panning start without that pause.
+playCanvas.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
 playCanvas.addEventListener(
   "wheel",
   (e) => {
