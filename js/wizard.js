@@ -16,7 +16,18 @@ import {
   translatePage,
 } from "./ui.js";
 import { t } from "./i18n.js";
-import { boxScale, applyAdjustments, MODES, DEFAULT_CLEAN, NO_ADJUST, normalizeParams } from "./engine.js";
+import {
+  boxScale,
+  applyAdjustments,
+  MODES,
+  DEFAULT_CLEAN,
+  NO_ADJUST,
+  normalizeParams,
+  kmeansPalette,
+} from "./engine.js";
+import { paletteOrder } from "./colorsort.js";
+import { openColorPicker, colorButtonHtml, hexToRgb, rgbToHex } from "./colorpicker.js";
+import { coverScale, floodFillMask, blendMask, recolor, edgeColor } from "./editops.js";
 import { settings, saveSettings } from "./settings.js";
 import { openGame, saveGame } from "./game.js";
 import { putSource, deleteCanvas } from "./storage.js";
@@ -61,13 +72,17 @@ const previewWrap = $("#preview-wrap");
 
 /* ---------- panels ---------- */
 
+const EDIT_TOOLS = ["crop", "pan", "brush", "shape", "fill", "recolor", "blur", "clone", "rest", "pick"];
 $("#panel-crop").innerHTML =
   `<div class="chips" id="ratio-chips"></div>` +
-  `<div class="chips"><button class="chip" id="btn-mirror"></button><button class="chip" id="btn-rotate"></button></div>` +
-  `<div class="chips" id="editor-tools">${["crop", "pan", "brush", "rest", "pick"].map((k) => `<button class="chip" data-tool="${k}" data-i="e_${k}"></button>`).join("")}</div>` +
+  `<div class="chips"><button class="chip" id="btn-mirror"></button><button class="chip" id="btn-flipv"></button><button class="chip" id="btn-rotate"></button></div>` +
+  sliderHtml("tilt", "tilt", -45, 45, 0, 0.5) +
+  `<div class="chips" id="editor-tools">${EDIT_TOOLS.map((k) => `<button class="chip" data-tool="${k}" data-i="e_${k}"></button>`).join("")}</div>` +
   `<div id="editor-hint"></div>` +
-  `<div class="chips"><input type="color" id="brush-color" value="#ffffff"><button class="chip" data-zoom="1">＋</button><button class="chip" data-zoom="-1">－</button><button class="chip" data-zoom="0" data-i="e_fit"></button><button class="chip" id="btn-edit-reset" data-i="e_reset"></button></div>` +
-  sliderHtml("brush-size", "e_size", 2, 160, 28);
+  `<div class="chips" id="shape-kinds">${["rect", "oval", "line"].map((k) => `<button class="chip" data-shape="${k}" data-i="sh_${k}"></button>`).join("")}</div>` +
+  `<div class="chips">${colorButtonHtml("brush-color", "#ffffff")}<button class="chip" id="btn-clone-source" data-i="cl_src"></button><button class="chip" data-zoom="1">＋</button><button class="chip" data-zoom="-1">－</button><button class="chip" data-zoom="0" data-i="e_fit"></button><button class="chip" id="btn-edit-reset" data-i="e_reset"></button></div>` +
+  sliderHtml("brush-size", "e_size", 2, 160, 28) +
+  sliderHtml("tol", "tol", 2, 120, 24);
 
 $("#panel-adjust").innerHTML =
   ADJUSTMENTS.map(([key, min, max, v]) => sliderHtml("adj-" + key, key, min, max, v)).join("") +
@@ -115,7 +130,14 @@ export async function startWizard(file, restore = null) {
     image,
     rotation: 0, // quarter turns
     mirrored: false,
-    strokes: [], // touch-up strokes, in original photo coordinates
+    angle: 0, // fine tilt in degrees (-45..45), after the quarter turns
+    pad: { on: false, color: null }, // margins: the crop frame may reach beyond the photo, filled with color
+    strokes: [], // edits (brush, shapes, fill, ...), in original photo coordinates
+    color: "#ffffff", // color of the brush, shapes, fill and color replace
+    shape: "rect", // rect | oval | line
+    tol: 24, // tolerance of fill and color replace, in gray levels
+    clone: null, // clone tool: { source: [x, y] (original photo coordinates), off, shift }
+    prevTool: null, // tool to return to after the eyedropper
     editVersion: 0, // bumps on every change to the photo pixels
     step: 1,
     gray: true, // preview in gray (judge shapes, not colors)
@@ -138,6 +160,8 @@ export async function startWizard(file, restore = null) {
   $("#wiz-undo").disabled = true;
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
+  setSlider("tol", wiz.tol);
+  syncTiltSlider();
   resetOrientation();
   showScreen("screen-wizard");
   if (restore) applyState(restore.state);
@@ -150,7 +174,9 @@ function sourceState(params, scale) {
   return {
     rotation: wiz.rotation,
     mirrored: wiz.mirrored,
-    strokes: wiz.strokes.map((s) => ({ ...s, radius: s.radius * scale, points: s.points.map((v) => v * scale) })),
+    strokes: wiz.strokes.map((s) => scaleEdit(s, scale)),
+    angle: wiz.angle,
+    pad: { ...wiz.pad },
     rect: { x: wiz.rect.x * scale, y: wiz.rect.y * scale, w: wiz.rect.w * scale, h: wiz.rect.h * scale },
     ratio: wiz.ratio,
     adjust: { ...wiz.adjust },
@@ -158,10 +184,21 @@ function sourceState(params, scale) {
   };
 }
 
+/** An edit with its coordinates and sizes multiplied by k (the stored photo may be smaller than the original). */
+const scaleEdit = (s, k) => ({
+  ...s,
+  ...(s.radius != null && { radius: s.radius * k }),
+  points: s.points.map((v) => v * k),
+  ...(s.off && { off: s.off.map((v) => v * k) }),
+});
+
 function applyState(st) {
   wiz.rotation = st.rotation;
   wiz.mirrored = st.mirrored;
-  wiz.strokes = st.strokes.map((s) => ({ ...s, points: [...s.points] }));
+  wiz.angle = st.angle || 0;
+  wiz.pad = st.pad ? { ...st.pad } : { on: false, color: null };
+  wiz.strokes = st.strokes.map((s) => scaleEdit(s, 1));
+  syncTiltSlider();
   buildPhoto();
   wiz.rect = { ...st.rect };
   wiz.ratio = st.ratio;
@@ -195,6 +232,7 @@ export function translateWizard() {
   translatePage();
   $("#btn-mirror").innerHTML = icon("flip") + " " + t("mir");
   $("#btn-rotate").innerHTML = icon("rot") + " " + t("rotb");
+  $("#btn-flipv").innerHTML = `<span class="icon-turned">${icon("flip")}</span> ` + t("flipv");
   $("#wiz-back").innerHTML = icon("back");
   $("#wiz-undo").innerHTML = icon("undo");
   $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
@@ -204,7 +242,7 @@ export function translateWizard() {
 function goToStep(n) {
   wiz.step = n;
   cropCanvas.hidden = n !== 1;
-  adjustCanvas.hidden = n !== 2;
+  adjustWrap.hidden = n !== 2;
   previewWrap.hidden = n !== 3;
   ["crop", "adjust", "pixel"].forEach((name, i) => ($("#panel-" + name).hidden = i + 1 !== n));
   $("#wiz-title").textContent = t(["", "crop", "adj", "pix"][n]);
@@ -215,7 +253,10 @@ function goToStep(n) {
     updateEditorUi();
     requestAnimationFrame(drawCrop);
   }
-  if (n === 2) drawAdjustPreview();
+  if (n === 2) {
+    adjView.zoom = 1;
+    requestAnimationFrame(drawAdjustPreview);
+  } else adjRegions.clear(); // free the preview's pixel copies
   if (n === 3) {
     if (!wiz.sized) {
       const r = cropRatio();
@@ -240,6 +281,7 @@ $("#wiz-back").onclick = () => {
 $("#wiz-next").onclick = () => (wiz.step < 3 ? goToStep(wiz.step + 1) : createCanvasFromResult());
 addEventListener("resize", () => {
   drawCrop();
+  if (wiz.step === 2) scheduleAdjust();
   if (wiz.step === 3) applyPreviewZoom();
 });
 
@@ -251,13 +293,15 @@ function pushHistory(entry) {
   $("#wiz-undo").disabled = false;
 }
 
-/** Remembers crop/rotation/adjustments before a change. */
+/** Remembers crop/rotation/margins/adjustments before a change. */
 const snapshot = () =>
   pushHistory({
     geometry: JSON.stringify({
       rect: wiz.rect,
       rotation: wiz.rotation,
       mirrored: wiz.mirrored,
+      angle: wiz.angle,
+      pad: wiz.pad,
       ratio: wiz.ratio,
       adjust: wiz.adjust,
     }),
@@ -268,21 +312,24 @@ function undo() {
   if (!e) return;
   if (e.stroke) {
     wiz.strokes.pop();
-    replayStrokes();
+    replayEdits();
   } else if (e.strokesBefore) {
     wiz.strokes = e.strokesBefore;
-    replayStrokes();
+    replayEdits();
   } else {
     const s = JSON.parse(e.geometry);
-    const turned = s.rotation !== wiz.rotation || s.mirrored !== wiz.mirrored;
+    const turned = s.rotation !== wiz.rotation || s.mirrored !== wiz.mirrored || (s.angle || 0) !== wiz.angle;
     wiz.rotation = s.rotation;
     wiz.mirrored = s.mirrored;
+    wiz.angle = s.angle || 0;
+    wiz.pad = s.pad || { on: false, color: null };
     if (turned) buildPhoto();
     wiz.rect = s.rect;
     wiz.ratio = s.ratio;
     wiz.adjust = s.adjust;
     ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
     highlightRatio();
+    syncTiltSlider();
   }
   photoChanged();
   if (wiz.step === 1) drawCrop();
@@ -291,9 +338,19 @@ function undo() {
 }
 $("#wiz-undo").onclick = undo;
 
-/* ---------- photo (rotation, mirror, touch-up strokes) ---------- */
+/* ---------- photo (rotation, mirror, tilt, edits) ----------
+   wiz.base  = the photo turned by quarter turns, mirrored, tilted (and enlarged so the tilt leaves no corners);
+   photo     = base with all edits (wiz.strokes) applied in order. Edits are stored in original-photo
+   coordinates ("source"), so turning the photo or undoing replays them in the right place. */
 
-/** Draws the photo rotated/mirrored into wiz.base; photo = base + stroke overlay. */
+/** Fine-tilt transform: [cos * k, sin * k, k], k = enlargement that hides the corners. */
+function tiltMatrix() {
+  if (!wiz.angle) return [1, 0, 1];
+  const k = coverScale(wiz.base.width, wiz.base.height, wiz.angle);
+  const a = (wiz.angle * Math.PI) / 180;
+  return [Math.cos(a) * k, Math.sin(a) * k, k];
+}
+
 function buildPhoto() {
   const im = wiz.image;
   const sideways = wiz.rotation % 2;
@@ -302,12 +359,17 @@ function buildPhoto() {
   x.fillStyle = "#fff"; // transparent PNGs get a white background
   x.fillRect(0, 0, c.width, c.height);
   x.translate(c.width / 2, c.height / 2);
+  if (wiz.angle) {
+    const k = coverScale(c.width, c.height, wiz.angle);
+    x.rotate((wiz.angle * Math.PI) / 180);
+    x.scale(k, k);
+    x.imageSmoothingQuality = "high";
+  }
   x.rotate((wiz.rotation * Math.PI) / 2);
   if (wiz.mirrored) x.scale(-1, 1);
   x.drawImage(im, -im.width / 2, -im.height / 2);
   wiz.base = photo = c;
-  wiz.overlay = null;
-  if (wiz.strokes.length) replayStrokes();
+  if (wiz.strokes.length) replayEdits();
   photoChanged();
 }
 
@@ -325,18 +387,60 @@ function photoChanged() {
   wiz.result = null;
 }
 
-$("#btn-rotate").onclick = () => {
+/**
+ * Turns or flips the photo as shown on screen, keeping the crop frame on the same part of the picture.
+ *   "rot":   90° clockwise;  "flipH": left-right;  "flipV": upside down.
+ * In terms of the stored transform (mirror first, then quarter turns, then tilt): a flip on screen
+ * reverses the quarter turns and the tilt and toggles the mirror (flipV = flipH + half a turn).
+ */
+function turnPhoto(kind) {
   snapshot();
-  wiz.rotation = (wiz.rotation + 1) % 4;
-  resetOrientation();
+  const PW = photo.width;
+  const PH = photo.height;
+  const r = wiz.rect;
+  if (kind === "rot") {
+    wiz.rotation = (wiz.rotation + 1) % 4;
+    wiz.rect = { x: PH - (r.y + r.h), y: r.x, w: r.h, h: r.w };
+    if (wiz.ratio) wiz.ratio = 1 / wiz.ratio;
+  } else {
+    wiz.rotation = ((kind === "flipV" ? 6 : 4) - wiz.rotation) % 4;
+    wiz.mirrored = !wiz.mirrored;
+    wiz.angle = -wiz.angle || 0;
+    if (kind === "flipH") wiz.rect = { ...r, x: PW - r.x - r.w };
+    else wiz.rect = { ...r, y: PH - r.y - r.h };
+    syncTiltSlider();
+  }
+  buildPhoto();
+  highlightRatio();
   drawCrop();
-};
-$("#btn-mirror").onclick = () => {
-  snapshot();
-  wiz.mirrored = !wiz.mirrored;
-  resetOrientation();
-  drawCrop();
-};
+}
+$("#btn-rotate").onclick = () => turnPhoto("rot");
+$("#btn-mirror").onclick = () => turnPhoto("flipH");
+$("#btn-flipv").onclick = () => turnPhoto("flipV");
+
+/* tilt slider: rebuilding a big photo takes a moment, so at most once per frame */
+let tiltFrame = 0;
+function syncTiltSlider() {
+  setSlider("tilt", wiz.angle || 0);
+  $("#tilt").previousElementSibling.textContent = (wiz.angle || 0) + "°";
+}
+$("#panel-crop").addEventListener(
+  "pointerdown",
+  (e) => {
+    if (e.target.closest("#tilt")) snapshot();
+  },
+  true,
+);
+$("#panel-crop").addEventListener("input", (e) => {
+  if (e.target.id !== "tilt") return;
+  e.target.previousElementSibling.textContent = e.target.value + "°";
+  wiz.angle = +e.target.value;
+  cancelAnimationFrame(tiltFrame);
+  tiltFrame = requestAnimationFrame(() => {
+    buildPhoto();
+    drawCrop();
+  });
+});
 
 /* ---------- crop rectangle ---------- */
 
@@ -362,52 +466,154 @@ for (const [value, label] of RATIOS) {
   $("#ratio-chips").append(b);
 }
 
+/* margins ("Поля"): the frame may reach beyond the photo; what is outside is filled with one color */
+{
+  const chip = document.createElement("button");
+  chip.className = "chip";
+  chip.id = "btn-pad";
+  chip.dataset.i = "pad";
+  chip.onclick = () => {
+    snapshot();
+    wiz.pad = { ...wiz.pad, on: !wiz.pad.on };
+    if (wiz.pad.on && !wiz.pad.color) wiz.pad.color = photoEdgeColor();
+    if (wiz.pad.on) {
+      if (wiz.ratio)
+        fitRectToRatio(); // with a ratio chosen: the whole photo inside, margins around it
+      else toast(t("h_pad"));
+    } else clampRectToPhoto();
+    highlightRatio();
+    photoChanged();
+    drawCrop();
+  };
+  $("#ratio-chips").append(chip, Object.assign(document.createElement("span"), { id: "pad-color-slot" }));
+  $("#pad-color-slot").outerHTML = colorButtonHtml("pad-color", "#ffffff", "hidden");
+  $("#pad-color").onclick = async () =>
+    openColorPicker({
+      value: wiz.pad.color || "#ffffff",
+      title: t("pad"),
+      rows: [{ label: t("cp_photo"), colors: [...new Set([photoEdgeColor(), ...(await photoColors())])] }],
+      onDone: (hex) => {
+        snapshot();
+        wiz.pad = { ...wiz.pad, color: hex };
+        highlightRatio();
+        photoChanged();
+        drawCrop();
+      },
+    });
+}
+
+/** Average color along the photo's edge (the default margin color: the picture seems to continue). */
+function photoEdgeColor() {
+  const n = 96;
+  const c = createCanvas(n, n).getContext("2d");
+  c.drawImage(photo, 0, 0, n, n);
+  return rgbToHex(...edgeColor(c.getImageData(0, 0, n, n).data, n, n));
+}
+
 function highlightRatio() {
-  $$("#ratio-chips .chip").forEach((b) => {
+  $$("#ratio-chips .chip[data-ratio]").forEach((b) => {
     const v = +b.dataset.ratio;
     const r = wiz.ratio;
     const on = v === 0 ? !r : v > 0 ? Math.abs(v - r) < 1e-6 : !!r && Math.abs(r - photo.width / photo.height) < 1e-6;
     b.classList.toggle("on", on);
   });
+  $("#btn-pad").classList.toggle("on", !!wiz.pad.on);
+  const padColor = $("#pad-color");
+  padColor.hidden = !wiz.pad.on;
+  padColor.style.background = wiz.pad.color || "#ffffff";
 }
 
-/** Largest rectangle of the chosen ratio, centered where the current one is. */
+/** Where the frame may go: the photo, or with margins on, up to half its longer side beyond each edge. */
+function cropBounds() {
+  const m = wiz.pad.on ? Math.max(photo.width, photo.height) / 2 : 0;
+  return { x0: -m, y0: -m, x1: photo.width + m, y1: photo.height + m };
+}
+
+/** Margins turned off: the frame goes back inside the photo. */
+function clampRectToPhoto() {
+  const r = wiz.rect;
+  const x0 = Math.max(0, r.x);
+  const y0 = Math.max(0, r.y);
+  const x1 = Math.min(photo.width, r.x + r.w);
+  const y1 = Math.min(photo.height, r.y + r.h);
+  wiz.rect =
+    x1 - x0 >= 12 && y1 - y0 >= 12
+      ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+      : { x: 0, y: 0, w: photo.width, h: photo.height };
+  if (wiz.ratio) fitRectToRatio();
+}
+
+/**
+ * Frame of the chosen ratio. Without margins: the largest one inside the photo, centered where the current
+ * one is. With margins: the smallest one that holds the whole photo (the rest becomes margin).
+ */
 function fitRectToRatio() {
   const R = wiz.ratio;
   if (!R) return;
-  const r = wiz.rect;
+  const PW = photo.width;
+  const PH = photo.height;
   let w;
   let h;
-  if (photo.width / photo.height > R) {
-    h = photo.height;
+  if (wiz.pad.on) {
+    if (PW / PH > R) {
+      w = PW;
+      h = w / R;
+    } else {
+      h = PH;
+      w = h * R;
+    }
+    wiz.rect = { w, h, x: (PW - w) / 2, y: (PH - h) / 2 };
+    return;
+  }
+  if (PW / PH > R) {
+    h = PH;
     w = h * R;
   } else {
-    w = photo.width;
+    w = PW;
     h = w / R;
   }
+  const r = wiz.rect;
   const cx = r.x + r.w / 2;
   const cy = r.y + r.h / 2;
   wiz.rect = {
     w,
     h,
-    x: Math.min(photo.width - w, Math.max(0, cx - w / 2)),
-    y: Math.min(photo.height - h, Math.max(0, cy - h / 2)),
+    x: Math.min(PW - w, Math.max(0, cx - w / 2)),
+    y: Math.min(PH - h, Math.max(0, cy - h / 2)),
   };
 }
 
 const cropRatio = () => wiz.rect.w / wiz.rect.h;
 
+/** Area the view fits on screen: the photo, plus the frame where it reaches into the margins. */
+let frozenBox = null; // kept while the frame is being dragged, so the view does not jump under the finger
+function viewBox() {
+  if (!wiz.pad.on) return { x0: 0, y0: 0, x1: photo.width, y1: photo.height };
+  if (frozenBox) return frozenBox;
+  const r = wiz.rect;
+  return {
+    x0: Math.min(0, r.x),
+    y0: Math.min(0, r.y),
+    x1: Math.max(photo.width, r.x + r.w),
+    y1: Math.max(photo.height, r.y + r.h),
+  };
+}
+
 /** Where the photo sits on screen: screen = offset + photoPixel * scale. */
 function cropGeometry() {
   const w = cropCanvas.clientWidth;
   const h = cropCanvas.clientHeight;
-  const scale = Math.min(w / photo.width, h / photo.height) * 0.94 * wiz.zoom;
+  const b = viewBox();
+  const BW = b.x1 - b.x0;
+  const BH = b.y1 - b.y0;
+  const scale = Math.min(w / BW, h / BH) * 0.94 * wiz.zoom;
   return {
     scale,
-    ox: (w - photo.width * scale) / 2 + wiz.panX,
-    oy: (h - photo.height * scale) / 2 + wiz.panY,
+    ox: (w - BW * scale) / 2 - b.x0 * scale + wiz.panX,
+    oy: (h - BH * scale) / 2 - b.y0 * scale + wiz.panY,
     w,
     h,
+    box: b,
   };
 }
 
@@ -424,18 +630,36 @@ function drawCrop() {
   x.clearRect(0, 0, g.w, g.h);
   const PW = photo.width * g.scale;
   const PH = photo.height * g.scale;
-  x.drawImage(photo, g.ox, g.oy, PW, PH);
   const r = wiz.rect;
   const X = g.ox + r.x * g.scale;
   const Y = g.oy + r.y * g.scale;
   const RW = r.w * g.scale;
   const RH = r.h * g.scale;
-  // darken outside the crop
+  if (wiz.pad.on) {
+    x.fillStyle = wiz.pad.color || "#fff";
+    x.fillRect(X, Y, RW, RH);
+  }
+  x.drawImage(photo, g.ox, g.oy, PW, PH);
+  // darken the photo outside the crop
+  x.save();
+  x.beginPath();
+  x.rect(g.ox, g.oy, PW, PH);
+  x.clip();
+  x.beginPath();
+  x.rect(g.ox, g.oy, PW, PH);
+  x.rect(X, Y, RW, RH);
   x.fillStyle = "rgba(0,0,0,.55)";
-  x.fillRect(g.ox, g.oy, PW, Y - g.oy);
-  x.fillRect(g.ox, Y + RH, PW, g.oy + PH - Y - RH);
-  x.fillRect(g.ox, Y, X - g.ox, RH);
-  x.fillRect(X + RW, Y, g.ox + PW - X - RW, RH);
+  x.fill("evenodd");
+  x.restore();
+  drawEditorOverlay(x, g);
+  if (wiz.tool !== "crop") {
+    x.strokeStyle = "#fff";
+    x.globalAlpha = 0.6;
+    x.lineWidth = 1;
+    x.strokeRect(X, Y, RW, RH);
+    x.globalAlpha = 1;
+    return;
+  }
   // frame, rule-of-thirds lines, corner handles
   x.strokeStyle = "#fff";
   x.lineWidth = 1.5;
@@ -467,17 +691,18 @@ function drawCrop() {
 function resizeCrop(corner, dx, dy) {
   const r = wiz.rect;
   const R = wiz.ratio;
+  const b = cropBounds();
   const right = corner[1] === "r";
   const bottom = corner[0] === "b";
   const anchorX = right ? r.x : r.x + r.w;
   const anchorY = bottom ? r.y : r.y + r.h;
-  const px = Math.max(0, Math.min(photo.width, (right ? r.x + r.w : r.x) + dx));
-  const py = Math.max(0, Math.min(photo.height, (bottom ? r.y + r.h : r.y) + dy));
+  const px = Math.max(b.x0, Math.min(b.x1, (right ? r.x + r.w : r.x) + dx));
+  const py = Math.max(b.y0, Math.min(b.y1, (bottom ? r.y + r.h : r.y) + dy));
   let w = Math.max(12, Math.abs(px - anchorX));
   let h = Math.max(12, Math.abs(py - anchorY));
   if (R) {
-    const roomX = right ? photo.width - anchorX : anchorX;
-    const roomY = bottom ? photo.height - anchorY : anchorY;
+    const roomX = right ? b.x1 - anchorX : anchorX - b.x0;
+    const roomY = bottom ? b.y1 - anchorY : anchorY - b.y0;
     w = Math.min(w, roomX, roomY * R);
     h = w / R;
   }
@@ -492,6 +717,7 @@ let cropSnapshotTaken = false;
 cropCanvas.addEventListener("pointerdown", (e) => {
   cropCanvas.setPointerCapture(e.pointerId);
   cropPointers.set(e.pointerId, [e.offsetX, e.offsetY]);
+  frozenBox = frozenBox || viewBox();
   if (cropPointers.size > 1) {
     cropMode = "pinch";
     pinchDist = 0;
@@ -525,27 +751,28 @@ cropCanvas.addEventListener("pointermove", (e) => {
   }
   const k = cropGeometry().scale;
   const r = wiz.rect;
+  const b = cropBounds();
   if (cropPointers.size > 1) {
     // pinch resizes the crop around its center
-    const [a, b] = [...cropPointers.values()];
-    const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const [p, q] = [...cropPointers.values()];
+    const d = Math.hypot(p[0] - q[0], p[1] - q[1]);
     if (pinchDist) {
-      const s = Math.min(pinchDist / d, photo.width / r.w, photo.height / r.h);
-      const w = r.w * s;
-      const h = r.h * s;
+      const s = Math.min(pinchDist / d, (b.x1 - b.x0) / r.w, (b.y1 - b.y0) / r.h);
+      const w = Math.max(12, r.w * s);
+      const h = Math.max(12, r.h * s);
       const cx = r.x + r.w / 2;
       const cy = r.y + r.h / 2;
       wiz.rect = {
         w,
         h,
-        x: Math.max(0, Math.min(photo.width - w, cx - w / 2)),
-        y: Math.max(0, Math.min(photo.height - h, cy - h / 2)),
+        x: Math.max(b.x0, Math.min(b.x1 - w, cx - w / 2)),
+        y: Math.max(b.y0, Math.min(b.y1 - h, cy - h / 2)),
       };
     }
     pinchDist = d;
   } else if (cropMode === "move") {
-    wiz.rect.x = Math.max(0, Math.min(photo.width - r.w, r.x + (now[0] - old[0]) / k));
-    wiz.rect.y = Math.max(0, Math.min(photo.height - r.h, r.y + (now[1] - old[1]) / k));
+    wiz.rect.x = Math.max(b.x0, Math.min(b.x1 - r.w, r.x + (now[0] - old[0]) / k));
+    wiz.rect.y = Math.max(b.y0, Math.min(b.y1 - r.h, r.y + (now[1] - old[1]) / k));
   } else if (cropMode) resizeCrop(cropMode, (now[0] - old[0]) / k, (now[1] - old[1]) / k);
   if (cropMode) photoChanged();
   drawCrop();
@@ -556,14 +783,24 @@ const cropPointerUp = (e) => {
   if (!cropPointers.size) {
     cropMode = null;
     cropSnapshotTaken = false;
+    frozenBox = null;
+    drawCrop(); // the view may now fit the margins differently
   }
 };
 cropCanvas.addEventListener("pointerup", cropPointerUp);
 cropCanvas.addEventListener("pointercancel", cropPointerUp);
 
-/* ---------- touch-up editor (pan / brush / restore / eyedropper on the crop canvas) ----------
-   Strokes are stored in original-photo coordinates so rotate/mirror/undo can replay them.
-   photo = base (clean rotated photo) + overlay (strokes); "restore" strokes erase the overlay. */
+/* ---------- photo editor (pan / brush / shapes / fill / color replace / blur / clone / restore / eyedropper)
+   Every edit is one entry of wiz.strokes:
+     brush    { color, radius, points }            (older canvases: same, restore: true = restore stroke)
+     restore  { restore: true, radius, points }    copies the untouched photo back
+     shape    { kind: "shape", shape: "rect" | "oval" | "line", color, radius, points }
+              rect/oval: the four corners (top-left, top-right, bottom-right, bottom-left), line: two ends
+     fill     { kind: "fill", color, tol, seed: [r, g, b], points: [x, y] }
+     recolor  { kind: "recolor", color, tol, from: [r, g, b], points: [x, y] }
+     blur     { kind: "blur", radius, points }
+     clone    { kind: "clone", radius, points, off: [dx, dy] }  copies from (point + off)
+   points, radius and off are in original-photo coordinates. */
 
 const turn = (u, v, quarter) =>
   [
@@ -577,72 +814,185 @@ function sourceToPhoto(x, y) {
   let u = x - w / 2;
   if (wiz.mirrored) u = -u;
   const [a, b] = turn(u, y - h / 2, wiz.rotation);
-  return [a + photo.width / 2, b + photo.height / 2];
+  const [c, s] = tiltMatrix();
+  return [a * c - b * s + wiz.base.width / 2, a * s + b * c + wiz.base.height / 2];
 }
 function photoToSource(x, y) {
   const { width: w, height: h } = wiz.image;
-  let [u, v] = turn(x - photo.width / 2, y - photo.height / 2, 4 - (wiz.rotation & 3));
+  const [c, s, k] = tiltMatrix();
+  const X = x - wiz.base.width / 2;
+  const Y = y - wiz.base.height / 2;
+  let [u, v] = turn((X * c + Y * s) / (k * k), (-X * s + Y * c) / (k * k), 4 - (wiz.rotation & 3));
   if (wiz.mirrored) u = -u;
   return [u + w / 2, v + h / 2];
 }
 
-function ensureOverlay() {
-  if (wiz.overlay) return;
-  const b = wiz.base;
-  wiz.overlay = createCanvas(b.width, b.height);
-  photo = createCanvas(b.width, b.height);
-  photo.getContext("2d").drawImage(b, 0, 0);
+const editKind = (op) => op.kind || (op.restore ? "restore" : "brush");
+/** All points of an edit in photo coordinates, flat [x, y, x, y, ...]. */
+function opPoints(op) {
+  const p = [];
+  for (let i = 0; i < op.points.length; i += 2) p.push(...sourceToPhoto(op.points[i], op.points[i + 1]));
+  return p;
 }
+/** Blur radius of the blur brush, in photo pixels, for a brush of radius r. */
+const blurPx = (r) => Math.max(1, r * 0.25);
 
-/** Draws stroke s along points p (photo coordinates, flat [x, y, ...]) onto the overlay. */
-function paintStroke(s, p) {
-  const x = wiz.overlay.getContext("2d");
-  x.save();
-  x.globalCompositeOperation = s.restore ? "destination-out" : "source-over";
-  x.fillStyle = x.strokeStyle = s.restore ? "#000" : s.color;
-  x.lineWidth = s.radius * 2;
-  x.lineCap = x.lineJoin = "round";
-  x.beginPath();
-  if (p.length < 4) {
-    x.arc(p[0], p[1], s.radius, 0, 7);
-    x.fill();
-  } else {
-    x.moveTo(p[0], p[1]);
-    for (let i = 2; i < p.length; i += 2) x.lineTo(p[i], p[i + 1]);
-    x.stroke();
+/** Draws a round-capped line through flat points p (one point = a dot). */
+function tracePath(ctx, p, r, dx = 0, dy = 0) {
+  ctx.lineWidth = 2 * r;
+  ctx.lineCap = ctx.lineJoin = "round";
+  ctx.beginPath();
+  if (p.length <= 2) {
+    ctx.arc(p[0] - dx, p[1] - dy, r, 0, 7);
+    ctx.fill();
+    return;
   }
-  x.restore();
+  ctx.moveTo(p[0] - dx, p[1] - dy);
+  for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i] - dx, p[i + 1] - dy);
+  ctx.stroke();
 }
 
-/** photo = base + overlay, inside the given rectangle only. */
-function composite(x0, y0, x1, y1) {
-  x0 = Math.max(0, Math.floor(x0));
-  y0 = Math.max(0, Math.floor(y0));
-  x1 = Math.min(photo.width, Math.ceil(x1));
-  y1 = Math.min(photo.height, Math.ceil(y1));
-  const w = x1 - x0;
-  const h = y1 - y0;
+const scratch = createCanvas(1, 1);
+/**
+ * Copies picture `src` onto the photo, but only under the brush path p (radius r): restore copies the
+ * untouched photo, clone copies the photo shifted by (dx, dy), blur copies a blurred photo.
+ */
+function drawFrom(src, dx, dy, p, r, blur = 0) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < p.length; i += 2) {
+    minX = Math.min(minX, p[i]);
+    maxX = Math.max(maxX, p[i]);
+    minY = Math.min(minY, p[i + 1]);
+    maxY = Math.max(maxY, p[i + 1]);
+  }
+  const X0 = Math.max(0, Math.floor(minX - r - 2));
+  const Y0 = Math.max(0, Math.floor(minY - r - 2));
+  const X1 = Math.min(photo.width, Math.ceil(maxX + r + 2));
+  const Y1 = Math.min(photo.height, Math.ceil(maxY + r + 2));
+  const w = X1 - X0;
+  const h = Y1 - Y0;
   if (w < 1 || h < 1) return;
-  const c = photo.getContext("2d");
-  c.drawImage(wiz.base, x0, y0, w, h, x0, y0, w, h);
-  c.drawImage(wiz.overlay, x0, y0, w, h, x0, y0, w, h);
+  scratch.width = w;
+  scratch.height = h;
+  const c = scratch.getContext("2d");
+  // with blur, also take the surroundings, so pixels near the edge of the brush blur with real neighbours
+  const m = blur ? Math.ceil(blur * 3) : 0;
+  if (blur) c.filter = `blur(${blur}px)`;
+  c.drawImage(src, X0 + dx - m, Y0 + dy - m, w + 2 * m, h + 2 * m, -m, -m, w + 2 * m, h + 2 * m);
+  c.filter = "none";
+  c.globalCompositeOperation = "destination-in";
+  c.fillStyle = c.strokeStyle = "#000";
+  tracePath(c, p, r, X0, Y0);
+  c.globalCompositeOperation = "source-over";
+  photo.getContext("2d").drawImage(scratch, X0, Y0);
 }
 
-function replayStrokes() {
-  if (!wiz.strokes.length && !wiz.overlay) return;
-  ensureOverlay();
-  wiz.overlay.getContext("2d").clearRect(0, 0, wiz.overlay.width, wiz.overlay.height);
-  for (const s of wiz.strokes) {
-    const p = [];
-    for (let i = 0; i < s.points.length; i += 2) p.push(...sourceToPhoto(s.points[i], s.points[i + 1]));
-    paintStroke(s, p);
+function drawShape(ctx, op, p) {
+  ctx.fillStyle = ctx.strokeStyle = op.color;
+  if (op.shape === "line") {
+    tracePath(ctx, p, op.radius * tiltMatrix()[2]);
+    return;
   }
-  composite(0, 0, photo.width, photo.height);
+  ctx.beginPath();
+  if (op.shape === "rect") {
+    ctx.moveTo(p[0], p[1]);
+    for (let i = 2; i < 8; i += 2) ctx.lineTo(p[i], p[i + 1]);
+    ctx.closePath();
+  } else {
+    // ellipse inside the four corners: a unit circle stretched along the two sides
+    ctx.save();
+    ctx.transform(
+      (p[2] - p[0]) / 2,
+      (p[3] - p[1]) / 2,
+      (p[6] - p[0]) / 2,
+      (p[7] - p[1]) / 2,
+      (p[0] + p[4]) / 2,
+      (p[1] + p[5]) / 2,
+    );
+    ctx.arc(0, 0, 1, 0, Math.PI * 2);
+    ctx.restore();
+  }
+  ctx.fill();
 }
+
+/** Fill and color replace work on the pixels of the whole photo. */
+function applyPixelEdit(op) {
+  const W = photo.width;
+  const H = photo.height;
+  const ctx = photo.getContext("2d");
+  const img = ctx.getImageData(0, 0, W, H);
+  const color = hexToRgb(op.color);
+  if (op.kind === "fill") {
+    const [x, y] = sourceToPhoto(op.points[0], op.points[1]).map(Math.floor);
+    blendMask(img.data, floodFillMask(img.data, W, H, x, y, op.seed, op.tol), color);
+  } else recolor(img.data, op.from, color, op.tol);
+  ctx.putImageData(img, 0, 0);
+}
+
+/** Applies one whole edit to the photo (replaying; while drawing, strokes go segment by segment). */
+function applyEdit(op) {
+  const ctx = photo.getContext("2d");
+  const kind = editKind(op);
+  const p = opPoints(op);
+  const r = (op.radius || 0) * tiltMatrix()[2];
+  if (kind === "brush") {
+    ctx.fillStyle = ctx.strokeStyle = op.color;
+    tracePath(ctx, p, r);
+  } else if (kind === "restore") drawFrom(wiz.base, 0, 0, p, r);
+  else if (kind === "blur") drawFrom(photo, 0, 0, p, r, blurPx(r));
+  else if (kind === "clone") {
+    const [dx, dy] = cloneShift(op);
+    drawFrom(photo, dx, dy, p, r);
+  } else if (kind === "shape") drawShape(ctx, op, p);
+  else applyPixelEdit(op);
+}
+
+/** Clone offset of an edit, in photo pixels (the same everywhere: the photo transform is linear). */
+function cloneShift(op) {
+  const a = sourceToPhoto(op.points[0], op.points[1]);
+  const b = sourceToPhoto(op.points[0] + op.off[0], op.points[1] + op.off[1]);
+  return [b[0] - a[0], b[1] - a[1]];
+}
+
+/** photo = base + all edits. */
+function replayEdits() {
+  if (!wiz.strokes.length) {
+    photo = wiz.base;
+    return;
+  }
+  photo = createCanvas(wiz.base.width, wiz.base.height);
+  photo.getContext("2d").drawImage(wiz.base, 0, 0);
+  for (const op of wiz.strokes) applyEdit(op);
+}
+
+/** Before the first edit photo is the base itself; edits must not change the base. */
+function ensureOwnPhoto() {
+  if (photo !== wiz.base) return;
+  photo = createCanvas(wiz.base.width, wiz.base.height);
+  photo.getContext("2d").drawImage(wiz.base, 0, 0);
+}
+
+/* tools that need a color, a size, a tolerance, a shape kind or a clone source */
+const COLOR_TOOLS = ["brush", "shape", "fill", "recolor", "pick"];
+const SIZE_TOOLS = ["brush", "shape", "blur", "clone", "rest"];
+const TOL_TOOLS = ["fill", "recolor"];
 
 function updateEditorUi() {
   $$("#editor-tools [data-tool]").forEach((b) => b.classList.toggle("on", b.dataset.tool === wiz.tool));
-  $("#editor-hint").textContent = t("h_" + wiz.tool);
+  const cloneReady = wiz.tool === "clone" && wiz.clone;
+  $("#editor-hint").textContent = t("h_" + wiz.tool + (cloneReady ? "2" : ""));
+  const tool = wiz.tool;
+  $("#brush-color").hidden = !COLOR_TOOLS.includes(tool);
+  $("#brush-color").style.background = wiz.color;
+  $("#shape-kinds").hidden = tool !== "shape";
+  $$("#shape-kinds [data-shape]").forEach((b) => b.classList.toggle("on", b.dataset.shape === wiz.shape));
+  $("#btn-clone-source").hidden = tool !== "clone";
+  $("#brush-size").closest(".field").hidden = !SIZE_TOOLS.includes(tool);
+  $("#tol").closest(".field").hidden = !TOL_TOOLS.includes(tool);
+  drawCrop();
 }
 
 /** Zoom the crop view by factor s around screen point (mx, my). */
@@ -652,9 +1002,10 @@ function zoomCropView(s, mx, my) {
   const k = g.scale * (z / wiz.zoom);
   const u = (mx - g.ox) / g.scale;
   const v = (my - g.oy) / g.scale;
+  const b = g.box;
   wiz.zoom = z;
-  wiz.panX = mx - u * k - (g.w - photo.width * k) / 2;
-  wiz.panY = my - v * k - (g.h - photo.height * k) / 2;
+  wiz.panX = mx - u * k - ((g.w - (b.x1 - b.x0) * k) / 2 - b.x0 * k);
+  wiz.panY = my - v * k - ((g.h - (b.y1 - b.y0) * k) / 2 - b.y0 * k);
   if (z === 1) wiz.panX = wiz.panY = 0;
   drawCrop();
 }
@@ -663,18 +1014,132 @@ const pointerToPhoto = (e) => {
   const g = cropGeometry();
   return [(e.offsetX - g.ox) / g.scale, (e.offsetY - g.oy) / g.scale];
 };
+const insidePhoto = ([x, y]) => x >= 0 && y >= 0 && x < photo.width && y < photo.height;
+function photoPixel([x, y]) {
+  const d = photo.getContext("2d").getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
+  return [d[0], d[1], d[2]];
+}
+
+function setEditColor(hex) {
+  wiz.color = hex;
+  $("#brush-color").style.background = hex;
+}
 
 function pickColor(e) {
-  const [x, y] = pointerToPhoto(e);
-  if (x < 0 || y < 0 || x >= photo.width || y >= photo.height) return;
-  const d = photo.getContext("2d").getImageData(x | 0, y | 0, 1, 1).data;
-  $("#brush-color").value = "#" + [d[0], d[1], d[2]].map((v) => v.toString(16).padStart(2, "0")).join("");
+  const p = pointerToPhoto(e);
+  if (insidePhoto(p)) setEditColor(rgbToHex(...photoPixel(p)));
+}
+
+/** Main colors of the photo (for the color picker), recomputed when the photo changes. */
+async function photoColors() {
+  if (wiz.photoColors && wiz.photoColors.key === wiz.editVersion) return wiz.photoColors.colors;
+  const n = 64;
+  const c = createCanvas(n, n).getContext("2d");
+  c.drawImage(photo, 0, 0, n, n);
+  const pal = await kmeansPalette(c.getImageData(0, 0, n, n).data, n * n, 12);
+  const bytes = Uint8Array.from(pal);
+  const colors = [
+    ...new Set(paletteOrder(bytes, "col").map((k) => rgbToHex(bytes[k * 3], bytes[k * 3 + 1], bytes[k * 3 + 2]))),
+  ];
+  wiz.photoColors = { key: wiz.editVersion, colors };
+  return colors;
+}
+
+$("#brush-color").onclick = async () => {
+  const colors = await photoColors();
+  openColorPicker({
+    value: wiz.color,
+    rows: [{ label: t("cp_photo"), colors }],
+    onEyedropper: () => {
+      if (wiz.tool !== "pick") wiz.prevTool = wiz.tool;
+      wiz.tool = "pick";
+      updateEditorUi();
+    },
+    onDone: setEditColor,
+  });
+};
+
+/* things drawn over the photo while editing: shape being dragged, clone source, brush outline */
+function drawEditorOverlay(x, g) {
+  const toScreen = ([px, py]) => [g.ox + px * g.scale, g.oy + py * g.scale];
+  const d = editDraft;
+  if (d && d.end) {
+    const op = shapeEdit(d.start, d.end);
+    const p = [];
+    for (let i = 0; i < op.photoPoints.length; i += 2) p.push(...toScreen([op.photoPoints[i], op.photoPoints[i + 1]]));
+    x.save();
+    x.globalAlpha = 0.85;
+    drawShape(x, { ...op, radius: op.radius * g.scale }, p);
+    x.restore();
+  }
+  if (wiz.tool === "clone" && wiz.clone) {
+    // where the clone copies from right now
+    const at =
+      wiz.clone.off && lastPoint
+        ? [lastPoint[0] + wiz.clone.shift[0], lastPoint[1] + wiz.clone.shift[1]]
+        : sourceToPhoto(...wiz.clone.source);
+    const [sx, sy] = toScreen(at);
+    const rr = Math.max(6, wiz.brushSize / 2);
+    x.lineWidth = 2;
+    for (const [color, w] of [
+      ["#000a", 4],
+      ["#fff", 2],
+    ]) {
+      x.strokeStyle = color;
+      x.lineWidth = w;
+      x.beginPath();
+      x.arc(sx, sy, rr, 0, 7);
+      x.moveTo(sx - rr - 6, sy);
+      x.lineTo(sx + rr + 6, sy);
+      x.moveTo(sx, sy - rr - 6);
+      x.lineTo(sx, sy + rr + 6);
+      x.stroke();
+    }
+  }
+}
+
+/** A shape edit from two photo points (rect/oval: axis-aligned on screen; line: the two points). */
+function shapeEdit(a, b) {
+  const corners =
+    wiz.shape === "line"
+      ? [a, b]
+      : [
+          [Math.min(a[0], b[0]), Math.min(a[1], b[1])],
+          [Math.max(a[0], b[0]), Math.min(a[1], b[1])],
+          [Math.max(a[0], b[0]), Math.max(a[1], b[1])],
+          [Math.min(a[0], b[0]), Math.max(a[1], b[1])],
+        ];
+  return {
+    kind: "shape",
+    shape: wiz.shape,
+    color: wiz.color,
+    radius: wiz.brushSize / 2 / cropGeometry().scale / tiltMatrix()[2],
+    points: corners.flatMap((q) => photoToSource(q[0], q[1])),
+    photoPoints: corners.flat(),
+  };
 }
 
 const editPointers = new Map();
-let activeStroke = null;
+let activeStroke = null; // edit being drawn with the finger
+let strokeSource = null; // picture the clone/blur stroke copies from (the photo as it was when it started)
 let lastPoint = null;
 let editPinch = 0;
+let editDraft = null; // { start, end } of a shape being dragged
+let tapStart = null; // [x, y] screen position of a touch that may turn out to be a tap
+
+/** One piece of the stroke being drawn, from photo point a to b. */
+function strokeSegment(op, a, b) {
+  const kind = editKind(op);
+  const r = op.radius * tiltMatrix()[2];
+  const p = a === b ? [a[0], a[1]] : [a[0], a[1], b[0], b[1]];
+  if (kind === "brush") {
+    const ctx = photo.getContext("2d");
+    ctx.fillStyle = ctx.strokeStyle = op.color;
+    tracePath(ctx, p, r);
+  } else if (kind === "restore") drawFrom(wiz.base, 0, 0, p, r);
+  else if (kind === "blur") drawFrom(strokeSource, 0, 0, p, r, blurPx(r));
+  else if (kind === "clone") drawFrom(strokeSource, wiz.clone.shift[0], wiz.clone.shift[1], p, r);
+}
 
 // These run in the capture phase, before the crop handlers, and stop them unless the crop tool is active.
 cropCanvas.addEventListener(
@@ -691,34 +1156,45 @@ cropCanvas.addEventListener(
       if (activeStroke && activeStroke.points.length <= 4 && top && top.stroke) {
         wiz.strokes.pop();
         history.pop();
-        replayStrokes();
+        replayEdits();
         photoChanged();
-        drawCrop();
         $("#wiz-undo").disabled = !history.length;
       }
-      activeStroke = null;
+      activeStroke = editDraft = tapStart = null;
       editPinch = 0;
+      return drawCrop();
+    }
+    tapStart = [e.offsetX, e.offsetY];
+    const p = pointerToPhoto(e);
+    if (tool === "pick") return pickColor(e);
+    if (tool === "shape") {
+      editDraft = { start: p, end: null };
       return;
     }
-    if (tool === "pick") {
-      pickColor(e);
-      wiz.tool = "brush";
-      return updateEditorUi();
+    const radius = wiz.brushSize / 2 / cropGeometry().scale / tiltMatrix()[2];
+    let op = null;
+    if (tool === "brush") op = { color: wiz.color, radius, points: photoToSource(...p) };
+    else if (tool === "rest") op = { restore: true, radius, points: photoToSource(...p) };
+    else if (tool === "blur") op = { kind: "blur", radius, points: photoToSource(...p) };
+    else if (tool === "clone" && wiz.clone) {
+      const start = photoToSource(...p);
+      if (!wiz.clone.off) wiz.clone.off = [wiz.clone.source[0] - start[0], wiz.clone.source[1] - start[1]];
+      op = { kind: "clone", radius, points: start, off: [...wiz.clone.off] };
+      wiz.clone.shift = cloneShift(op);
     }
-    if (tool === "brush" || tool === "rest") {
-      ensureOverlay();
-      const radius = wiz.brushSize / 2 / cropGeometry().scale;
-      const p = pointerToPhoto(e);
-      const s = { restore: tool === "rest", color: $("#brush-color").value, radius, points: photoToSource(p[0], p[1]) };
-      wiz.strokes.push(s);
-      pushHistory({ stroke: true });
-      activeStroke = s;
-      lastPoint = p;
-      paintStroke(s, p);
-      composite(p[0] - radius - 2, p[1] - radius - 2, p[0] + radius + 2, p[1] + radius + 2);
-      photoChanged();
-      drawCrop();
+    if (!op) return;
+    ensureOwnPhoto();
+    if (tool === "blur" || tool === "clone") {
+      strokeSource = createCanvas(photo.width, photo.height);
+      strokeSource.getContext("2d").drawImage(photo, 0, 0);
     }
+    wiz.strokes.push(op);
+    pushHistory({ stroke: true });
+    activeStroke = op;
+    lastPoint = p;
+    strokeSegment(op, p, p);
+    photoChanged();
+    drawCrop();
   },
   true,
 );
@@ -732,6 +1208,7 @@ cropCanvas.addEventListener(
     const old = editPointers.get(e.pointerId);
     const now = [e.offsetX, e.offsetY];
     editPointers.set(e.pointerId, now);
+    if (tapStart && Math.hypot(now[0] - tapStart[0], now[1] - tapStart[1]) > 10) tapStart = null;
     if (editPointers.size > 1) {
       const [a, b] = [...editPointers.values()];
       const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -741,17 +1218,18 @@ cropCanvas.addEventListener(
       wiz.panY += (now[1] - old[1]) / 2;
       return drawCrop();
     }
-    if (tool === "pan") {
+    if (tool === "pan" || ((tool === "fill" || tool === "recolor" || (tool === "clone" && !wiz.clone)) && !tapStart)) {
+      // tap tools: a drag moves the picture instead
       wiz.panX += now[0] - old[0];
       wiz.panY += now[1] - old[1];
       drawCrop();
     } else if (tool === "pick") pickColor(e);
-    else if (activeStroke) {
+    else if (tool === "shape" && editDraft) {
+      editDraft.end = pointerToPhoto(e);
+      drawCrop();
+    } else if (activeStroke) {
       const q = pointerToPhoto(e);
-      const a = lastPoint;
-      const r = activeStroke.radius + 2;
-      paintStroke(activeStroke, [a[0], a[1], q[0], q[1]]);
-      composite(Math.min(a[0], q[0]) - r, Math.min(a[1], q[1]) - r, Math.max(a[0], q[0]) + r, Math.max(a[1], q[1]) + r);
+      strokeSegment(activeStroke, lastPoint, q);
       activeStroke.points.push(...photoToSource(q[0], q[1]));
       lastPoint = q;
       photoChanged();
@@ -764,14 +1242,69 @@ cropCanvas.addEventListener(
 const editPointerUp = (e) => {
   if (wiz.tool === "crop") return;
   e.stopImmediatePropagation();
+  const single = editPointers.size === 1 && editPointers.has(e.pointerId);
   editPointers.delete(e.pointerId);
+  if (single) finishEdit(e);
   if (!editPointers.size) {
-    activeStroke = null;
+    activeStroke = editDraft = tapStart = strokeSource = null;
     editPinch = 0;
+    drawCrop();
   }
 };
 cropCanvas.addEventListener("pointerup", editPointerUp, true);
-cropCanvas.addEventListener("pointercancel", editPointerUp, true);
+cropCanvas.addEventListener(
+  "pointercancel",
+  (e) => {
+    tapStart = editDraft = null;
+    editPointerUp(e);
+  },
+  true,
+);
+
+/** The finger was lifted: commit a shape, apply a tap tool, end the eyedropper. */
+async function finishEdit(e) {
+  const tool = wiz.tool;
+  const tapped = !!tapStart;
+  if (tool === "pick") {
+    wiz.tool = wiz.prevTool || "brush";
+    wiz.prevTool = null;
+    return updateEditorUi();
+  }
+  if (tool === "shape" && editDraft && editDraft.end) {
+    const op = shapeEdit(editDraft.start, editDraft.end);
+    delete op.photoPoints;
+    editDraft = null;
+    return commitEdit(op);
+  }
+  if (!tapped) return;
+  const p = pointerToPhoto(e);
+  if (tool === "clone" && !wiz.clone) {
+    if (!insidePhoto(p)) return;
+    wiz.clone = { source: photoToSource(...p), off: null, shift: [0, 0] };
+    return updateEditorUi();
+  }
+  if ((tool === "fill" || tool === "recolor") && insidePhoto(p)) {
+    const color = photoPixel(p);
+    const op =
+      tool === "fill"
+        ? { kind: "fill", color: wiz.color, tol: wiz.tol, seed: color, points: photoToSource(...p) }
+        : { kind: "recolor", color: wiz.color, tol: wiz.tol, from: color, points: photoToSource(...p) };
+    setBusy(true);
+    await yieldToBrowser();
+    commitEdit(op);
+    setBusy(false);
+  }
+}
+
+function commitEdit(op) {
+  ensureOwnPhoto();
+  wiz.strokes.push(op);
+  pushHistory({ stroke: true });
+  applyEdit(op);
+  photoChanged();
+  drawCrop();
+}
+
 cropCanvas.addEventListener(
   "wheel",
   (e) => {
@@ -784,8 +1317,14 @@ cropCanvas.addEventListener(
 $("#panel-crop").addEventListener("click", (e) => {
   const toolBtn = e.target.closest("#editor-tools [data-tool]");
   const zoomBtn = e.target.closest("[data-zoom]");
+  const shapeBtn = e.target.closest("[data-shape]");
   if (toolBtn) {
     wiz.tool = toolBtn.dataset.tool;
+    wiz.prevTool = null;
+    updateEditorUi();
+  }
+  if (shapeBtn) {
+    wiz.shape = shapeBtn.dataset.shape;
     updateEditorUi();
   }
   if (zoomBtn) {
@@ -797,16 +1336,25 @@ $("#panel-crop").addEventListener("click", (e) => {
     } else zoomCropView(zoomBtn.dataset.zoom > 0 ? 1.4 : 1 / 1.4, g.w / 2, g.h / 2);
   }
 });
+$("#btn-clone-source").onclick = () => {
+  wiz.clone = null;
+  updateEditorUi();
+};
 $("#panel-crop").addEventListener("input", (e) => {
-  if (e.target.id !== "brush-size") return;
-  e.target.previousElementSibling.textContent = e.target.value;
-  wiz.brushSize = +e.target.value;
+  if (e.target.id === "brush-size") {
+    e.target.previousElementSibling.textContent = e.target.value;
+    wiz.brushSize = +e.target.value;
+  }
+  if (e.target.id === "tol") {
+    e.target.previousElementSibling.textContent = e.target.value;
+    wiz.tol = +e.target.value;
+  }
 });
 $("#btn-edit-reset").onclick = () => {
   if (!wiz.strokes.length) return;
   pushHistory({ strokesBefore: wiz.strokes });
   wiz.strokes = [];
-  replayStrokes();
+  replayEdits();
   photoChanged();
   drawCrop();
 };
@@ -816,8 +1364,22 @@ $("#btn-edit-reset").onclick = () => {
 /** Cropped photo pixels (at most 12 MP), cached until the photo or crop changes. */
 function sourcePixels() {
   const R = wiz.rect;
-  const key = [wiz.editVersion, R.x, R.y, R.w, R.h].join();
+  const margins = wiz.pad.on && (R.x < 0 || R.y < 0 || R.x + R.w > photo.width || R.y + R.h > photo.height);
+  const key = [wiz.editVersion, R.x, R.y, R.w, R.h, margins && wiz.pad.color].join();
   if (wiz.source && wiz.source.key === key) return wiz.source;
+  if (margins) {
+    // a canvas of the frame's size in the margin color, with the photo drawn where it lies
+    const s = Math.min(1, Math.sqrt(MAX_SOURCE_PIXELS / (R.w * R.h)));
+    const w = Math.max(1, Math.round(R.w * s));
+    const h = Math.max(1, Math.round(R.h * s));
+    const c = createCanvas(w, h).getContext("2d");
+    c.fillStyle = wiz.pad.color || "#fff";
+    c.fillRect(0, 0, w, h);
+    c.imageSmoothingQuality = "high";
+    c.drawImage(photo, Math.round(-R.x * s), Math.round(-R.y * s), photo.width * s, photo.height * s);
+    const source = { data: c.getImageData(0, 0, w, h).data, width: w, height: h, key };
+    return (wiz.source = source);
+  }
   const sx = Math.min(photo.width - 1, Math.round(R.x));
   const sy = Math.min(photo.height - 1, Math.round(R.y));
   const sw = Math.max(1, Math.min(photo.width - sx, Math.round(R.w)));
@@ -838,19 +1400,173 @@ function sourcePixels() {
   return (wiz.source = source);
 }
 
-function drawAdjustPreview() {
+/* ---------- step 2: preview with zoom and a before/after divider ----------
+   The preview is drawn at the screen's real resolution: the visible part of the frame is drawn straight from
+   the photo (the browser resamples it on the GPU) at exactly the screen pixels it covers, never more than the
+   photo has there. Left of the divider it is shown as it is, right of it with the adjustments, which a Web
+   Worker applies so that sliders and gestures never wait for them. When adjusting the whole preview is slow
+   (the "enhance" filter), slider drags are previewed at reduced resolution, sharp again when the finger lifts.
+   While pinching or dragging, the pictures already drawn are only moved and scaled; they are redrawn after.
+   Coordinates are frame pixels: (0, 0) is the frame's top left corner, 1 unit = 1 photo pixel. */
+
+const adjustWrap = $("#adjust-wrap");
+const adjustOrig = $("#adjust-orig");
+const adjView = { zoom: 1, cx: 0.5, cy: 0.5 }; // zoom and view center (0..1 of the frame)
+const adjParts = { orig: null, origKey: "", result: null }; // part of the frame each canvas shows now
+const adjRegions = new Map(); // unadjusted pixels of a part: key -> data (the last two)
+let adjSliding = false; // a slider is being dragged
+let adjSlow = false; // adjusting the full preview took long last time
+let adjustFrame = 0;
+const adjWorker = new Worker(new URL("./adjust.worker.js", import.meta.url), { type: "module" });
+let adjBusy = false; // a job is in the worker
+let adjNext = null; // the newest job, waiting for the worker
+const adjScratch = createCanvas(1, 1);
+
+const frameKey = () => {
   const R = wiz.rect;
-  const L = 640;
-  const w = R.w >= R.h ? L : Math.round((L * R.w) / R.h);
-  const h = R.w >= R.h ? Math.round((L * R.h) / R.w) : L;
-  const rgba = boxScale(sourcePixels(), w, h);
-  applyAdjustments(rgba, w, h, wiz.adjust);
-  adjustCanvas.width = w;
-  adjustCanvas.height = h;
-  adjustCanvas.getContext("2d").putImageData(new ImageData(rgba, w, h), 0, 0);
+  return [wiz.editVersion, R.x, R.y, R.w, R.h, wiz.pad.on && wiz.pad.color].join();
+};
+
+/** Where the frame goes at the current zoom: visible part [x0, x1) x [y0, y1), k = CSS px per frame px. */
+function adjustLayout() {
+  const W = adjustWrap.clientWidth;
+  const H = adjustWrap.clientHeight;
+  const fw = wiz.rect.w;
+  const fh = wiz.rect.h;
+  const k = Math.min(W / fw, H / fh) * adjView.zoom;
+  const halfW = W / 2 / k;
+  const halfH = H / 2 / k;
+  // the picture covers the whole stage when it is bigger than it, and is centered when smaller
+  const cx = fw * k > W ? Math.max(halfW, Math.min(fw - halfW, adjView.cx * fw)) : fw / 2;
+  const cy = fh * k > H ? Math.max(halfH, Math.min(fh - halfH, adjView.cy * fh)) : fh / 2;
+  adjView.cx = cx / fw;
+  adjView.cy = cy / fh;
+  return {
+    k,
+    fw,
+    fh,
+    key: frameKey(),
+    x0: Math.max(0, cx - halfW),
+    y0: Math.max(0, cy - halfH),
+    x1: Math.min(fw, cx + halfW),
+    y1: Math.min(fh, cy + halfH),
+  };
 }
 
-let adjustFrame = 0;
+/** Draws part of the frame into a w x h canvas context, margins included. */
+function drawFramePart(ctx, w, h, part) {
+  const R = wiz.rect;
+  ctx.fillStyle = (wiz.pad.on && wiz.pad.color) || "#fff"; // margins, and the photo's own white background
+  ctx.fillRect(0, 0, w, h);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  // a source rectangle reaching past the photo (margins) is clipped by drawImage in proportion
+  ctx.drawImage(photo, R.x + part.x0, R.y + part.y0, part.x1 - part.x0, part.y1 - part.y0, 0, 0, w, h);
+}
+
+function sizeCanvas(canvas, w, h) {
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+}
+
+/** Puts each canvas where the part of the frame it shows lies on screen at the current zoom and center. */
+function placeAdjustCanvases(L = adjustLayout()) {
+  const W = adjustWrap.clientWidth;
+  const H = adjustWrap.clientHeight;
+  for (const [canvas, part] of [
+    [adjustOrig, adjParts.orig],
+    [adjustCanvas, adjParts.result],
+  ]) {
+    // a picture of another frame or photo (undo went back to a step-1 change) waits hidden for its update
+    canvas.style.visibility = part && part.key === L.key ? "" : "hidden";
+    if (!part) continue;
+    Object.assign(canvas.style, {
+      left: W / 2 + (part.x0 - adjView.cx * L.fw) * L.k + "px",
+      top: H / 2 + (part.y0 - adjView.cy * L.fh) * L.k + "px",
+      width: (part.x1 - part.x0) * L.k + "px",
+      height: (part.y1 - part.y0) * L.k + "px",
+    });
+  }
+  $("#adjust-fit").hidden = adjView.zoom < 1.01;
+}
+
+function drawAdjustPreview() {
+  if (wiz.step !== 2 || !adjustWrap.clientWidth || !photo) return;
+  const L = adjustLayout();
+  const part = { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1, key: L.key };
+  const pw = L.x1 - L.x0;
+  const ph = L.y1 - L.y0;
+  // canvas pixels for the part: one per screen pixel, at most one per photo pixel
+  const size = (quality) => {
+    const s = Math.min(1, L.k * (devicePixelRatio || 1) * quality);
+    return [Math.max(1, Math.round(pw * s)), Math.max(1, Math.round(ph * s))];
+  };
+  const [w, h] = size(1);
+  const partKey = [L.key, L.x0, L.y0, pw, ph].join();
+  if (adjParts.origKey !== partKey + w) {
+    adjParts.origKey = partKey + w;
+    sizeCanvas(adjustOrig, w, h);
+    drawFramePart(adjustOrig.getContext("2d"), w, h, part);
+    adjParts.orig = part;
+  }
+  if (!adjParts.result || adjParts.result.key !== part.key) {
+    // nothing adjusted to show yet: the photo itself until the worker answers
+    sizeCanvas(adjustCanvas, w, h);
+    adjustCanvas.getContext("2d").drawImage(adjustOrig, 0, 0);
+    adjParts.result = part;
+  }
+  const lowRes = adjSliding && adjSlow;
+  const [jw, jh] = lowRes ? size(0.45) : [w, h];
+  const regionKey = partKey + "/" + jw + "x" + jh;
+  let pixels = adjRegions.get(regionKey);
+  if (!pixels) {
+    sizeCanvas(adjScratch, jw, jh);
+    const ctx = adjScratch.getContext("2d");
+    drawFramePart(ctx, jw, jh, part);
+    pixels = ctx.getImageData(0, 0, jw, jh).data;
+    adjRegions.set(regionKey, pixels);
+    if (adjRegions.size > 2) adjRegions.delete(adjRegions.keys().next().value);
+  }
+  adjNext = {
+    data: new Uint8ClampedArray(pixels),
+    width: jw,
+    height: jh,
+    adjust: { ...wiz.adjust },
+    part,
+    full: !lowRes,
+  };
+  pumpAdjust();
+  placeAdjustCanvases(L);
+  placeAdjustDivider();
+}
+
+function pumpAdjust() {
+  if (adjBusy || !adjNext) return;
+  const job = adjNext;
+  adjNext = null;
+  adjBusy = true;
+  adjWorker.postMessage(job, [job.data.buffer]);
+}
+
+adjWorker.onmessage = (e) => {
+  adjBusy = false;
+  const job = e.data;
+  if (job.full) adjSlow = job.ms > 60;
+  if (wiz.step === 2 && job.part.key === frameKey()) {
+    sizeCanvas(adjustCanvas, job.width, job.height);
+    adjustCanvas.getContext("2d").putImageData(new ImageData(job.data, job.width, job.height), 0, 0);
+    adjParts.result = job.part;
+    placeAdjustCanvases();
+  }
+  pumpAdjust();
+};
+
+function scheduleAdjust() {
+  cancelAnimationFrame(adjustFrame);
+  adjustFrame = requestAnimationFrame(drawAdjustPreview);
+}
+
+/* sliders */
 $("#panel-adjust").addEventListener(
   "pointerdown",
   (e) => {
@@ -864,9 +1580,118 @@ $("#panel-adjust").addEventListener("input", (e) => {
   el.previousElementSibling.textContent = el.value;
   wiz.adjust[el.id.slice(4)] = +el.value; // "adj-bri" -> "bri"
   wiz.result = null;
-  cancelAnimationFrame(adjustFrame);
-  adjustFrame = requestAnimationFrame(drawAdjustPreview);
+  adjSliding = true;
+  scheduleAdjust();
 });
+// the finger left the slider: full resolution again
+$("#panel-adjust").addEventListener("change", () => {
+  adjSliding = false;
+  scheduleAdjust();
+});
+
+/* before/after divider */
+function placeAdjustDivider() {
+  const x = Math.round((wiz.adjCompare ?? 0.5) * adjustWrap.clientWidth);
+  $("#adjust-clip").style.width = x + "px";
+  $("#adjust-line").style.left = x + "px";
+}
+const adjustKnob = $("#adjust-knob");
+adjustKnob.addEventListener("pointerdown", (e) => {
+  e.stopPropagation();
+  adjustKnob.setPointerCapture(e.pointerId);
+  adjustKnob.dragging = true;
+});
+adjustKnob.addEventListener("pointermove", (e) => {
+  if (!adjustKnob.dragging) return;
+  const r = adjustWrap.getBoundingClientRect();
+  wiz.adjCompare = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  placeAdjustDivider();
+});
+const adjustKnobUp = () => (adjustKnob.dragging = false);
+adjustKnob.addEventListener("pointerup", adjustKnobUp);
+adjustKnob.addEventListener("pointercancel", adjustKnobUp);
+
+/* zoom: pinch, drag, double tap, mouse wheel */
+const adjPointers = new Map();
+let adjPinch = 0;
+let adjLastTap = 0;
+let adjMoved = 0;
+
+/** Zooms by factor f keeping screen point (sx, sy) over the same spot of the frame. */
+function zoomAdjust(f, sx, sy) {
+  const L = adjustLayout();
+  const W = adjustWrap.clientWidth;
+  const H = adjustWrap.clientHeight;
+  const px = adjView.cx * L.fw + (sx - W / 2) / L.k; // frame point under the finger
+  const py = adjView.cy * L.fh + (sy - H / 2) / L.k;
+  const zoom = Math.max(1, Math.min(24, adjView.zoom * f));
+  const k = (L.k / adjView.zoom) * zoom;
+  adjView.zoom = zoom;
+  adjView.cx = (px - (sx - W / 2) / k) / L.fw;
+  adjView.cy = (py - (sy - H / 2) / k) / L.fh;
+}
+
+const stagePoint = (e) => {
+  const r = adjustWrap.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+};
+adjustWrap.addEventListener("pointerdown", (e) => {
+  adjustWrap.setPointerCapture(e.pointerId);
+  adjPointers.set(e.pointerId, stagePoint(e));
+  adjPinch = 0;
+  if (adjPointers.size === 1) adjMoved = 0;
+});
+adjustWrap.addEventListener("pointermove", (e) => {
+  const old = adjPointers.get(e.pointerId);
+  if (!old) return;
+  const now = stagePoint(e);
+  adjPointers.set(e.pointerId, now);
+  adjMoved += Math.hypot(now[0] - old[0], now[1] - old[1]);
+  if (adjPointers.size > 1) {
+    const [a, b] = [...adjPointers.values()];
+    const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (adjPinch) zoomAdjust(d / adjPinch, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+    adjPinch = d;
+  } else {
+    const L = adjustLayout();
+    adjView.cx -= (now[0] - old[0]) / L.k / L.fw;
+    adjView.cy -= (now[1] - old[1]) / L.k / L.fh;
+  }
+  placeAdjustCanvases();
+});
+const adjustPointerUp = (e) => {
+  if (!adjPointers.delete(e.pointerId)) return;
+  adjPinch = 0;
+  if (adjPointers.size) return;
+  const now = performance.now();
+  if (adjMoved < 10) {
+    // double tap: zoom in 3x at that spot, or back to the whole picture
+    if (now - adjLastTap < 320) {
+      if (adjView.zoom > 1.01) adjView.zoom = 1;
+      else zoomAdjust(3, ...stagePoint(e));
+      adjLastTap = 0;
+    } else adjLastTap = now;
+  }
+  scheduleAdjust();
+};
+adjustWrap.addEventListener("pointerup", adjustPointerUp);
+adjustWrap.addEventListener("pointercancel", adjustPointerUp);
+adjustWrap.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    zoomAdjust(e.deltaY < 0 ? 1.2 : 1 / 1.2, ...stagePoint(e));
+    placeAdjustCanvases();
+    clearTimeout(adjustWrap.wheelTimer);
+    adjustWrap.wheelTimer = setTimeout(scheduleAdjust, 150);
+  },
+  { passive: false },
+);
+$("#adjust-fit").addEventListener("pointerdown", (e) => e.stopPropagation());
+$("#adjust-fit").onclick = () => {
+  adjView.zoom = 1;
+  scheduleAdjust();
+};
 
 /** Auto enhance: stretch levels so 1% of pixels are black / white, slight contrast + saturation boost. */
 $("#btn-auto-enhance").onclick = () => {

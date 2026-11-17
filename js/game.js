@@ -33,6 +33,7 @@ import {
 import { openTimelapse } from "./timelapse.js";
 import { launchConfetti } from "./confetti.js";
 import { createGlView } from "./glview.js";
+import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
 
 /** Smallest rectangle [x0, y0, x1, y1] containing both (either may be null). */
 const unionRect = (a, b) =>
@@ -1540,8 +1541,8 @@ $("#play-more").onclick = () => {
       actionButton("wand", "tset", "menu-tools") +
       actionButton("image", "png", "menu-png") +
       `</div>${toggle("sil")}` +
-      `<div class="chips nowrap"><select id="menu-sil-tint">${options(["sg", "se", "sb", "sm", "sr", "sv", "cus"], settings.sit, "sit")}</select><input type="color" id="menu-sil-color" value="${settings.sic}"></div>` +
-      `<div class="chips nowrap"><select id="menu-canvas-theme">${options(["cw", "clg", "gl1", "gl2", "cd", "cb", "gd1", "gd2", "cus"], settings.ct, "ct")}</select><input type="color" id="menu-canvas-color" value="${settings.cc}"></div>` +
+      `<div class="chips nowrap"><select id="menu-sil-tint">${options(["sg", "se", "sb", "sm", "sr", "sv", "cus"], settings.sit, "sit")}</select>${colorButtonHtml("menu-sil-color", settings.sic)}</div>` +
+      `<div class="chips nowrap"><select id="menu-canvas-theme">${options(["cw", "clg", "gl1", "gl2", "cd", "cb", "gd1", "gd2", "cus"], settings.ct, "ct")}</select>${colorButtonHtml("menu-canvas-color", settings.cc)}</div>` +
       toggle("mini") +
       toggle("oth"),
   );
@@ -1554,22 +1555,34 @@ $("#play-more").onclick = () => {
     settings.sit = e.target.value;
     applyColors();
   };
-  sheet.querySelector("#menu-sil-color").oninput = (e) => {
-    settings.sic = e.target.value;
-    settings.sit = "cus";
-    sheet.querySelector("#menu-sil-tint").value = "cus";
-    applyColors();
-  };
+  sheet.querySelector("#menu-sil-color").onclick = (e) =>
+    openColorPicker({
+      value: settings.sic,
+      title: t("sic"),
+      onDone: (hex) => {
+        settings.sic = hex;
+        settings.sit = "cus";
+        sheet.querySelector("#menu-sil-tint").value = "cus";
+        e.target.style.background = hex;
+        applyColors();
+      },
+    });
   sheet.querySelector("#menu-canvas-theme").onchange = (e) => {
     settings.ct = e.target.value;
     applyColors();
   };
-  sheet.querySelector("#menu-canvas-color").oninput = (e) => {
-    settings.cc = e.target.value;
-    settings.ct = "cus";
-    sheet.querySelector("#menu-canvas-theme").value = "cus";
-    applyColors();
-  };
+  sheet.querySelector("#menu-canvas-color").onclick = (e) =>
+    openColorPicker({
+      value: settings.cc,
+      title: t("cc"),
+      onDone: (hex) => {
+        settings.cc = hex;
+        settings.ct = "cus";
+        sheet.querySelector("#menu-canvas-theme").value = "cus";
+        e.target.style.background = hex;
+        applyColors();
+      },
+    });
   sheet.querySelector("#menu-mode").onclick = () => {
     game.canvas.mode = NEXT_MODE[game.canvas.mode] || "b";
     markCanvasChanged();

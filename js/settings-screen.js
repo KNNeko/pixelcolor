@@ -5,6 +5,10 @@ import { settings, saveSettings, applyAppTheme } from "./settings.js";
 import { exportBackup, importBackup, requestPersistence } from "./storage.js";
 import { refreshLibrary, renderSortOptions, clearThumbCache } from "./library.js";
 import { restartAutosave } from "./game.js";
+import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
+
+/** Picking a custom color also switches its theme select to "custom", so the color is actually used. */
+const COLOR_SELECT = { cc: ["ct", "cus"], sic: ["sit", "cus"] };
 
 // [key, kind, options]: kind = toggle | select | color
 const ROWS = [
@@ -46,8 +50,24 @@ function renderSettings() {
         ? `<label class="toggle"><input type="checkbox" ${settings[key] ? "checked" : ""}><i></i></label>`
         : kind === "select"
           ? `<select>${options.map((v) => `<option value="${v}" ${settings[key] == v ? "selected" : ""}>${optionLabel(key, v)}</option>`).join("")}</select>`
-          : `<input type="color" value="${settings[key]}">`;
+          : colorButtonHtml("set-" + key, settings[key]);
     row.innerHTML = `<span>${t(key)}</span>${control}`;
+    if (kind === "color") {
+      row.querySelector(".color-btn").onclick = () =>
+        openColorPicker({
+          value: settings[key],
+          title: t(key),
+          onDone: (hex) => {
+            settings[key] = hex;
+            const [selectKey, value] = COLOR_SELECT[key] || [];
+            if (selectKey) settings[selectKey] = value;
+            saveSettings();
+            renderSettings();
+          },
+        });
+      list.append(row);
+      continue;
+    }
     const input = row.querySelector("input,select");
     input.onchange = () => {
       settings[key] = kind === "toggle" ? +input.checked : NUMERIC.includes(key) ? +input.value : input.value;

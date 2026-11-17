@@ -7,6 +7,7 @@ export const DEFAULTS = {
   ap: "sys", // app theme: sys | light | dark
   ct: "cw", // canvas theme
   cc: "#cfe3ff", // custom canvas color
+  rc: [], // recently picked colors (color picker)
   hide: 0, // hide finished colors in the palette
   slide: 1, // paint by sliding a finger
   two: 1, // pan with two fingers while zooming

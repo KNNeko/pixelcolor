@@ -514,7 +514,6 @@ header b {
 #crop-canvas {
   touch-action: none;
 }
-#adjust-canvas,
 #preview-canvas {
   object-fit: contain;
 }
@@ -526,7 +525,8 @@ header b {
   overflow: hidden;
 }
 /* before/after: the original photo is shown left of the divider */
-#compare-clip {
+#compare-clip,
+#adjust-clip {
   position: absolute;
   left: 0;
   top: 0;
@@ -534,10 +534,29 @@ header b {
   overflow: hidden;
   pointer-events: none;
 }
+#adjust-wrap {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  touch-action: none;
+}
+/* drawn at an exact size and place (set from wizard.js), not stretched over the stage */
+#wiz-stage #adjust-canvas,
+#wiz-stage #adjust-orig {
+  object-fit: fill;
+  width: auto;
+  height: auto;
+}
+#adjust-fit {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+}
 #wiz-stage #original-canvas {
   object-fit: contain;
 }
-#compare-line {
+#compare-line,
+#adjust-line {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -547,7 +566,8 @@ header b {
   box-shadow: 0 0 4px #0008;
   pointer-events: none;
 }
-#compare-knob {
+#compare-knob,
+#adjust-knob {
   position: absolute;
   top: 50%;
   left: 50%;
@@ -561,7 +581,8 @@ header b {
   pointer-events: auto;
   touch-action: none;
 }
-#compare-knob:before {
+#compare-knob:before,
+#adjust-knob:before {
   content: "‹ ›";
   color: #25214a;
   font-weight: 700;
@@ -999,4 +1020,98 @@ header b {
 }
 #toast.show {
   opacity: 1;
+}
+
+/* ---------- color picker ---------- */
+#picker {
+  z-index: 11; /* above other sheets: it can be opened from one */
+}
+.color-btn {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border: 0;
+  border-radius: 12px;
+  box-shadow:
+    inset 0 0 0 2px #fff8,
+    0 0 0 1px var(--line);
+}
+.picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.picker-preview {
+  display: flex;
+  width: 88px;
+  height: 34px;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px var(--line);
+}
+.picker-preview i {
+  flex: 1;
+}
+.picker-sv,
+.picker-hue {
+  position: relative;
+  touch-action: none;
+  flex: none;
+}
+.picker-sv {
+  height: 200px;
+  border-radius: 16px;
+  background-image: linear-gradient(to top, #000, #0000), linear-gradient(to right, #fff, #fff0);
+}
+.picker-hue {
+  height: 28px;
+  border-radius: 14px;
+  background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+}
+.picker-thumb {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 3px solid #fff;
+  box-shadow:
+    0 0 0 1px #0006,
+    0 2px 6px #0006;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.picker-hue .picker-thumb {
+  top: 50%;
+}
+.picker-hex {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.picker-label {
+  font-size: 13px;
+  opacity: 0.7;
+  margin-bottom: -6px;
+}
+.picker-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.picker-swatches button {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px #0003;
+}
+
+/* ---------- photo editor ---------- */
+.icon-turned {
+  display: inline-flex;
+  transform: rotate(90deg);
+}
+#panel-crop .color-btn {
+  width: 40px;
+  height: 40px;
 }

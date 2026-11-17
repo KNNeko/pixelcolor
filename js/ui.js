@@ -151,7 +151,7 @@ export function download(blob, filename) {
 
 /* ---------- custom range slider ----------
    <div class="range" data-min data-max data-v data-step> becomes a touch-friendly slider.
-   It exposes .value and fires "input" like a real <input type=range>. */
+   It exposes .value and fires "input" and "change" like a real <input type=range>. */
 
 export function initRangeSlider(el) {
   if (el._ready) return;
@@ -180,9 +180,11 @@ export function initRangeSlider(el) {
   });
   paint();
 
+  let startValue = value;
   thumb.addEventListener("pointerdown", (e) => {
     thumb.setPointerCapture(e.pointerId);
     dragging = true;
+    startValue = value;
     e.preventDefault();
   });
   thumb.addEventListener("pointermove", (e) => {
@@ -196,7 +198,11 @@ export function initRangeSlider(el) {
       el.dispatchEvent(new Event("input", { bubbles: true }));
     }
   });
-  const stop = () => (dragging = false);
+  // "change" when the finger lifts, like a real range input
+  const stop = () => {
+    if (dragging && value !== startValue) el.dispatchEvent(new Event("change", { bubbles: true }));
+    dragging = false;
+  };
   thumb.addEventListener("pointerup", stop);
   thumb.addEventListener("pointercancel", stop);
 }

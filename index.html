@@ -56,7 +56,12 @@
       <div id="wiz-main">
         <div id="wiz-stage">
           <canvas id="crop-canvas"></canvas>
-          <canvas id="adjust-canvas" hidden></canvas>
+          <div id="adjust-wrap" hidden>
+            <canvas id="adjust-canvas"></canvas>
+            <div id="adjust-clip"><canvas id="adjust-orig"></canvas></div>
+            <div id="adjust-line"><button id="adjust-knob" aria-label="compare"></button></div>
+            <button class="chip" id="adjust-fit" data-i="e_fit" hidden></button>
+          </div>
           <div id="preview-wrap" hidden>
             <canvas id="preview-canvas"></canvas>
             <div id="compare-clip"><canvas id="original-canvas"></canvas></div>
