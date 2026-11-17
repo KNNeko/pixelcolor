@@ -20,7 +20,8 @@ export const DEFAULTS = {
   grid: 1, // grid lines
   asv: 2, // autosave interval, minutes
   full: 1, // fullscreen
-  hall: 0, // the panel button hides the whole interface (top buttons, minimap), not only the bottom panel
+  hall: 0, // the panel button hides the whole interface (top buttons, minimap, itself), not only the bottom panel
+  hallTips: 0, // times the "how to bring it back" hint was shown
   gl: 1, // draw the coloring screen with WebGL (fast); off = old 2D drawing
   sil: 1, // silhouette (tinted unpainted cells)
   oth: 1, // show other parts while working on one part

@@ -202,6 +202,40 @@ test("pickCellColors averages a soft gradient instead of picking a side", () => 
   for (let x = 0; x < 4; x++) assert.ok(Math.abs(out[x * 4] - (x * 4 + 1.5) * 16) <= 4, `cell ${x}: ${out[x * 4]}`);
 });
 
+test("pickCellColors: a thin line gets its ink color, not a blend with the paper", () => {
+  // 4 sub-samples per cell side; a dark red line one sample wide plus a half-tone rim on each side
+  const src = image(40, 40, (x) =>
+    x === 18 ? [60, 20, 20] : x === 17 || x === 19 ? [150, 120, 110] : [240, 220, 200],
+  );
+  const out = pickCellColors(src.data, 10, 10, 4);
+  for (let y = 2; y < 8; y++) {
+    const i = (y * 10 + 4) * 4;
+    assert.ok(out[i] < 85 && out[i + 1] < 45, `cell 4,${y}: ${out[i]},${out[i + 1]},${out[i + 2]}`);
+  }
+});
+
+test("pickCellColors: a highlight inside a small dark iris stays light; the gap between two dark lines is no line", () => {
+  // a dark disk (radius 6 samples) with a white dot (2 x 2 samples) in it, on skin
+  const iris = image(40, 40, (x, y) => {
+    const d = Math.hypot(x - 20, y - 20);
+    if (x >= 19 && x <= 20 && y >= 17 && y <= 18) return [255, 255, 255];
+    return d < 6 ? [40, 40, 90] : [240, 220, 200];
+  });
+  const a = pickCellColors(iris.data, 10, 10, 4);
+  const lightest = Math.max(...[4, 5].flatMap((y) => [4, 5].map((x) => a[(y * 10 + x) * 4 + 1])));
+  assert.ok(lightest > 150, `highlight cell: ${lightest}`);
+  // two dark lines 3 samples apart on skin: the skin between them is no light line
+  const lines = image(40, 40, (x) => (x === 16 || x === 20 ? [60, 30, 30] : [240, 220, 200]));
+  const out = pickCellColors(lines.data, 10, 10, 4);
+  assert.ok(out.lines, "has lines");
+  for (let y = 2; y < 8; y++)
+    for (let x = 3; x < 6; x++) {
+      const i = y * 10 + x;
+      if (!out.lines[i]) continue;
+      assert.ok(out[i * 4] < 180, `cell ${x},${y} is a light line: ${out[i * 4]},${out[i * 4 + 1]}`);
+    }
+});
+
 test("pickCellColors: hatching finer than the grid keeps its average tone instead of one of its colors", () => {
   // 4 sub-samples per cell side; vertical stripes 3 samples red, 2 samples white: every cell holds both
   const src = image(40, 40, (x) => (x % 5 < 3 ? [200, 40, 40] : [250, 240, 240]));

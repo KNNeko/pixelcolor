@@ -367,6 +367,10 @@ for (let v = 0; v < 256; v++) lineThreshold[v] = Math.round(18 + ((LINE_MIN_CONT
 const LINE_CORE = 0.5;
 /** A one-cell dot with no line next to it is kept only if it stands out at least this much (luma, rms). */
 const LONE_DOT_CONTRAST = 60;
+/** A line's color comes from its samples that stand out at least this share of its strongest one. */
+const LINE_INK = 0.7;
+/** Lines of at most this many cells (dots, short dashes: a pupil, a highlight) never give way to another line. */
+const SHORT_LINE = 3;
 
 /**
  * Running maximum (or minimum) over a window of 2r+1 samples along the rows of a w x h byte image, in O(1) per
@@ -389,9 +393,11 @@ function maxRows(src, dst, w, h, r, g, hb) {
       }
     }
     hb[w - 1] = src[base + w - 1];
-    for (let x = w - 2; x >= 0; x--) {
+    // block ends where (x + 1) is a multiple of s
+    for (let x = w - 2, c = (w - 1) % s; x >= 0; x--, c--) {
+      if (c === 0) c = s;
       const v = src[base + x];
-      if ((x + 1) % s === 0) hb[x] = v;
+      if (c === s) hb[x] = v;
       else {
         const p = hb[x + 1];
         hb[x] = v > p ? v : p;
@@ -485,21 +491,21 @@ function findThinLines(rgba, w, h, r) {
   const invert = (src, dst) => {
     for (let i = 0; i < P; i++) dst[i] = 255 - src[i];
   };
-  const morph = (closing) => {
+  const morph = (closing, src) => {
     if (closing) {
-      dilate(Y, a, tmp, pw, ph, r, g, hb, G, HB); // a = max
+      dilate(src, a, tmp, pw, ph, r, g, hb, G, HB); // a = max
       invert(a, a);
       dilate(a, b, tmp, pw, ph, r, g, hb, G, HB); // b = 255 - min(max)
       invert(b, b);
     } else {
-      invert(Y, a);
+      invert(src, a);
       dilate(a, b, tmp, pw, ph, r, g, hb, G, HB); // b = 255 - min
       invert(b, b);
       dilate(b, a, tmp, pw, ph, r, g, hb, G, HB); // a = max(min)
       b.set(a);
     }
   };
-  morph(true); // closing: dark features narrower than the window are filled in
+  morph(true, Y); // closing: dark features narrower than the window are filled in
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const q = (y + r) * pw + x + r;
@@ -509,7 +515,61 @@ function findThinLines(rgba, w, h, r) {
         strength[y * w + x] = d;
       }
     }
-  morph(false); // opening: light features narrower than the window are removed
+  const closed = new Uint8Array(b);
+  // Opening: light features narrower than the window are removed. Plain, on the picture itself, it shows every
+  // light stripe; fine hatching then shows as both kinds everywhere (`raw`, for the texture test).
+  const raw = new Uint8Array(type);
+  const rawStrength = new Uint8Array(N);
+  morph(false, Y);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const q = (y + r) * pw + x + r;
+      const i = y * w + x;
+      const d = Y[q] - b[q];
+      if (d >= lineThreshold[b[q]] && d > strength[i]) {
+        raw[i] = 2;
+        rawStrength[i] = d;
+      }
+    }
+  // As a line, though, a long light stripe only counts where it is lighter than the area around it (a light
+  // strand): the gaps between dark lines (between eyelashes, hair strands, fingers) are no features of their
+  // own. A small light spot (a highlight in an eye, even inside a small dark iris) always counts.
+  const dot = 2 * r + 1;
+  const seen = new Uint8Array(N);
+  const spot = [];
+  for (let start = 0; start < N; start++) {
+    if (raw[start] !== 2 || seen[start]) continue;
+    spot.length = 0;
+    spot.push(start);
+    seen[start] = 1;
+    let x0 = w;
+    let y0 = h;
+    let x1 = -1;
+    let y1 = -1;
+    for (let k = 0; k < spot.length; k++) {
+      const p = spot[k];
+      const px = p % w;
+      const py = (p - px) / w;
+      x0 = Math.min(x0, px);
+      x1 = Math.max(x1, px);
+      y0 = Math.min(y0, py);
+      y1 = Math.max(y1, py);
+      for (let yy = Math.max(0, py - 1); yy <= Math.min(h - 1, py + 1); yy++)
+        for (let xx = Math.max(0, px - 1); xx <= Math.min(w - 1, px + 1); xx++) {
+          const j = yy * w + xx;
+          if (raw[j] === 2 && !seen[j]) {
+            seen[j] = 1;
+            spot.push(j);
+          }
+        }
+    }
+    if (x1 - x0 < dot && y1 - y0 < dot)
+      for (const p of spot) {
+        type[p] = 2;
+        strength[p] = rawStrength[p];
+      }
+  }
+  morph(false, closed);
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const q = (y + r) * pw + x + r;
@@ -520,7 +580,6 @@ function findThinLines(rgba, w, h, r) {
         strength[i] = d;
       }
     }
-  const raw = new Uint8Array(type); // before the clean-up below: fine hatching shows as both kinds everywhere
   // JPEG rings: a light line gets a faint dark shadow line beside it (and a dark one a light one). Of a dark
   // and a light line sample lying within two samples of each other, only the stronger is a line.
   const drop = [];
@@ -629,11 +688,64 @@ function rasterizeThinLines(rgba, W, H, k) {
   // skeleton of each line type, mapped to cells
   const skel = new Uint8Array(w * h);
   const onSkeleton = [null, new Uint8Array(cells), new Uint8Array(cells)];
+  // each separate line (8-connected piece of skeleton): its mean contrast; each cell: the line most of its
+  // skeleton belongs to (-1: none)
+  const lineOf = [null, new Int32Array(cells).fill(-1), new Int32Array(cells).fill(-1)];
+  const lineStrength = [null, [], []];
+  const label = new Int32Array(w * h);
+  const stack = [];
   for (const t of [1, 2]) {
     skel.fill(0);
-    for (const i of thinLines(type, t, w, h, skel)) {
+    const list = thinLines(type, t, w, h, skel);
+    for (const i of list) {
       const x = i % w;
       onSkeleton[t][(((i - x) / w / k) | 0) * W + ((x / k) | 0)] = 1;
+    }
+    label.fill(-1);
+    const strengths = lineStrength[t];
+    for (const start of list) {
+      if (label[start] >= 0) continue;
+      const id = strengths.length;
+      let total = 0;
+      let count = 0;
+      label[start] = id;
+      stack.push(start);
+      while (stack.length) {
+        const p = stack.pop();
+        total += strength[p];
+        count++;
+        const px = p % w;
+        const py = (p - px) / w;
+        for (let yy = Math.max(0, py - 1); yy <= Math.min(h - 1, py + 1); yy++)
+          for (let xx = Math.max(0, px - 1); xx <= Math.min(w - 1, px + 1); xx++) {
+            const q = yy * w + xx;
+            if (skel[q] && label[q] < 0) {
+              label[q] = id;
+              stack.push(q);
+            }
+          }
+      }
+      strengths.push(total / count);
+    }
+    const ids = new Int32Array(n);
+    for (let c = 0; c < cells; c++) {
+      if (!onSkeleton[t][c]) continue;
+      const cx = c % W;
+      const cy = (c - cx) / W;
+      let m = 0;
+      for (let sy = cy * k; sy < cy * k + k; sy++)
+        for (let sx = cx * k; sx < cx * k + k; sx++) if (label[sy * w + sx] >= 0) ids[m++] = label[sy * w + sx];
+      let best = -1;
+      let bestCount = 0;
+      for (let a = 0; a < m; a++) {
+        let same = 0;
+        for (let b = 0; b < m; b++) same += ids[b] === ids[a] ? 1 : 0;
+        if (same > bestCount || (same === bestCount && strengths[ids[a]] > strengths[best])) {
+          bestCount = same;
+          best = ids[a];
+        }
+      }
+      lineOf[t][c] = best;
     }
   }
   const kind = new Uint8Array(cells);
@@ -718,6 +830,79 @@ function rasterizeThinLines(rgba, W, H, k) {
       }
       if (drop) kind[c] = 0;
     }
+  // Lines closer together than one cell (hair strands, the lines between small fingers, dense folds) would
+  // merge into a dark patch when drawn side by side. Where two different lines run alongside each other in
+  // touching cells, the weaker one gives way there; what is left of it in pieces of one or two cells goes too.
+  // Line ends may touch (a line meeting another), and short lines (a pupil, a highlight) always stay.
+  for (const t of [1, 2]) {
+    const of = lineOf[t];
+    const strengths = lineStrength[t];
+    const size = new Int32Array(strengths.length);
+    for (let c = 0; c < cells; c++) if (kind[c] === t && of[c] >= 0) size[of[c]]++;
+    const ownNeighbours = (c) => {
+      const x = c % W;
+      const y = (c - x) / W;
+      let count = 0;
+      for (let d = 0; d < 8; d++) {
+        const xx = x + DX[d];
+        const yy = y + DY[d];
+        if (xx >= 0 && yy >= 0 && xx < W && yy < H && kind[yy * W + xx] === t && of[yy * W + xx] === of[c]) count++;
+      }
+      return count;
+    };
+    const stronger = (B, A) =>
+      strengths[B] > strengths[A] ||
+      (strengths[B] === strengths[A] && (size[B] > size[A] || (size[B] === size[A] && B < A)));
+    const order = [];
+    for (let c = 0; c < cells; c++) if (kind[c] === t && of[c] >= 0 && size[of[c]] > SHORT_LINE) order.push(c);
+    order.sort((p, q) => strengths[of[p]] - strengths[of[q]] || size[of[p]] - size[of[q]]);
+    const cut = new Uint8Array(strengths.length);
+    for (const c of order) {
+      const A = of[c];
+      if (ownNeighbours(c) < 2) continue; // a line end
+      const x = c % W;
+      const y = (c - x) / W;
+      let yields = false;
+      for (let d = 0; d < 8 && !yields; d++) {
+        const xx = x + DX[d];
+        const yy = y + DY[d];
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const j = yy * W + xx;
+        const B = of[j];
+        if (kind[j] !== t || B < 0 || B === A || !stronger(B, A)) continue;
+        if (ownNeighbours(j) >= 2) yields = true; // alongside, not end to end
+      }
+      if (yields) {
+        kind[c] = 0;
+        cut[A] = 1;
+      }
+    }
+    // leftovers of lines that gave way
+    const seen = new Uint8Array(cells);
+    const piece = [];
+    for (let c = 0; c < cells; c++) {
+      if (seen[c] || kind[c] !== t || of[c] < 0 || !cut[of[c]]) continue;
+      const A = of[c];
+      piece.length = 0;
+      seen[c] = 1;
+      piece.push(c);
+      for (let p = 0; p < piece.length; p++) {
+        const x = piece[p] % W;
+        const y = (piece[p] - x) / W;
+        for (let d = 0; d < 8; d++) {
+          const xx = x + DX[d];
+          const yy = y + DY[d];
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const j = yy * W + xx;
+          if (!seen[j] && kind[j] === t && of[j] === A) {
+            seen[j] = 1;
+            piece.push(j);
+          }
+        }
+      }
+      if (piece.length <= 2) for (const j of piece) kind[j] = 0;
+    }
+  }
   // a line's color is pooled from the cell and its line neighbours: a cell the line only grazes would get
   // a paler, half-blended color of its own, and the line would flicker between shades along its length
   // samples on a line or touching one: the line's anti-aliased rim and its JPEG halo are neither line nor
@@ -729,13 +914,28 @@ function rasterizeThinLines(rgba, W, H, k) {
       for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++)
         for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) near[yy * w + xx] = 1;
     }
+  // The line's own color (its ink, its highlight) is that of its strongest samples: those that stand out at
+  // least LINE_INK of the most any sample of the line does here. A plain average would mix in the anti-aliased
+  // rim and give pale lines and bluish-gray highlights.
+  const peak = [null, new Uint8Array(cells), new Uint8Array(cells)];
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const t = type[i];
+      if (!t) continue;
+      const c = ((y / k) | 0) * W + ((x / k) | 0);
+      if (strength[i] > peak[t][c]) peak[t][c] = strength[i];
+    }
   const color = new Uint8ClampedArray(cells * 3);
   for (let c = 0; c < cells; c++) {
     const t = kind[c];
     if (!t) continue;
-    const s = sum[t];
     const x = c % W;
     const y = (c - x) / W;
+    let top = 0;
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) if (same(x + dx, y + dy, t)) top = Math.max(top, peak[t][(y + dy) * W + x + dx]);
+    const floor = top * LINE_INK;
     let r = 0;
     let gg = 0;
     let b = 0;
@@ -743,11 +943,16 @@ function rasterizeThinLines(rgba, W, H, k) {
     for (let dy = -1; dy <= 1; dy++)
       for (let dx = -1; dx <= 1; dx++) {
         if (!same(x + dx, y + dy, t)) continue;
-        const o = ((y + dy) * W + x + dx) * 4;
-        r += s[o];
-        gg += s[o + 1];
-        b += s[o + 2];
-        wt += s[o + 3];
+        for (let sy = (y + dy) * k; sy < (y + dy + 1) * k; sy++)
+          for (let sx = (x + dx) * k; sx < (x + dx + 1) * k; sx++) {
+            const i = sy * w + sx;
+            if (type[i] !== t || strength[i] < floor) continue;
+            const wgt = strength[i];
+            r += rgba[i * 4] * wgt;
+            gg += rgba[i * 4 + 1] * wgt;
+            b += rgba[i * 4 + 2] * wgt;
+            wt += wgt;
+          }
       }
     color[c * 3] = r / wt;
     color[c * 3 + 1] = gg / wt;
@@ -1668,7 +1873,8 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
     removeSpecks(idx, W, H, 2 + (clean >> 2), pal, 3 + clean * 0.8, lines);
   }
   // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
-  if (!dither) ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
+  // (not in art mode: drawn pictures have clean color bands, a checker seam along every band reads as noise)
+  if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }

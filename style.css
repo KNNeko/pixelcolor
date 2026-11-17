@@ -757,7 +757,7 @@ header b {
   flex: 1;
   pointer-events: none;
 }
-/* "hide everything" (setting): only the panel button stays, faint */
+/* "hide everything" (setting): the panel button too goes invisible, but keeps working where it was */
 #play-top > *,
 #minimap {
   transition: opacity 0.2s;
@@ -768,7 +768,7 @@ header b {
   pointer-events: none;
 }
 #play-wrap.bare #play-panel-toggle {
-  opacity: 0.45;
+  opacity: 0;
 }
 #play-progress {
   font-variant-numeric: tabular-nums;

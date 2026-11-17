@@ -889,13 +889,23 @@ function tracePath(ctx, p, r, dx = 0, dy = 0) {
 }
 
 const scratch = createCanvas(1, 1);
-/**
- * Copies picture `src` onto the photo, but only under the brush path p (radius r): restore copies the
- * untouched photo, clone copies the photo shifted by (dx, dy), blur copies a blurred photo.
- * process(ctx, w, h, x, y), if given, changes the copied piece (with `margin` pixels of surroundings around it,
- * at photo position x, y) before it is cut to the brush: the blur styles.
+// The smoothing style reads it back every time: kept in memory from the start. (Chrome would otherwise move it
+// there by itself after some reads, and the same stroke could come out a little different on undo / redo.)
+scratch.getContext("2d", { willReadFrequently: true });
+
+/*
+ * Big brushes on big photos would make each finger move redraw millions of pixels (and the smoothing style
+ * read them all into JavaScript): the phone froze. The blur styles therefore work on a copy at most about
+ * WORK_SIDE pixels across, 1/d of the photo's size, and draw the result back enlarged. d is a whole number that
+ * depends on the brush only, and the copy starts on a multiple of d, so all segments of a stroke (and its replay)
+ * see the same grid. A blurred result loses nothing by this; at d > 1 a pixel of the copy is still far smaller
+ * than a cell of the coloring.
  */
-function drawFrom(src, dx, dy, p, r, blur = 0, alpha = 1, process = null, margin = 0, soft = 0) {
+const WORK_SIDE = 360;
+const workScale = (r, extra) => Math.max(1, Math.ceil((2 * (r + extra) + 4) / WORK_SIDE));
+
+/** Bounding box of a path's points: [minX, minY, maxX, maxY]. */
+function pathBox(p) {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -906,38 +916,75 @@ function drawFrom(src, dx, dy, p, r, blur = 0, alpha = 1, process = null, margin
     minY = Math.min(minY, p[i + 1]);
     maxY = Math.max(maxY, p[i + 1]);
   }
+  return [minX, minY, maxX, maxY];
+}
+
+/**
+ * The pieces of a brush operation around path p (radius r): `inner`, the photo pixels it may change, and
+ * `outer`, that plus `m` pixels of surroundings, on a grid of d: { X0, Y0, w, h, OX, OY, W, H } where (OX, OY)
+ * is the photo position of the work copy and W x H its size in work pixels. null: nothing on the photo.
+ */
+function brushArea(p, r, m, d) {
+  const [minX, minY, maxX, maxY] = pathBox(p);
   const X0 = Math.max(0, Math.floor(minX - r - 2));
   const Y0 = Math.max(0, Math.floor(minY - r - 2));
   const X1 = Math.min(photo.width, Math.ceil(maxX + r + 2));
   const Y1 = Math.min(photo.height, Math.ceil(maxY + r + 2));
-  const w = X1 - X0;
-  const h = Y1 - Y0;
-  if (w < 1 || h < 1) return;
+  if (X1 - X0 < 1 || Y1 - Y0 < 1) return null;
+  const OX = Math.floor((X0 - m) / d) * d;
+  const OY = Math.floor((Y0 - m) / d) * d;
+  const W = Math.ceil((X1 + m - OX) / d);
+  const H = Math.ceil((Y1 + m - OY) / d);
+  return { X0, Y0, w: X1 - X0, h: Y1 - Y0, OX, OY, W, H };
+}
+
+/** Draws the work copy c (of area a, scale d) back onto the photo over the area's inner part. */
+function drawBack(c, a, d, alpha = 1, crisp = false) {
+  const ctx = photo.getContext("2d");
+  ctx.globalAlpha = alpha;
+  ctx.imageSmoothingEnabled = !crisp;
+  ctx.drawImage(c.canvas, (a.X0 - a.OX) / d, (a.Y0 - a.OY) / d, a.w / d, a.h / d, a.X0, a.Y0, a.w, a.h);
+  ctx.imageSmoothingEnabled = true;
+  ctx.globalAlpha = 1;
+}
+
+/**
+ * Copies picture `src` onto the photo, but only under the brush path p (radius r): restore copies the
+ * untouched photo, clone copies the photo shifted by (dx, dy), blur copies a blurred photo.
+ * process(ctx, w, h, x, y, d), if given, changes the copied piece (with `margin` pixels of surroundings around
+ * it; at photo position x, y; d photo pixels to one of its pixels) before it is cut to the brush: the blur
+ * styles (src null: process draws the piece itself). fast: work at a reduced scale for big brushes (blur
+ * styles only; restore and clone stay exact).
+ */
+function drawFrom(src, dx, dy, p, r, blur = 0, alpha = 1, process = null, margin = 0, soft = 0, fast = false) {
   // the surroundings come along, so pixels near the edge of the brush blur with real neighbours
   const m = Math.ceil(Math.max(blur * 3, margin));
-  scratch.width = w + 2 * m;
-  scratch.height = h + 2 * m;
+  const d = fast ? workScale(r, m) : 1;
+  const a = brushArea(p, r, m, d);
+  if (!a) return;
+  scratch.width = a.W;
+  scratch.height = a.H;
   const c = scratch.getContext("2d");
-  if (blur) c.filter = `blur(${blur}px)`;
-  c.drawImage(src, X0 + dx - m, Y0 + dy - m, w + 2 * m, h + 2 * m, 0, 0, w + 2 * m, h + 2 * m);
+  c.imageSmoothingQuality = "high";
+  if (blur) c.filter = `blur(${blur / d}px)`;
+  if (src) c.drawImage(src, a.OX + dx, a.OY + dy, a.W * d, a.H * d, 0, 0, a.W, a.H);
   c.filter = "none";
-  if (process) process(c, w + 2 * m, h + 2 * m, X0 - m, Y0 - m);
+  if (process) process(c, a.W, a.H, a.OX, a.OY, d);
   c.globalCompositeOperation = "destination-in";
   c.fillStyle = c.strokeStyle = "#000";
   // soft: the brush fades out over its outer `soft` pixels (a smaller brush, blurred, still ends at r)
-  if (soft > 0.5) c.filter = `blur(${soft / 2.5}px)`;
-  tracePath(c, p, Math.max(0.5, r - soft), X0 - m, Y0 - m);
+  if (soft > 0.5) c.filter = `blur(${soft / 2.5 / d}px)`;
+  c.setTransform(1 / d, 0, 0, 1 / d, 0, 0);
+  tracePath(c, p, Math.max(0.5, r - soft), a.OX, a.OY);
+  c.setTransform(1, 0, 0, 1, 0, 0);
   c.filter = "none";
   c.globalCompositeOperation = "source-over";
-  const ctx = photo.getContext("2d");
-  ctx.globalAlpha = alpha;
-  ctx.drawImage(scratch, m, m, w, h, X0, Y0, w, h);
-  ctx.globalAlpha = 1;
+  drawBack(c, a, d, alpha);
 }
 
 /* Blur brush styles. strength 1..100; r = brush radius, in photo pixels.
      soft    plain blur
-     smart   blurs only where neighbours are alike: smooths noise, JPEG blocks and banding, keeps edges
+     smart   smooths noise, grain and fine texture, keeps edges and lines (a guided filter)
      motion  smears along the direction of the stroke
      mosaic  squares of one color (aligned to the photo, so overlapping strokes match)
      smudge  drags the colors under the finger along with it */
@@ -950,11 +997,15 @@ function blurSegment(op, src, a, b, r) {
   const soft = ((op.soft || 0) / 100) * r; // width of the fading edge, photo pixels
   const p = a === b ? [a[0], a[1]] : [a[0], a[1], b[0], b[1]];
   if (style === "soft") areaSegment(src, p, r, soft, blurRadius(strength, r));
-  else if (style === "smart")
-    areaSegment(src, p, r, soft, 0, (c, w, h) => smartBlur(c, w, h, strength, r), blurRadius(strength, r) * 3);
-  else if (style === "mosaic") {
-    const size = mosaicSize(strength, r);
-    areaSegment(src, p, r, soft, 0, (c, w, h, x, y) => mosaic(c, w, h, x, y, size), size);
+  else if (style === "smart") {
+    const { radius, eps } = surfaceParams(strength);
+    areaSegment(src, p, r, soft, 0, (c, w, h, x, y, d) => smoothSurface(c, w, h, radius / d, eps), radius * 2);
+  } else if (style === "mosaic") {
+    // squares of whole work pixels: the size is a multiple of the work scale the brush uses
+    const raw = Math.max(2, Math.round(2 + (strength / 100) * r * 0.8));
+    const d = workScale(r, Math.ceil(Math.max(raw, soft > 0.5 ? (soft / 2.5) * 3 : 0)));
+    const size = Math.max(d, Math.round(raw / d) * d);
+    areaSegment(src, p, r, soft, 0, (c, w, h, x, y) => mosaic(c, w, h, x, y, size, d), size, true, d);
   } else if (style === "motion") {
     if (a === b) return; // no direction yet
     const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
@@ -962,38 +1013,84 @@ function blurSegment(op, src, a, b, r) {
     const uy = (b[1] - a[1]) / len;
     const reach = Math.max(1, (strength / 100) * r * 1.5);
     drawFrom(
-      src,
+      null,
       0,
       0,
       p,
       r,
       0,
       1,
-      (c, w, h, x, y) => {
+      (c, w, h, x, y, d) => {
         // average of the piece shifted back and forth along the stroke (each draw weighs 1/(n+1): a running mean)
-        const steps = 12;
+        // enough copies that they merge into a smear, not a row of ghosts (what gap is left between them is
+        // closed by one slight blur at the end)
+        const small = workCopyFor(src, d).small;
+        const spread = (2 * reach) / d;
+        const steps = Math.min(32, Math.max(12, Math.ceil(spread / 2)));
         for (let i = 0; i <= steps; i++) {
           const t = (i / steps - 0.5) * 2 * reach;
           c.globalAlpha = 1 / (i + 1);
-          c.drawImage(src, x + ux * t, y + uy * t, w, h, 0, 0, w, h);
+          c.drawImage(small, (x + ux * t) / d, (y + uy * t) / d, w, h, 0, 0, w, h);
         }
         c.globalAlpha = 1;
+        const gap = spread / steps;
+        if (gap > 1.5) {
+          maskScratch.width = w;
+          maskScratch.height = h;
+          const k = maskScratch.getContext("2d");
+          k.filter = `blur(${gap / 2.5}px)`;
+          k.drawImage(c.canvas, 0, 0);
+          k.filter = "none";
+          c.clearRect(0, 0, w, h);
+          c.drawImage(maskScratch, 0, 0);
+        }
       },
       reach + 1,
       soft,
+      true,
     );
   } else if (style === "smudge") {
-    // in short steps, each carries a bit of the color it starts from to where it ends
+    // in short steps (a few pixels, so the dabs merge into a smear), each carries a bit of the color it
+    // starts from to where it ends
     const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
     if (!len) return;
-    const steps = Math.max(1, Math.ceil(len / Math.max(1, r / 4)));
+    const d = workScale(r, 0);
+    const steps = Math.min(32, Math.max(1, Math.ceil(len / Math.max(1, Math.min(r / 4, 4 * d)))));
     const alpha = 0.25 + (strength / 100) * 0.7;
     for (let i = 0; i < steps; i++) {
       const q0 = [a[0] + ((b[0] - a[0]) * i) / steps, a[1] + ((b[1] - a[1]) * i) / steps];
       const q1 = [a[0] + ((b[0] - a[0]) * (i + 1)) / steps, a[1] + ((b[1] - a[1]) * (i + 1)) / steps];
-      drawFrom(photo, q0[0] - q1[0], q0[1] - q1[1], [q1[0], q1[1]], r, 0, alpha, null, 0, soft);
+      if (d === 1) drawFrom(photo, q0[0] - q1[0], q0[1] - q1[1], [q1[0], q1[1]], r, 0, alpha, null, 0, soft);
+      else smudgeDab(workCopyFor(src, d), q0, q1, r, soft, alpha);
     }
   }
+}
+
+/**
+ * One smudge dab of a big brush: the stroke's reduced copy is smudged (the brush picks its colors there, so
+ * nothing big is read back from the photo), and the dab goes onto the photo enlarged.
+ */
+function smudgeDab(wc, q0, q1, r, soft, alpha) {
+  const d = wc.d;
+  const a = brushArea([q1[0], q1[1]], r, 0, d);
+  if (!a) return;
+  scratch.width = a.W;
+  scratch.height = a.H;
+  const c = scratch.getContext("2d");
+  c.drawImage(wc.small, (a.OX + q0[0] - q1[0]) / d, (a.OY + q0[1] - q1[1]) / d, a.W, a.H, 0, 0, a.W, a.H);
+  c.globalCompositeOperation = "destination-in";
+  c.fillStyle = c.strokeStyle = "#000";
+  if (soft > 0.5) c.filter = `blur(${soft / 2.5 / d}px)`;
+  c.setTransform(1 / d, 0, 0, 1 / d, 0, 0);
+  tracePath(c, [q1[0], q1[1]], Math.max(0.5, r - soft), a.OX, a.OY);
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.filter = "none";
+  c.globalCompositeOperation = "source-over";
+  const g = wc.small.getContext("2d");
+  g.globalAlpha = alpha;
+  g.drawImage(scratch, a.OX / d, a.OY / d);
+  g.globalAlpha = 1;
+  drawBack(c, a, d, alpha);
 }
 
 /*
@@ -1004,63 +1101,73 @@ function blurSegment(op, src, a, b, r) {
  */
 const blurMask = createCanvas(1, 1);
 const maskScratch = createCanvas(1, 1);
+/** The stroke's reduced copies: { src, d, small (src at 1/d), mask (the stroke's core so far, at 1/d) }. */
+let workCopy = null;
 
+/** A new blur stroke begins. */
 function beginBlurMask() {
-  if (blurMask.width !== photo.width || blurMask.height !== photo.height) {
+  workCopy = null;
+}
+
+/** The reduced copies for picture src at scale d, made once per stroke. */
+function workCopyFor(src, d) {
+  if (workCopy && workCopy.src === src && workCopy.d === d) return workCopy;
+  let small = src;
+  let mask = blurMask;
+  if (d > 1) {
+    const W = Math.ceil(photo.width / d);
+    const H = Math.ceil(photo.height / d);
+    small = createCanvas(W, H);
+    const g = small.getContext("2d");
+    g.imageSmoothingQuality = "high";
+    g.drawImage(src, 0, 0, W * d, H * d, 0, 0, W, H);
+    mask = createCanvas(W, H);
+  } else if (blurMask.width !== photo.width || blurMask.height !== photo.height) {
     blurMask.width = photo.width;
     blurMask.height = photo.height;
   } else blurMask.getContext("2d").clearRect(0, 0, blurMask.width, blurMask.height);
+  workCopy = { src, d, small, mask };
+  return workCopy;
 }
 
-/** One segment (path p, flat photo points) of an area blur style, fading out over the outer `soft` pixels. */
-function areaSegment(src, p, r, soft, blur = 0, process = null, margin = 0) {
+/**
+ * One segment (path p, flat photo points) of an area blur style, fading out over the outer `soft` pixels.
+ * crisp: draw the result back without smoothing (mosaic squares keep sharp sides).
+ */
+function areaSegment(src, p, r, soft, blur = 0, process = null, margin = 0, crisp = false, scale = 0) {
   const core = Math.max(0.5, r - soft);
   const sigma = soft > 0.5 ? soft / 2.5 : 0;
-  const mc = blurMask.getContext("2d");
-  mc.fillStyle = mc.strokeStyle = "#000";
-  tracePath(mc, p, core);
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (let i = 0; i < p.length; i += 2) {
-    minX = Math.min(minX, p[i]);
-    maxX = Math.max(maxX, p[i]);
-    minY = Math.min(minY, p[i + 1]);
-    maxY = Math.max(maxY, p[i + 1]);
-  }
-  const X0 = Math.max(0, Math.floor(minX - r - 2));
-  const Y0 = Math.max(0, Math.floor(minY - r - 2));
-  const X1 = Math.min(photo.width, Math.ceil(maxX + r + 2));
-  const Y1 = Math.min(photo.height, Math.ceil(maxY + r + 2));
-  const w = X1 - X0;
-  const h = Y1 - Y0;
-  if (w < 1 || h < 1) return;
   const m = Math.ceil(Math.max(blur * 3, margin, sigma * 3));
-  const W = w + 2 * m;
-  const H = h + 2 * m;
+  const d = scale || workScale(r, m);
+  const wc = workCopyFor(src, d);
+  const mc = wc.mask.getContext("2d");
+  mc.fillStyle = mc.strokeStyle = "#000";
+  mc.setTransform(1 / d, 0, 0, 1 / d, 0, 0);
+  tracePath(mc, p, core);
+  mc.setTransform(1, 0, 0, 1, 0, 0);
+  const a = brushArea(p, r, m, d);
+  if (!a) return;
   // the changed picture
-  scratch.width = W;
-  scratch.height = H;
+  scratch.width = a.W;
+  scratch.height = a.H;
   const c = scratch.getContext("2d");
-  if (blur) c.filter = `blur(${blur}px)`;
-  c.drawImage(edgeExtended(src, X0 - m, Y0 - m, W, H), 0, 0); // at the photo's border it blurs with itself
+  if (blur) c.filter = `blur(${blur / d}px)`;
+  c.drawImage(edgeExtended(wc.small, a.OX / d, a.OY / d, a.W, a.H), 0, 0); // at the border it blurs with itself
   c.filter = "none";
-  if (process) process(c, W, H, X0 - m, Y0 - m);
+  if (process) process(c, a.W, a.H, a.OX, a.OY, d);
   // its mask: the stroke's core, blurred (past the photo's border the mask goes on as at the border, so a
   // stroke along the border does not fade towards it)
-  maskScratch.width = W;
-  maskScratch.height = H;
+  maskScratch.width = a.W;
+  maskScratch.height = a.H;
   const k = maskScratch.getContext("2d");
-  if (sigma) k.filter = `blur(${sigma}px)`;
-  k.drawImage(edgeExtended(blurMask, X0 - m, Y0 - m, W, H), 0, 0);
+  if (sigma) k.filter = `blur(${sigma / d}px)`;
+  k.drawImage(edgeExtended(wc.mask, a.OX / d, a.OY / d, a.W, a.H), 0, 0);
   k.filter = "none";
   c.globalCompositeOperation = "destination-in";
   c.drawImage(maskScratch, 0, 0);
   c.globalCompositeOperation = "source-over";
-  const ctx = photo.getContext("2d");
-  ctx.drawImage(src, X0, Y0, w, h, X0, Y0, w, h);
-  ctx.drawImage(scratch, m, m, w, h, X0, Y0, w, h);
+  photo.getContext("2d").drawImage(src, a.X0, a.Y0, a.w, a.h, a.X0, a.Y0, a.w, a.h);
+  drawBack(c, a, d, 1, crisp);
 }
 
 const edgeScratch = createCanvas(1, 1);
@@ -1091,40 +1198,96 @@ function edgeExtended(src, x, y, W, H) {
   return edgeScratch;
 }
 
-/** Smart blur of the w x h piece in c: each pixel moves towards the blurred image as far as it is alike. */
-function smartBlur(c, w, h, strength, r) {
-  const orig = c.getImageData(0, 0, w, h);
-  const blurred = createCanvas(w, h);
-  const b = blurred.getContext("2d");
-  b.filter = `blur(${blurRadius(strength, r)}px)`;
-  b.drawImage(c.canvas, 0, 0);
-  const soft = b.getImageData(0, 0, w, h).data;
-  const d = orig.data;
-  const limit = 12 + strength * 0.5; // luma difference beyond which a pixel is an edge and stays
-  for (let i = 0; i < d.length; i += 4) {
-    const diff = Math.abs(0.3 * (soft[i] - d[i]) + 0.59 * (soft[i + 1] - d[i + 1]) + 0.11 * (soft[i + 2] - d[i + 2]));
-    const t = Math.max(0, 1 - diff / limit);
-    for (let j = 0; j < 3; j++) d[i + j] += (soft[i + j] - d[i + j]) * t;
-  }
-  c.putImageData(orig, 0, 0);
+/**
+ * "Smooth" style: how coarse a texture it flattens (radius, photo pixels, about 0.6..2.5 cells of a default
+ * coloring) and how strong a texture still counts as one (eps: variance; stronger contrast is an edge and
+ * stays). Both grow with the strength.
+ */
+function surfaceParams(strength) {
+  const s = strength / 100;
+  const cell = Math.max(1, Math.sqrt((wiz.base.width * wiz.base.height) / DEFAULT_PIXELS));
+  const level = 4 + 36 * s; // spread of brightness (0..255) still smoothed away
+  return { radius: Math.max(1, cell * (0.6 + 1.9 * s)), eps: level * level };
 }
 
-const mosaicSize = (strength, r) => Math.max(2, Math.round(2 + (strength / 100) * r * 0.8));
+/**
+ * Edge-preserving smoothing of the w x h piece in c (He et al.'s guided filter, each channel guided by
+ * itself): where a window's colors spread less than sqrt(eps) they are replaced by its mean, where they spread
+ * more (an edge, a line) they stay. Costs a few passes over the piece, whatever the radius.
+ */
+function smoothSurface(c, w, h, radius, eps) {
+  const r = Math.max(1, Math.round(radius));
+  const img = c.getImageData(0, 0, w, h);
+  const data = img.data;
+  const n = w * h;
+  const I = new Float32Array(n);
+  const mean = new Float32Array(n);
+  const sq = new Float32Array(n);
+  const A = new Float32Array(n);
+  const B = new Float32Array(n);
+  const tmp = new Float32Array(n);
+  for (let ch = 0; ch < 3; ch++) {
+    for (let i = 0; i < n; i++) {
+      const v = data[i * 4 + ch];
+      I[i] = v;
+      sq[i] = v * v;
+    }
+    boxMean(I, mean, w, h, r, tmp);
+    boxMean(sq, sq, w, h, r, tmp);
+    for (let i = 0; i < n; i++) {
+      const variance = Math.max(0, sq[i] - mean[i] * mean[i]);
+      const a = variance / (variance + eps);
+      A[i] = a;
+      B[i] = mean[i] * (1 - a);
+    }
+    boxMean(A, A, w, h, r, tmp);
+    boxMean(B, B, w, h, r, tmp);
+    for (let i = 0; i < n; i++) data[i * 4 + ch] = A[i] * I[i] + B[i];
+  }
+  c.putImageData(img, 0, 0);
+}
 
-/** Mosaic of the w x h piece in c (at photo position X0, Y0): squares aligned to the photo's own grid. */
-function mosaic(c, w, h, X0, Y0, size) {
-  const ox = ((X0 % size) + size) % size;
-  const oy = ((Y0 % size) + size) % size;
-  const cols = Math.ceil((w + ox) / size);
-  const rows = Math.ceil((h + oy) / size);
+/** Mean over the (2r+1)^2 window around each pixel (fewer at the sides); src may be dst. */
+function boxMean(src, dst, w, h, r, tmp) {
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let sum = 0;
+    for (let x = 0; x < Math.min(r, w); x++) sum += src[row + x];
+    for (let x = 0; x < w; x++) {
+      if (x + r < w) sum += src[row + x + r];
+      if (x - r - 1 >= 0) sum -= src[row + x - r - 1];
+      tmp[row + x] = sum / (Math.min(w - 1, x + r) - Math.max(0, x - r) + 1);
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = 0; y < Math.min(r, h); y++) sum += tmp[y * w + x];
+    for (let y = 0; y < h; y++) {
+      if (y + r < h) sum += tmp[(y + r) * w + x];
+      if (y - r - 1 >= 0) sum -= tmp[(y - r - 1) * w + x];
+      dst[y * w + x] = sum / (Math.min(h - 1, y + r) - Math.max(0, y - r) + 1);
+    }
+  }
+}
+
+/**
+ * Mosaic of the w x h piece in c (at photo position X0, Y0, d photo pixels a pixel): squares of `size` photo
+ * pixels (a multiple of d) on the photo's own grid, so overlapping strokes match.
+ */
+function mosaic(c, w, h, X0, Y0, size, d = 1) {
+  const s = size / d;
+  const ox = ((((X0 / d) % s) + s) % s) | 0;
+  const oy = ((((Y0 / d) % s) + s) % s) | 0;
+  const cols = Math.ceil((w + ox) / s);
+  const rows = Math.ceil((h + oy) / s);
   const small = createCanvas(cols, rows);
-  const s = small.getContext("2d");
-  s.imageSmoothingEnabled = true;
-  s.imageSmoothingQuality = "high";
-  s.drawImage(c.canvas, -ox, -oy, cols * size, rows * size, 0, 0, cols, rows);
+  const g = small.getContext("2d");
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = "high";
+  g.drawImage(c.canvas, -ox, -oy, cols * s, rows * s, 0, 0, cols, rows);
   c.imageSmoothingEnabled = false;
   c.clearRect(0, 0, w, h);
-  c.drawImage(small, 0, 0, cols, rows, -ox, -oy, cols * size, rows * size);
+  c.drawImage(small, 0, 0, cols, rows, -ox, -oy, cols * s, rows * s);
   c.imageSmoothingEnabled = true;
 }
 
@@ -1316,9 +1479,10 @@ function replayBlur(op, p, r) {
   // the styles that copy from the photo as it was when the stroke started work from a snapshot of it
   const src = style === "smudge" ? photo : createCanvas(photo.width, photo.height);
   if (src !== photo) src.getContext("2d").drawImage(photo, 0, 0);
+  beginBlurMask();
   if (style === "soft" || style === "smart" || style === "mosaic") {
-    beginBlurMask();
-    blurSegment(op, src, [p[0], p[1]], [p[0], p[1]], r);
+    const first = [p[0], p[1]];
+    blurSegment(op, src, first, first, r); // a dot, as the stroke began (the same object twice: see blurSegment)
     for (let i = 2; i < p.length; i += 2) blurSegment(op, src, [p[i - 2], p[i - 1]], [p[i], p[i + 1]], r);
     return;
   }
@@ -1358,8 +1522,8 @@ const TOL_TOOLS = ["fill", "recolor"];
 function updateEditorUi() {
   $$("#editor-tools [data-tool]").forEach((b) => b.classList.toggle("on", b.dataset.tool === wiz.tool));
   const stampReady = wiz.tool === "clone" && wiz.stamp;
-  $("#editor-hint").textContent = t("h_" + wiz.tool + (stampReady ? "2" : ""));
   const tool = wiz.tool;
+  $("#editor-hint").textContent = t(tool === "blur" ? "h_blur_" + wiz.blur : "h_" + wiz.tool + (stampReady ? "2" : ""));
   $("#frame-options").hidden = tool !== "crop";
   $("#brush-color").hidden = !COLOR_TOOLS.includes(tool);
   $("#brush-color").style.background = wiz.color;

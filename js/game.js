@@ -1630,6 +1630,12 @@ $("#play-back").onclick = () => closeGame();
 $("#play-panel-toggle").onclick = () => {
   game.dockHidden = !game.dockHidden;
   updateLayout();
+  // everything is gone, the button too (it still works where it was): say so the first few times
+  if (game.dockHidden && settings.hall && settings.hallTips < 3) {
+    settings.hallTips++;
+    saveSettings();
+    toast(t("hall_back"), 3500);
+  }
   // while the panel was hidden the strip was not scrolled: put the selected color back in the middle
   if (!game.dockHidden && game.selected) scrollPaletteTo(swatches[game.selected - 1], "auto");
 };

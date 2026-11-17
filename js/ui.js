@@ -108,12 +108,12 @@ export function showScreen(id) {
 }
 
 let toastTimer = 0;
-export function toast(text) {
+export function toast(text, ms = 1400) {
   const el = $("#toast");
   el.textContent = text;
   el.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 1400);
+  toastTimer = setTimeout(() => el.classList.remove("show"), ms);
 }
 
 export function setBusy(on, text) {

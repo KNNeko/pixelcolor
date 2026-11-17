@@ -35,7 +35,7 @@ export const STRINGS = {
   sh_fill: "Filled|Заливка",
   sh_outline: "Outline|Контур",
   bl_soft: "Soft|Мягкое",
-  bl_smart: "Smooth|Сглаживание",
+  bl_smart: "Smooth out|Разгладить",
   bl_motion: "Motion|Движение",
   bl_mosaic: "Mosaic|Мозаика",
   bl_smudge: "Smudge|Размазать",
@@ -53,8 +53,15 @@ export const STRINGS = {
     "Tap an area: it and the similar pixels touching it become the chosen color. Tolerance = how similar.|Коснитесь области: она и похожие пиксели вокруг станут выбранным цветом. Допуск — насколько похожие.",
   h_recolor:
     "Tap a color: every similar pixel of the photo takes the chosen color, shading stays.|Коснитесь цвета: все похожие пиксели фото примут выбранный цвет, тени сохранятся.",
-  h_blur:
-    "Paint over the picture: soft blur, smoothing that keeps edges, motion, mosaic or smudge.|Проведите по картинке: мягкое размытие, сглаживание с сохранением краёв, движение, мозаика или размазывание.",
+  h_blur_soft:
+    "Plain blur under your finger. Strength: how much; edge softness: how gently it fades into the photo.|Обычное размытие под пальцем. Сила — насколько сильно, мягкость краёв — насколько плавно оно переходит в фото.",
+  h_blur_smart:
+    "Smooths out noise, grain and fine texture (skin, fabric, JPEG squares) but keeps edges and lines sharp, so the coloring gets fewer stray dots. Strength: how coarse a texture goes.|Разглаживает шум, зерно и мелкую текстуру (кожа, ткань, квадраты JPEG), а края и линии оставляет чёткими — в раскраске будет меньше случайных точек. Сила — насколько крупную текстуру убирать.",
+  h_blur_motion: "Smears the picture along the way your finger moves.|Смазывает картинку вдоль движения пальца.",
+  h_blur_mosaic:
+    "Squares of one color, e.g. to hide a face or text. Strength: square size.|Квадраты одного цвета, например чтобы скрыть лицо или надпись. Сила — размер квадратов.",
+  h_blur_smudge:
+    "Drags the colors along with your finger, like a finger in wet paint.|Тянет цвета за пальцем, как палец по мокрой краске.",
   h_clone: "Draw a loop around what to copy.|Обведите пальцем то, что нужно копировать.",
   h_clone2:
     "Touch and drag to place a copy (as many as you like). «New selection» picks another piece.|Коснитесь и ведите, чтобы поставить копию (сколько угодно раз). «Новое выделение» — взять другой кусок.",
@@ -194,6 +201,8 @@ export const STRINGS = {
   asv: "Auto-save (minutes)|Автосохранение (мин)",
   full: "Full screen|Полный экран",
   hall: "Panel button hides everything|Кнопка панели скрывает всё",
+  hall_back:
+    "To bring it back, tap the top right corner, where the button was|Чтобы вернуть, коснитесь правого верхнего угла — там, где была кнопка",
   sil: "Silhouette picture|Силуэтная картинка",
   oth: "Show other parts|Показывать другие части",
   tset: "Tool settings|Настройки инструментов",
