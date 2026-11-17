@@ -29,6 +29,7 @@ export const DEFAULTS = {
   so: "rec", // library sort
   pm: "art", // pixelization mode used last (art | photo | dither)
   pcl: 3, // pixelization "cleanliness" used last, 0..10
+  tot: null, // lifetime painting statistics (stats.js); null until first counted
 };
 
 export const settings = { ...DEFAULTS };

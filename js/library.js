@@ -31,6 +31,7 @@ import { startWizard } from "./wizard.js";
 import { renderThumbnails } from "./render.js";
 import { openGame } from "./game.js";
 import { openTimelapse } from "./timelapse.js";
+import { ensureTotals, canvasStatsHtml, emptyStats } from "./stats.js";
 import { openPngExport } from "./export-png.js";
 
 export const library = { folderId: "", search: "" };
@@ -129,6 +130,7 @@ async function fillMissingStats() {
 
 export async function refreshLibrary() {
   const all = await listLibrary();
+  ensureTotals(all);
   const query = library.search.trim().toLowerCase();
   const folders = all.filter((m) => m.folder);
   const canvases = all.filter((m) => !m.folder);
@@ -238,6 +240,7 @@ async function openCanvasMenu(entry) {
   const sheet = openSheet(
     `<div class="carousel"></div><b></b>` +
       `<span class="muted">${entry.width}×${entry.height} · ${statsText(entry)}</span>` +
+      canvasStatsHtml(entry.stats, entry) +
       `<div class="actions">` +
       actionButton("play", "cont", "act-continue") +
       actionButton("film", "tlapse", "act-timelapse") +
@@ -298,7 +301,7 @@ async function openCanvasMenu(entry) {
         await saveCanvas({
           canvas,
           writeCanvas: true,
-          meta: { ...entry, progress: 0, colorsDone: 0, done: false, updated: Date.now() },
+          meta: { ...entry, progress: 0, colorsDone: 0, done: false, updated: Date.now(), stats: emptyStats() },
           events: [],
           rewriteEvents: true,
           thumbs,

@@ -6,6 +6,7 @@ import { exportBackup, importBackup, requestPersistence } from "./storage.js";
 import { refreshLibrary, renderSortOptions, clearThumbCache } from "./library.js";
 import { restartAutosave } from "./game.js";
 import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
+import { totalsHtml } from "./stats.js";
 
 /** Picking a custom color also switches its theme select to "custom", so the color is actually used. */
 const COLOR_SELECT = { cc: ["ct", "cus"], sic: ["sit", "cus"] };
@@ -84,7 +85,15 @@ function renderSettings() {
     };
     list.append(row);
   }
-  list.append(backupRow());
+  list.append(statsRow(), backupRow());
+}
+
+/** Lifetime statistics, folded away until tapped. */
+function statsRow() {
+  const row = document.createElement("details");
+  row.className = "row stats-row";
+  row.innerHTML = `<summary>${t("st_title")}</summary>${totalsHtml()}`;
+  return row;
 }
 
 function backupRow() {
@@ -117,6 +126,7 @@ function backupRow() {
       const saved = await importBackup(file);
       if (saved) {
         Object.assign(settings, saved);
+        if (!saved.tot) settings.tot = null; // a backup from before statistics: count again from the library
         saveSettings();
         applyAppTheme();
         translatePage();

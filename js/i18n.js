@@ -207,6 +207,19 @@ export const STRINGS = {
   copyp: "Copy with new settings|Копия с другими параметрами",
   recq: "Recreate this canvas with new settings? Its coloring progress will be lost.|Пересоздать холст с новыми настройками? Прогресс раскраски будет потерян.",
   share_err: "Could not open the shared image|Не удалось открыть присланное изображение",
+  st_title: "Statistics|Статистика",
+  st_time: "Painting time|Время рисования",
+  st_speed: "Speed|Скорость",
+  st_start: "Started|Начат",
+  st_end: "Finished|Завершён",
+  st_days: "Days of painting|Дней рисования",
+  st_done: "Canvases finished|Завершено холстов",
+  st_cells: "Cells painted|Закрашено клеток",
+  st_avg: "Average speed|Средняя скорость",
+  u_s: "s|с",
+  u_min: "min|мин",
+  u_h: "h|ч",
+  u_cpm: "cells/min|кл/мин",
 };
 
 export function t(key) {

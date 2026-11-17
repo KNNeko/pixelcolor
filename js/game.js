@@ -34,6 +34,7 @@ import { openTimelapse } from "./timelapse.js";
 import { launchConfetti } from "./confetti.js";
 import { createGlView } from "./glview.js";
 import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
+import { emptyStats, IDLE_LIMIT, dayKey, canvasStatsHtml } from "./stats.js";
 
 /** Smallest rectangle [x0, y0, x1, y1] containing both (either may be null). */
 const unionRect = (a, b) =>
@@ -138,6 +139,10 @@ export const game = {
   partCorrect: 0,
   partTotal: 0,
   touchedColors: new Set(),
+
+  // statistics (canvas.stats, settings.tot; see stats.js)
+  lastActive: 0, // time of the last touch while painting
+  statsChanged: false,
 
   // tools
   selected: 0, // 1-based color number, 0 = none
@@ -295,7 +300,10 @@ export async function openGame(canvas, events, isNew = false) {
   await yieldToBrowser();
   const N = canvas.width * canvas.height;
   canvas.partOf = canvas.partOf || new Uint8Array(N);
+  canvas.stats = canvas.stats || emptyStats();
   game.canvas = canvas;
+  game.lastActive = 0;
+  game.statsChanged = false;
   game.events = events;
   game.savedEvents = isNew ? 0 : events.length;
   game.unsaved = isNew;
@@ -365,7 +373,7 @@ export async function saveGame(withThumbs) {
   const g = game;
   if (!g.canvas) return;
   const wantThumbs = withThumbs && g.thumbsStale;
-  if (!g.unsaved && !wantThumbs) return;
+  if (!g.unsaved && !g.statsChanged && !wantThumbs) return;
   const canvas = g.canvas;
   const meta = {
     id: canvas.id,
@@ -378,7 +386,10 @@ export async function saveGame(withThumbs) {
     done: canvas.done,
     folderId: canvas.folderId,
     updated: Date.now(),
+    stats: { ...canvas.stats },
   };
+  if (g.statsChanged) saveSettings(); // lifetime totals
+  g.statsChanged = false;
   const writeCanvas = g.canvasChanged;
   g.unsaved = false;
   g.canvasChanged = false;
@@ -590,6 +601,8 @@ function putCell(i, v) {
     }
   }
   if (v === right) {
+    game.canvas.stats.cells++;
+    if (settings.tot) settings.tot.cells++;
     game.remaining[right - 1]--;
     game.correct++;
     game.partCorrectCells[part]++;
@@ -617,10 +630,36 @@ export function commitStroke() {
   if (s && s.cells.length) {
     game.events.push({ cells: Int32Array.from(s.cells), values: Uint16Array.from(s.values) });
     game.unsaved = game.thumbsStale = true;
+    countPaintingDay();
   }
   game.stroke = null;
   updateStatus();
   requestDraw();
+}
+
+/** Painting time: the time since the last touch counts, unless it was a pause (or the picture is finished). */
+function noteActivity() {
+  const canvas = game.canvas;
+  if (!canvas || canvas.done) return;
+  const now = Date.now();
+  const gap = now - game.lastActive;
+  game.lastActive = now;
+  if (gap >= IDLE_LIMIT) return;
+  canvas.stats.time += gap;
+  if (settings.tot) settings.tot.time += gap;
+  game.statsChanged = true;
+}
+
+/** Something was painted: first paint and the number of days with painting. */
+function countPaintingDay() {
+  const s = game.canvas.stats;
+  if (!s.started) s.started = Date.now();
+  const day = dayKey();
+  if (s.lastDay !== day) {
+    s.days++;
+    s.lastDay = day;
+  }
+  game.statsChanged = true;
 }
 
 /** Progress pill, swatches, auto-advance to the next color, "finished" sheet. */
@@ -633,11 +672,14 @@ export function updateStatus() {
   if (game.canvas.parts.length) renderPartChips();
   if (game.correct === cellCount() && !game.canvas.done) {
     game.canvas.done = true;
+    game.canvas.stats.finished = Date.now();
+    if (settings.tot) settings.tot.done++;
+    game.statsChanged = true;
     markCanvasChanged();
     vibrate([80, 40, 80, 40, 300]);
     launchConfetti();
     const sheet = openSheet(
-      `<div class="finished">🎉 ${t("fin")}</div><div class="actions">${actionButton("film", "tlapse", "fin-timelapse")}${actionButton("image", "png", "fin-png")}${actionButton("check", "done", "fin-close")}</div>`,
+      `<div class="finished">🎉 ${t("fin")}</div>${canvasStatsHtml(game.canvas.stats, game.canvas)}<div class="actions">${actionButton("film", "tlapse", "fin-timelapse")}${actionButton("image", "png", "fin-png")}${actionButton("check", "done", "fin-close")}</div>`,
     );
     sheet.querySelector("#fin-timelapse").onclick = () => {
       closeSheet();
@@ -1398,6 +1440,7 @@ playCanvas.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
+    noteActivity();
     zoomAround(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
     requestDraw();
   },
@@ -1406,6 +1449,7 @@ playCanvas.addEventListener(
 
 playCanvas.addEventListener("pointerdown", (e) => {
   if (!game.canvas) return;
+  noteActivity();
   playCanvas.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, [e.offsetX, e.offsetY]);
   game.hintCell = null;
@@ -1436,6 +1480,7 @@ playCanvas.addEventListener("pointerdown", (e) => {
 playCanvas.addEventListener("pointermove", (e) => {
   const old = pointers.get(e.pointerId);
   if (!old) return;
+  noteActivity();
   const now = [e.offsetX, e.offsetY];
   pointers.set(e.pointerId, now);
   if (pointers.size > 1) {

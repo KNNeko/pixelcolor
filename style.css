@@ -990,6 +990,54 @@ header b {
   font-size: 24px;
   font-weight: 700;
 }
+/* painting statistics: label / value pairs */
+.stats {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 12px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: var(--field);
+  font-size: 14px;
+}
+.stats span {
+  color: var(--muted);
+}
+.stats b {
+  text-align: right;
+  font-weight: 600;
+}
+.row.stats-row {
+  display: block;
+  padding: 0 16px;
+}
+.stats-row summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  cursor: pointer;
+  list-style: none;
+}
+.stats-row summary::-webkit-details-marker {
+  display: none;
+}
+.stats-row summary:after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(45deg);
+  transition: transform 0.2s;
+}
+.stats-row[open] summary:after {
+  transform: rotate(-135deg);
+}
+.stats-row .stats {
+  margin-bottom: 14px;
+}
 #timelapse .sheet {
   max-height: 96%;
 }

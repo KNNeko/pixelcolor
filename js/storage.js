@@ -2,7 +2,8 @@
 //
 // Database "pxc3", version 3. Object stores:
 //   p   canvases  { id, fid, name, W, H, mode, pal, idx, done, parts:[{id,n}], pm }   (pixel data, rarely rewritten)
-//   m   library   { id, name, W, H, pct, done, fid, ts, nc, nd }  or folders { id, folder:1, name, ts }   (small, listed often)
+//   m   library   { id, name, W, H, pct, done, fid, ts, nc, nd, tm, pc, t0, t1, dd, ld }  or folders { id, folder:1, name, ts }
+//                 (small, listed often; tm..ld = painting statistics, see stats.js)
 //   ev  events    { id, seq, cells: Int32Array, values: Uint16Array }   one record per paint action, append-only
 //   th  thumbnails{ id, main, parts:[...] }   Blob (new) or data-URL string (migrated), loaded lazily
 //   src source    { id, image: Blob (JPEG), state }   the photo + wizard settings, for "recreate" / "copy"
@@ -129,8 +130,19 @@ function toMeta(rec) {
     updated: rec.ts,
     colors: rec.nc || 0, // palette size (0 = entry saved before this was stored)
     colorsDone: rec.nd || 0, // colors with no cells left to paint
+    stats: toStats(rec),
   };
 }
+
+/** Painting statistics of a library record (stats.js); missing fields (older entries) are 0. */
+const toStats = (rec) => ({
+  time: rec.tm || 0,
+  cells: rec.pc || 0,
+  started: rec.t0 || 0,
+  finished: rec.t1 || 0,
+  days: rec.dd || 0,
+  lastDay: rec.ld || 0,
+});
 
 function fromMeta(m) {
   if (m.folder) return { id: m.id, folder: 1, name: m.name, ts: m.updated };
@@ -145,6 +157,12 @@ function fromMeta(m) {
     ts: m.updated,
     nc: m.colors || 0,
     nd: m.colorsDone || 0,
+    tm: (m.stats && m.stats.time) || 0,
+    pc: (m.stats && m.stats.cells) || 0,
+    t0: (m.stats && m.stats.started) || 0,
+    t1: (m.stats && m.stats.finished) || 0,
+    dd: (m.stats && m.stats.days) || 0,
+    ld: (m.stats && m.stats.lastDay) || 0,
   };
 }
 
@@ -236,18 +254,23 @@ export const deleteFolderEntry = (id) => run([LIBRARY], "readwrite", (tx) => tx.
 
 /* ---------- canvases ---------- */
 
-/** Full canvas plus its paint events: { canvas, events: [{cells, values}] }. */
+/** Full canvas (with canvas.stats from its library entry) plus its paint events: { canvas, events: [{cells, values}] }. */
 export async function loadCanvas(id) {
   let rec;
+  let entry;
   let events;
-  await run([CANVASES, EVENTS], "readonly", (tx) => {
+  await run([CANVASES, LIBRARY, EVENTS], "readonly", (tx) => {
     const a = tx.objectStore(CANVASES).get(id);
     a.onsuccess = () => (rec = a.result);
     const b = tx.objectStore(EVENTS).getAll(eventRange(id));
     b.onsuccess = () => (events = b.result);
+    const c = tx.objectStore(LIBRARY).get(id);
+    c.onsuccess = () => (entry = c.result);
   });
   if (!rec) throw new Error("canvas not found");
-  return { canvas: toCanvas(rec), events: events.map((e) => ({ cells: e.cells, values: e.values })) };
+  const canvas = toCanvas(rec);
+  canvas.stats = toStats(entry || {});
+  return { canvas, events: events.map((e) => ({ cells: e.cells, values: e.values })) };
 }
 
 /**
