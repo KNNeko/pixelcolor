@@ -3,7 +3,7 @@
   "short_name": "Pixel Color",
   "start_url": "./",
   "scope": "./",
-  "display": "standalone",
+  "display": "fullscreen",
   "background_color": "#f3f1ff",
   "theme_color": "#f3f1ff",
   "icons": [

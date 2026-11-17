@@ -684,11 +684,15 @@ header b {
 #play-gl {
   pointer-events: none;
 }
+/* The picture also fills the strip beside the camera cutout / under the status bar; the buttons stay below it. */
+#screen-play {
+  padding-top: 0;
+}
 #play-top {
   position: absolute;
   left: 8px;
   right: 8px;
-  top: 8px;
+  top: calc(8px + env(safe-area-inset-top));
   display: flex;
   gap: 8px;
   align-items: center;
@@ -712,7 +716,7 @@ header b {
   position: absolute;
   left: 8px;
   right: 8px;
-  top: 62px;
+  top: calc(62px + env(safe-area-inset-top));
   display: flex;
   gap: 6px;
   overflow-x: auto;

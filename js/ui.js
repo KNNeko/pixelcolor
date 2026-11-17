@@ -221,10 +221,13 @@ export function translatePage() {
 
 /* ---------- fullscreen ---------- */
 
+/** Installed with "display": "fullscreen": the system already keeps the app fullscreen by itself. */
+const systemFullscreen = () => matchMedia("(display-mode: fullscreen)").matches;
+
 let fullscreenTried = false;
 export function syncFullscreen(force) {
   const root = document.documentElement;
-  if (!root.requestFullscreen) return;
+  if (!root.requestFullscreen || systemFullscreen()) return;
   if (settings.full) {
     if (!document.fullscreenElement && (force || !fullscreenTried)) {
       fullscreenTried = true;
@@ -236,3 +239,12 @@ export function syncFullscreen(force) {
     }
   } else if (document.fullscreenElement) document.exitFullscreen();
 }
+
+// Switching to another app (or the recent-apps list) drops fullscreen, and a page may only ask for it again
+// from inside a touch. So when the app comes back without fullscreen, the next touch restores it.
+function restoreFullscreenOnTouch() {
+  if (document.hidden || !settings.full || document.fullscreenElement || systemFullscreen()) return;
+  addEventListener("pointerup", () => syncFullscreen(true), { once: true, capture: true });
+}
+addEventListener("visibilitychange", restoreFullscreenOnTouch);
+addEventListener("pageshow", restoreFullscreenOnTouch);

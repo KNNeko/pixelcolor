@@ -349,7 +349,6 @@ export async function saveGame(withThumbs) {
   if (!g.canvas) return;
   const wantThumbs = withThumbs && g.thumbsStale;
   if (!g.unsaved && !wantThumbs) return;
-  g.buffer.flush();
   const canvas = g.canvas;
   const meta = {
     id: canvas.id,
@@ -828,8 +827,10 @@ export function handleResize() {
 }
 if (window.ResizeObserver) new ResizeObserver(handleResize).observe($("#play-wrap"));
 
-const TOP_BAR = 64;
+/** Height taken by the round buttons at the top, including the camera cutout / status bar inset above them. */
+const topBarHeight = () => $("#play-top").offsetTop + 56;
 export function fitView() {
+  const TOP_BAR = topBarHeight();
   const bottom = dockHeight();
   placeMinimap();
   const { width: W, height: H } = game.canvas;
@@ -842,7 +843,7 @@ export function fitView() {
 
 /** Zooms so the cell rectangle x0..x1, y0..y1 fills the screen. */
 export function fitToBox(x0, y0, x1, y1) {
-  const top = 120;
+  const top = topBarHeight() + 56;
   const bottom = dockHeight();
   const w = x1 - x0 + 1;
   const h = y1 - y0 + 1;
@@ -1047,6 +1048,55 @@ function draw2d(fades) {
 const minimapElement = $("#minimap");
 /** Scaled-down picture for the minimap; rebuilt only when the picture changed, a few times a second at most. */
 const minimapCache = { canvas: createCanvas(1, 1), version: -1, size: 0, background: "", time: 0, timer: 0 };
+/** Panel color of the current app theme as [r, g, b] (the minimap frame and shade use it). */
+const panelColor = { theme: "", rgb: [29, 31, 59] };
+function panelRgb() {
+  const theme = document.documentElement.dataset.theme || "";
+  if (panelColor.theme !== theme) {
+    panelColor.theme = theme;
+    const hex = getComputedStyle(document.documentElement).getPropertyValue("--panel").trim();
+    const full = hex.length === 4 ? "#" + [...hex.slice(1)].map((c) => c + c).join("") : hex;
+    const n = parseInt(full.slice(1), 16);
+    if (!Number.isNaN(n)) panelColor.rgb = [n >> 16, (n >> 8) & 255, n & 255];
+  }
+  return panelColor.rgb;
+}
+
+/**
+ * Draws the picture into the minimap cache straight from the pixel array: 4 samples per minimap pixel.
+ * The cost depends on the minimap size only, so a 4000x4000 canvas is as cheap as a small one.
+ */
+function renderMinimapPicture(N, k, ox, oy) {
+  const { width: W, height: H } = game.canvas;
+  const cache = minimapCache;
+  cache.canvas.width = cache.canvas.height = cache.size = N;
+  const cctx = cache.canvas.getContext("2d");
+  const image = cctx.createImageData(N, N);
+  const out = new Uint32Array(image.data.buffer);
+  const px = game.buffer.pixels;
+  const bg = game.backgroundPixel;
+  out.fill(bg);
+  const x0 = Math.max(0, Math.ceil(ox));
+  const y0 = Math.max(0, Math.ceil(oy));
+  const x1 = Math.min(N, Math.floor(ox + W * k));
+  const y1 = Math.min(N, Math.floor(oy + H * k));
+  for (let v = y0; v < y1; v++)
+    for (let u = x0; u < x1; u++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (let n = 0; n < 4; n++) {
+        const cx = Math.min(W - 1, ((u + 0.25 + (n & 1) * 0.5 - ox) / k) | 0);
+        const cy = Math.min(H - 1, ((v + 0.25 + (n >> 1) * 0.5 - oy) / k) | 0);
+        const c = px[cy * W + cx] || bg; // 0 = hidden cell: background
+        r += c & 255;
+        g += (c >> 8) & 255;
+        b += (c >> 16) & 255;
+      }
+      out[v * N + u] = 0xff000000 | ((b >> 2) << 16) | ((g >> 2) << 8) | (r >> 2);
+    }
+  cctx.putImageData(image, 0, 0);
+}
 
 function drawMinimap() {
   const mm = minimapElement;
@@ -1072,17 +1122,10 @@ function drawMinimap() {
   if (resized || cache.version !== game.buffer.version) {
     const now = performance.now();
     if (resized || cache.version < 0 || now - cache.time > 300) {
-      cache.canvas.width = cache.canvas.height = cache.size = N;
       cache.background = game.theme.bg;
       cache.version = game.buffer.version;
       cache.time = now;
-      const cctx = cache.canvas.getContext("2d");
-      cctx.fillStyle = game.theme.bg;
-      cctx.fillRect(0, 0, N, N);
-      cctx.imageSmoothingEnabled = k < 1;
-      cctx.imageSmoothingQuality = "high";
-      game.buffer.flush();
-      cctx.drawImage(game.buffer.canvas, ox, oy, W * k, H * k);
+      renderMinimapPicture(N, k, ox, oy);
     } else if (!cache.timer)
       cache.timer = setTimeout(() => {
         cache.timer = 0;
@@ -1090,13 +1133,22 @@ function drawMinimap() {
       }, 320);
   }
   mctx.drawImage(cache.canvas, 0, 0);
-  const rect = [ox + a * k, oy + b * k, Math.max(4, (c - a) * k), Math.max(4, (d - b) * k)];
-  mctx.lineWidth = 3.2 * dpr;
-  mctx.strokeStyle = "#fff";
-  mctx.strokeRect(...rect);
-  mctx.lineWidth = 1.6 * dpr;
-  mctx.strokeStyle = "#ff2d55";
-  mctx.strokeRect(...rect);
+  // Where you are: everything outside the visible area is shaded with the panel color, the visible area
+  // stays clear and gets a thin frame. At least 6 px, so it can still be found on a huge canvas.
+  const min = 6 * dpr;
+  const w = Math.max(min, (c - a) * k);
+  const h = Math.max(min, (d - b) * k);
+  const x = Math.max(0, Math.min(N - w, ox + ((a + c) / 2) * k - w / 2));
+  const y = Math.max(0, Math.min(N - h, oy + ((b + d) / 2) * k - h / 2));
+  const [pr, pg, pb] = panelRgb();
+  mctx.fillStyle = `rgba(${pr},${pg},${pb},0.55)`;
+  mctx.fillRect(0, 0, N, y);
+  mctx.fillRect(0, y + h, N, N - y - h);
+  mctx.fillRect(0, y, x, h);
+  mctx.fillRect(x + w, y, N - x - w, h);
+  mctx.lineWidth = dpr;
+  mctx.strokeStyle = `rgb(${pr},${pg},${pb})`;
+  mctx.strokeRect(x - dpr / 2, y - dpr / 2, w + dpr, h + dpr);
 }
 
 /* ---------- touch / mouse input ---------- */

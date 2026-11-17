@@ -212,6 +212,8 @@ export function createGlView(element, onRestored) {
   let glyphs = null;
   let size = null; // { width, height } of the canvas the textures hold
   let mipsStale = true;
+  let sentTheme = null; // theme object whose colors are currently in the shader
+  let gridColor = [0, 0, 0, 0];
 
   function compile(type, source) {
     const shader = gl.createShader(type);
@@ -252,6 +254,7 @@ export function createGlView(element, onRestored) {
     gl.uniform4f(uniform.uGlyph, glyphs.advanceCells, glyphs.heightCells, glyphs.advanceU, glyphs.padU);
     gl.uniform1f(uniform.uGlyphPx, glyphs.boxHeight);
     size = null;
+    sentTheme = null;
   }
 
   function makeTexture(unit, format, width, height, levels, filter) {
@@ -336,14 +339,18 @@ export function createGlView(element, onRestored) {
     gl.uniform2f(uniform.uSize, size.width, size.height);
     gl.uniform2f(uniform.uScreen, element.width, element.height);
     const theme = p.theme;
-    const [bg0, bg1] = theme.gradient || [theme.bg, theme.bg];
-    gl.uniform3fv(uniform.uBg0, hexToRgb(bg0));
-    gl.uniform3fv(uniform.uBg1, hexToRgb(bg1));
-    gl.uniform3fv(uniform.uCell, hexToRgb(theme.cell));
-    gl.uniform3fv(uniform.uHighlight, hexToRgb(theme.highlight));
-    gl.uniform3fv(uniform.uNumber, hexToRgb(theme.number));
-    const grid = rgbaToVec(theme.grid);
-    gl.uniform4f(uniform.uGrid, grid[0], grid[1], grid[2], grid[3] * p.gridFade);
+    if (theme !== sentTheme) {
+      // theme colors are parsed and sent only when the theme object changes, not every frame
+      sentTheme = theme;
+      const [bg0, bg1] = theme.gradient || [theme.bg, theme.bg];
+      gl.uniform3fv(uniform.uBg0, hexToRgb(bg0));
+      gl.uniform3fv(uniform.uBg1, hexToRgb(bg1));
+      gl.uniform3fv(uniform.uCell, hexToRgb(theme.cell));
+      gl.uniform3fv(uniform.uHighlight, hexToRgb(theme.highlight));
+      gl.uniform3fv(uniform.uNumber, hexToRgb(theme.number));
+      gridColor = rgbaToVec(theme.grid);
+    }
+    gl.uniform4f(uniform.uGrid, gridColor[0], gridColor[1], gridColor[2], gridColor[3] * p.gridFade);
     gl.uniform1f(uniform.uCellFade, p.cellFade);
     gl.uniform1f(uniform.uNumberFade, p.numberFade);
     gl.uniform1i(uniform.uSelected, p.selected);

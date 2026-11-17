@@ -15,6 +15,7 @@
 //   -> quantize: map every cell to the nearest palette color (dither: with error diffusion)
 //   -> settle: a cell that fits its neighbours' color almost as well as its own joins them (no stray dots)
 //   -> removeSpecks: tiny islands that barely differ from their surroundings join a neighbour
+//   -> ditherRamps: borders between the bands of a gradient get a soft one-cell checker edge
 //   -> cleanPalette: merge colors the eye cannot tell apart and colors used by a couple of cells
 //   -> finalizePalette: drop unused colors, number them dark -> light
 
@@ -182,9 +183,10 @@ export function smoothFlat(rgba, w, h, clean) {
   const limit = 6 * clean; // |dR|+|dG|+|dB| that still counts as "the same area"
   const weight = new Float32Array(766);
   for (let d = 0; d < 766; d++) weight[d] = Math.max(0, Math.min(1, 2 - d / limit));
+  // low settings only touch the nearest neighbours once: fine texture and faint lines keep their contrast
   const big = w * h > 2e6;
-  const radius = big ? 1 : 2;
-  const passes = big ? 1 : 1 + (clean >= 2) + (clean >= 7);
+  const radius = big || clean < 4 ? 1 : 2;
+  const passes = big ? 1 : 1 + (clean >= 6) + (clean >= 9);
   let src = rgba;
   for (let pass = 0; pass < passes; pass++) {
     const out = new Uint8ClampedArray(src.length);
@@ -224,8 +226,12 @@ export function smoothFlat(rgba, w, h, clean) {
 
 /** Sub-samples of one cell closer than this (in color levels) are one flat color. */
 const FLAT_RANGE = 12;
-/** A thin line or small detail is kept only if it differs from its surroundings by at least this much. */
-const LINE_CONTRAST = 40;
+/**
+ * A thin line or small detail is kept only if it differs from its surroundings by at least this much (color
+ * levels). Low on purpose: faint strokes (blush hatching, soft hair strands) are what makes a drawing look
+ * drawn, and "two clearly separate groups of samples" already filters out noise.
+ */
+const LINE_CONTRAST = 16;
 /** ...and covers at least this share of the cell. */
 const LINE_SHARE = 0.15;
 
@@ -432,7 +438,7 @@ export function samplePixels(rgba, pixelCount, count) {
  * A group of n similar cells counts as n^(1 - RARE_BOOST): a huge flat background no longer takes most of
  * the palette as near-identical shades, and small details (eyes, lips, highlights) get colors of their own.
  */
-const RARE_BOOST = 0.15;
+const RARE_BOOST = 0.05;
 
 /** Evenly spaced sample of the cell image for the palette search, with rarity weights. */
 export function paletteSample(rgba, pixelCount, count) {
@@ -748,6 +754,7 @@ export function settle(idx, rgba, W, H, pal, K, clean) {
  * Removes connected same-color regions smaller than minSize cells: each one takes the neighbouring color
  * closest to its own (in Lab), but only if that color is within maxDelta, so a small island that clearly
  * stands out (an eye highlight) is left alone.
+ * Cells touching by a corner count as connected: a thin diagonal line is one region, not a row of specks.
  */
 export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
   if (minSize < 2) return;
@@ -759,7 +766,7 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
   const regionColor = [];
   let regions = 0;
 
-  // label connected regions (4-neighbour flood fill)
+  // label connected regions (8-neighbour flood fill)
   for (let start = 0; start < N; start++) {
     if (region[start] >= 0) continue;
     const c = idx[start];
@@ -771,11 +778,19 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
       const i = queue[head++];
       const x = i % W;
       const y = (i / W) | 0;
-      for (const j of [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, y > 0 ? i - W : -1, y < H - 1 ? i + W : -1])
-        if (j >= 0 && region[j] < 0 && idx[j] === c) {
-          region[j] = regions;
-          queue[tail++] = j;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= W) continue;
+          const j = yy * W + xx;
+          if (region[j] < 0 && idx[j] === c) {
+            region[j] = regions;
+            queue[tail++] = j;
+          }
         }
+      }
     }
     regionSize.push(tail);
     regionColor.push(c);
@@ -811,8 +826,55 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
   }
 }
 
+/** Band borders are softened only between palette colors at most this far apart (Lab distance). */
+const RAMP_REACH = 7;
+
+/**
+ * Softens the borders between the bands of a gradient, the way pixel artists do: along the border the two
+ * colors interlock like teeth (a one-cell checker pattern) instead of meeting in a hard line.
+ * Only cells right at a border are touched, only between two similar colors (a real edge between different
+ * colors stays as it is), and only where the cell's real color is about halfway between the two.
+ * width 0..0.5: how far from "exactly halfway" a cell may be (0 = off).
+ */
+export function ditherRamps(idx, rgba, W, H, pal, K, width) {
+  if (width <= 0) return;
+  const palLab = paletteToLab(pal, K);
+  const lab = new Float32Array(3);
+  const before = new Uint16Array(idx);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const a = before[i];
+      // the neighbouring color that differs from this cell's, nearest in color if there are several
+      let b = -1;
+      let gap2 = RAMP_REACH * RAMP_REACH;
+      for (const j of [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, y > 0 ? i - W : -1, y < H - 1 ? i + W : -1]) {
+        if (j < 0 || before[j] === a) continue;
+        const c = before[j];
+        const d0 = palLab[c * 3] - palLab[a * 3];
+        const d1 = palLab[c * 3 + 1] - palLab[a * 3 + 1];
+        const d2 = palLab[c * 3 + 2] - palLab[a * 3 + 2];
+        const d = d0 * d0 + d1 * d1 + d2 * d2;
+        if (d < gap2) {
+          gap2 = d;
+          b = c;
+        }
+      }
+      if (b < 0) continue;
+      // the color this spot of the checker pattern should have: the lower number on "black" squares
+      const wanted = (x + y) & 1 ? Math.max(a, b) : Math.min(a, b);
+      if (wanted === a) continue;
+      // where the cell's real color lies on the way from a (0) to b (1)
+      srgbToLab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], lab, 0);
+      let t = 0;
+      for (let j = 0; j < 3; j++) t += (lab[j] - palLab[a * 3 + j]) * (palLab[b * 3 + j] - palLab[a * 3 + j]);
+      t /= gap2;
+      if (t > 0.5 - width) idx[i] = b;
+    }
+}
+
 /** Two palette colors closer than this (Lab distance; ~2.3 is the smallest difference people notice) become one. */
-export const SAME_COLOR = 1.2;
+export const SAME_COLOR = 0.8;
 /** A color used by only a few cells joins its nearest color if that one is within this distance. */
 const TINY_COLOR_REACH = 10;
 
@@ -940,6 +1002,8 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
     settle(idx, rgba, W, H, pal, K, clean);
     removeSpecks(idx, W, H, 2 + (clean >> 1), pal, 3 + clean * 1.5);
   }
+  // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
+  if (!dither) ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }

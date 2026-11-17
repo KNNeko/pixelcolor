@@ -18,6 +18,7 @@ import {
   smoothFlat,
   settle,
   cleanPalette,
+  ditherRamps,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -124,6 +125,38 @@ test("removeSpecks leaves a small island alone when it clearly stands out", () =
   dull[12] = 1; // nearly the same gray: noise
   removeSpecks(dull, 5, 5, 3, new Uint8Array([100, 100, 100, 104, 104, 104]), 8);
   assert.equal(dull[12], 0);
+});
+
+test("removeSpecks treats a thin diagonal line as one region, not as separate specks", () => {
+  const idx = new Uint16Array(36);
+  for (let k = 0; k < 6; k++) idx[k * 6 + k] = 1; // diagonal of faintly different cells
+  removeSpecks(idx, 6, 6, 3, new Uint8Array([100, 100, 100, 108, 108, 108]), 8);
+  for (let k = 0; k < 6; k++) assert.equal(idx[k * 6 + k], 1);
+});
+
+test("ditherRamps interlocks two similar colors along their border and leaves a real edge alone", () => {
+  // left half color 0, right half color 1; the real colors form a smooth ramp, so border cells are "halfway"
+  const W = 8;
+  const H = 6;
+  const src = image(W, H, (x) => [101 + x * 2, 101 + x * 2, 101 + x * 2]);
+  const similar = new Float32Array([104, 104, 104, 112, 112, 112]);
+  const idx = new Uint16Array(W * H);
+  for (let i = 0; i < W * H; i++) idx[i] = i % W < 4 ? 0 : 1;
+  ditherRamps(idx, src.data, W, H, similar, 2, 0.2);
+  let switched = 0;
+  for (let y = 0; y < H; y++) {
+    if (idx[y * W + 3] === 1) switched++;
+    if (idx[y * W + 4] === 0) switched++;
+    assert.equal(idx[y * W + 1], 0); // cells away from the border are untouched
+    assert.equal(idx[y * W + 6], 1);
+  }
+  assert.equal(switched, H); // one tooth per row, alternating sides
+
+  const different = new Float32Array([20, 20, 20, 230, 230, 230]);
+  const hard = new Uint16Array(W * H);
+  for (let i = 0; i < W * H; i++) hard[i] = i % W < 4 ? 0 : 1;
+  ditherRamps(hard, src.data, W, H, different, 2, 0.2);
+  for (let i = 0; i < W * H; i++) assert.equal(hard[i], i % W < 4 ? 0 : 1);
 });
 
 test("quantize with dithering mixes two colors for an in-between shade and never uses a far-off one", async () => {
