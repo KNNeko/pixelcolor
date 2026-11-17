@@ -22,6 +22,7 @@ import { openPngExport } from "./export-png.js";
 import { refreshLibrary } from "./library.js";
 import {
   renderPartChips,
+  closePartMenu,
   startSplitMode,
   stopSplitMode,
   openPartsDialog,
@@ -148,6 +149,7 @@ export const game = {
   selected: 0, // 1-based color number, 0 = none
   tool: "brush",
   brushSize: 1,
+  eraserSize: 1,
   wandConnected: false,
   wandTolerance: 20,
   stroke: null, // action being built: { cells: [], values: [], warned }
@@ -316,6 +318,7 @@ export async function openGame(canvas, events, isNew = false) {
   game.touchedColors.clear();
   game.part = -1;
   game.splitting = false;
+  closePartMenu();
   floodQueue = floodSeen = null;
   game.buffer = new PixelBuffer(canvas.width, canvas.height);
   if (glView === undefined)
@@ -670,10 +673,16 @@ export function updateStatus() {
   game.touchedColors.forEach(updateSwatch);
   game.touchedColors.clear();
   if (game.canvas.parts.length) renderPartChips();
+  if (game.canvas.done && game.correct < cellCount()) {
+    game.canvas.done = false; // the eraser took cells away: finishing again shows the "finished" window again
+    markCanvasChanged();
+  }
   if (game.correct === cellCount() && !game.canvas.done) {
     game.canvas.done = true;
-    game.canvas.stats.finished = Date.now();
-    if (settings.tot) settings.tot.done++;
+    if (!game.canvas.stats.finished) {
+      game.canvas.stats.finished = Date.now(); // first time only: erasing and repainting is not a new finish
+      if (settings.tot) settings.tot.done++;
+    }
     game.statsChanged = true;
     markCanvasChanged();
     vibrate([80, 40, 80, 40, 300]);
@@ -690,9 +699,10 @@ export function updateStatus() {
   }
 }
 
-/** Paints with the brush around cell [x, y]. */
+/** Paints with the brush, or clears with the eraser, the square of cells around cell [x, y]. */
 function stampBrush([cx, cy]) {
-  const r = game.brushSize >> 1;
+  const erase = game.tool === "eraser";
+  const r = (erase ? game.eraserSize : game.brushSize) >> 1;
   const W = game.canvas.width;
   for (let dy = -r; dy <= r; dy++)
     for (let dx = -r; dx <= r; dx++) {
@@ -700,6 +710,10 @@ function stampBrush([cx, cy]) {
       const y = cy + dy;
       if (x < 0 || y < 0 || x >= W || y >= game.canvas.height) continue;
       const i = y * W + x;
+      if (erase) {
+        paintCell(i, 0); // recorded like paint, so the time-lapse shows it too
+        continue;
+      }
       const right = game.canvas.target[i] + 1;
       if (game.paint[i] === right || !inCurrentPart(i)) continue;
       if (right !== game.selected && !settings.wrong) continue;
@@ -841,6 +855,7 @@ function showHint() {
 const TOOLS = [
   ["move", "hand"],
   ["pen", "brush"],
+  ["eraser", "eraser"],
   ["bucket", "bucket"],
   ["wand", "wand"],
   ["bulb", "hint"],
@@ -851,7 +866,7 @@ for (const [iconName, tool] of TOOLS) {
   b.innerHTML = icon(iconName);
   b.onclick = () => {
     if (tool === "hint") return showHint();
-    if (game.tool === tool && (tool === "brush" || tool === "wand")) return openToolOptions();
+    if (game.tool === tool && (tool === "brush" || tool === "eraser" || tool === "wand")) return openToolOptions();
     game.tool = tool;
     $$("#toolbar .tool").forEach((x) => x.classList.toggle("on", x === b));
   };
@@ -861,6 +876,7 @@ for (const [iconName, tool] of TOOLS) {
 export function openToolOptions() {
   const sheet = openSheet(
     `<b>${t("size")}</b><div class="chips">${[1, 3, 5, 9].map((n) => `<button class="chip ${n === game.brushSize ? "on" : ""}" data-size="${n}">${n}</button>`).join("")}</div>` +
+      `<b>${t("esize")}</b><div class="chips">${[1, 3, 5, 9].map((n) => `<button class="chip ${n === game.eraserSize ? "on" : ""}" data-esize="${n}">${n}</button>`).join("")}</div>` +
       `<div class="chips"><button class="chip ${game.wandConnected ? "" : "on"}" data-wand="0">${t("wall")}</button><button class="chip ${game.wandConnected ? "on" : ""}" data-wand="1">${t("wcon")}</button></div>` +
       `<div class="field"><span>${t("tol")}</span><b>${game.wandTolerance}</b><div class="range" data-min="0" data-max="120" data-v="${game.wandTolerance}" data-step="1"></div></div>` +
       `<button class="chip primary" data-close>${t("done")}</button>`,
@@ -870,6 +886,7 @@ export function openToolOptions() {
     if (!b) return;
     if ("close" in b.dataset) return closeSheet();
     if (b.dataset.size) game.brushSize = +b.dataset.size;
+    else if (b.dataset.esize) game.eraserSize = +b.dataset.esize;
     else game.wandConnected = b.dataset.wand === "1";
     b.parentNode.querySelectorAll(".chip").forEach((x) => x.classList.toggle("on", x === b));
   };
@@ -1373,7 +1390,7 @@ export const rawCellAt = (e) => [
   Math.floor((e.offsetY - view.y) / view.scale),
 ];
 
-const brushActive = () => game.tool === "brush";
+const brushActive = () => game.tool === "brush" || game.tool === "eraser"; // tools that paint along a stroke
 
 /** Aim assist reach in screen pixels for settings.aim = 0..3 (off, light, medium, strong). */
 const AIM_REACH = [0, 10, 17, 24];
@@ -1424,7 +1441,12 @@ function aimCell(px, py, dragging = false) {
   return best || under;
 }
 
+/** Cell a brush or eraser touch acts on: aim assist helps the brush only. */
+const strokeCell = (px, py, dragging) =>
+  game.tool === "eraser" ? cellAt({ offsetX: px, offsetY: py }) : aimCell(px, py, dragging);
+
 function brushCanStartAt(c) {
+  if (game.tool === "eraser") return !!c && !!game.paint[c[1] * game.canvas.width + c[0]];
   if (!c || !game.selected) return false;
   const i = c[1] * game.canvas.width + c[0];
   const right = game.canvas.target[i] + 1;
@@ -1466,8 +1488,9 @@ playCanvas.addEventListener("pointerdown", (e) => {
   if (game.splitting && e.button < 1) return splitPointerDown(e);
   input.panning = game.tool === "hand" || e.button > 0 || (brushActive() && !settings.slide);
   // One finger moves the picture instead of painting when the brush would do nothing where it starts:
-  // no color chosen, outside the picture, an already finished cell, or a cell of another number.
-  const start = brushActive() ? aimCell(e.offsetX, e.offsetY) : null;
+  // no color chosen, outside the picture, an already finished cell, or a cell of another number
+  // (for the eraser: a cell with no paint on it).
+  const start = brushActive() ? strokeCell(e.offsetX, e.offsetY) : null;
   if (!input.panning && brushActive() && !brushCanStartAt(start)) input.panning = true;
   if (!input.panning && brushActive()) {
     game.stroke = { cells: [], values: [] };
@@ -1510,12 +1533,14 @@ playCanvas.addEventListener("pointermove", (e) => {
     const dy = now[1] - old[1];
     const steps = Math.max(1, Math.min(64, Math.ceil(Math.hypot(dx, dy) / Math.max(2, view.scale / 2))));
     for (let n = 1; n <= steps; n++) {
-      const c = aimCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps, true);
+      const c = strokeCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps, true);
       if (c && input.lastCell) brushLine(input.lastCell, c);
       input.lastCell = c || input.lastCell;
     }
   }
 });
+
+const DOUBLE_TAP_TOOLS = ["brush", "bucket", "wand"];
 
 function pointerUp(e) {
   if (!pointers.delete(e.pointerId) || pointers.size) return;
@@ -1524,16 +1549,17 @@ function pointerUp(e) {
   const isTap = input.moved < 10 && !input.multiTouch && c;
   if (input.panning) {
     // brush without "sliding": a tap paints one stamp
-    if (isTap && brushActive() && !settings.slide && game.selected) {
+    if (isTap && brushActive() && !settings.slide && (game.selected || game.tool === "eraser")) {
       game.stroke = { cells: [], values: [] };
-      stampBrush(aimCell(e.offsetX, e.offsetY) || c);
+      stampBrush(strokeCell(e.offsetX, e.offsetY) || c);
       commitStroke();
       drawNow();
     }
   } else if (brushActive()) commitStroke();
   else if (isTap) tapCell(c);
 
-  if (isTap && settings.dbl) {
+  // double tap picks the cell's number (and paints the cell); not with the hand or the eraser
+  if (isTap && settings.dbl && DOUBLE_TAP_TOOLS.includes(game.tool)) {
     const i = c[1] * game.canvas.width + c[0];
     const now = Date.now();
     if (now - input.lastTapTime < 320 && input.lastTapCell === i) {
@@ -1581,7 +1607,7 @@ $("#play-more").onclick = () => {
     `<div class="actions">` +
       actionButton("eye", NEXT_MODE_LABEL[game.canvas.mode] || "mboth", "menu-mode") +
       actionButton("split", "parts", "menu-parts") +
-      actionButton("plus", "split", "menu-split") +
+      actionButton("split", "split", "menu-split") +
       actionButton("film", "tlapse", "menu-timelapse") +
       actionButton("wand", "tset", "menu-tools") +
       actionButton("image", "png", "menu-png") +

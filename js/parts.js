@@ -23,32 +23,80 @@ const split = {
   history: [], // list of part-id lists, for undo
 };
 
-/* ---------- chips above the picture ---------- */
+/* ---------- part picker: a button beside the progress pill drops down the list of parts ---------- */
 
+const partButton = $("#play-parts");
+const partMenu = $("#part-menu");
+partButton.innerHTML = icon("split") + `<span class="badge" hidden></span>`;
+
+const partName = (id) => (id ? game.canvas.parts.find((p) => p.id === id).name : t("rest"));
+
+/** Button state: shown when the canvas has parts; dark with the part's number while one part is chosen. */
 export function renderPartChips() {
-  const el = $("#part-chips");
   const canvas = game.canvas;
-  if (!canvas.parts.length || game.splitting) {
-    el.innerHTML = "";
-    return;
+  const show = !!canvas && canvas.parts.length > 0 && !game.splitting;
+  partButton.hidden = !show;
+  if (!show) return closePartMenu();
+  partButton.classList.toggle("active", game.part >= 0);
+  const badge = partButton.querySelector(".badge");
+  badge.hidden = game.part < 0;
+  if (game.part >= 0) {
+    const name = partName(game.part);
+    badge.textContent = (name.match(/\d+$/) || [name.slice(0, 1)])[0];
   }
-  const ids = canvas.parts.map((p) => p.id);
-  if (game.partCells[0] > 0) ids.unshift(0); // cells left outside any part
-  const percent = (id) => (game.partCells[id] ? Math.floor((game.partCorrectCells[id] / game.partCells[id]) * 100) : 0);
-  el.innerHTML =
-    `<button class="chip ${game.part < 0 ? "on" : ""}" data-part="-1">${t("whole")}</button>` +
-    ids
-      .map((id) => {
-        const name = id ? canvas.parts.find((p) => p.id === id).name : t("rest");
-        return `<button class="chip ${game.part === id ? "on" : ""}" data-part="${id}">${name} ${percent(id)}%</button>`;
-      })
-      .join("");
+  if (!partMenu.hidden) fillPartMenu();
 }
 
-$("#part-chips").onclick = (e) => {
+function fillPartMenu() {
+  const canvas = game.canvas;
+  const ids = canvas.parts.map((p) => p.id);
+  if (game.partCells[0] > 0) ids.unshift(0); // cells left outside any part
+  const rows = [[-1, t("whole"), (game.correct / canvas.target.length) * 100]];
+  for (const id of ids)
+    rows.push([id, partName(id), game.partCells[id] ? (game.partCorrectCells[id] / game.partCells[id]) * 100 : 0]);
+  partMenu.innerHTML = rows
+    .map(
+      ([id, , p]) =>
+        `<button class="part-item ${game.part === id ? "on" : ""}" data-part="${id}">` +
+        `<span></span><b>${Math.floor(p)}%</b><i style="--p:${p.toFixed(1)}%"></i></button>`,
+    )
+    .join("");
+  partMenu.querySelectorAll(".part-item span").forEach((el, n) => (el.textContent = rows[n][1]));
+}
+
+function openPartMenu() {
+  fillPartMenu();
+  partMenu.hidden = false;
+  // under the button, kept inside the screen
+  const wrap = partMenu.parentNode.getBoundingClientRect();
+  const b = partButton.getBoundingClientRect();
+  const left = Math.max(8, Math.min(b.left - wrap.left - 12, wrap.width - partMenu.offsetWidth - 8));
+  partMenu.style.left = left + "px";
+  partMenu.style.top = b.bottom - wrap.top + 8 + "px";
+  partMenu.querySelector(".on")?.scrollIntoView({ block: "nearest" });
+}
+
+export function closePartMenu() {
+  partMenu.hidden = true;
+}
+
+partButton.onclick = () => (partMenu.hidden ? openPartMenu() : closePartMenu());
+partMenu.onclick = (e) => {
   const b = e.target.closest("[data-part]");
-  if (b) selectPart(+b.dataset.part);
+  if (!b) return;
+  closePartMenu();
+  selectPart(+b.dataset.part);
 };
+// a touch anywhere else only closes the list (it does not paint or move the picture)
+document.addEventListener(
+  "pointerdown",
+  (e) => {
+    if (partMenu.hidden || partMenu.contains(e.target) || partButton.contains(e.target)) return;
+    closePartMenu();
+    if (e.target.id === "play-canvas") e.stopPropagation();
+  },
+  true,
+);
 
 /** Switches to working on one part (-1 = whole picture). */
 export function selectPart(part) {
@@ -127,7 +175,7 @@ export function startSplitMode() {
   showScreen("screen-play");
   renderSplitBar();
   updateLayout();
-  $("#part-chips").innerHTML = "";
+  renderPartChips();
   redrawAll();
 }
 

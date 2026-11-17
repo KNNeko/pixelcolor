@@ -28,6 +28,7 @@ import {
 import { paletteOrder } from "./colorsort.js";
 import { openColorPicker, colorButtonHtml, hexToRgb, rgbToHex } from "./colorpicker.js";
 import { coverScale, floodFillMask, blendMask, recolor, edgeColor } from "./editops.js";
+import { formatCount } from "./stats.js";
 import { settings, saveSettings } from "./settings.js";
 import { openGame, saveGame } from "./game.js";
 import { putSource, deleteCanvas } from "./storage.js";
@@ -72,17 +73,31 @@ const previewWrap = $("#preview-wrap");
 
 /* ---------- panels ---------- */
 
-const EDIT_TOOLS = ["crop", "pan", "brush", "shape", "fill", "recolor", "blur", "clone", "rest", "pick"];
+// [tool, icon]; under the grid only the active tool's options are shown
+const EDIT_TOOLS = [
+  ["crop", "crop"],
+  ["pan", "move"],
+  ["brush", "pen"],
+  ["shape", "shapes"],
+  ["fill", "bucket"],
+  ["recolor", "swap"],
+  ["blur", "drop"],
+  ["clone", "stamp"],
+  ["rest", "reset"],
+  ["pick", "pipette"],
+];
 $("#panel-crop").innerHTML =
-  `<div class="chips" id="ratio-chips"></div>` +
-  `<div class="chips"><button class="chip" id="btn-mirror"></button><button class="chip" id="btn-flipv"></button><button class="chip" id="btn-rotate"></button></div>` +
-  sliderHtml("tilt", "tilt", -45, 45, 0, 0.5) +
-  `<div class="chips" id="editor-tools">${EDIT_TOOLS.map((k) => `<button class="chip" data-tool="${k}" data-i="e_${k}"></button>`).join("")}</div>` +
+  `<div class="tool-grid" id="editor-tools">${EDIT_TOOLS.map(([k, ic]) => `<button class="tool-tile" data-tool="${k}">${icon(ic)}<span data-i="et_${k}"></span></button>`).join("")}</div>` +
   `<div id="editor-hint"></div>` +
+  `<div class="panel" id="frame-options"><div class="chips" id="ratio-chips"></div>` +
+  `<div class="tile-row"><button class="action" id="btn-mirror"></button><button class="action" id="btn-flipv"></button><button class="action" id="btn-rotate"></button></div>` +
+  sliderHtml("tilt", "tilt", -45, 45, 0, 0.5) +
+  `</div>` +
   `<div class="chips" id="shape-kinds">${["rect", "oval", "line"].map((k) => `<button class="chip" data-shape="${k}" data-i="sh_${k}"></button>`).join("")}</div>` +
-  `<div class="chips">${colorButtonHtml("brush-color", "#ffffff")}<button class="chip" id="btn-clone-source" data-i="cl_src"></button><button class="chip" data-zoom="1">＋</button><button class="chip" data-zoom="-1">－</button><button class="chip" data-zoom="0" data-i="e_fit"></button><button class="chip" id="btn-edit-reset" data-i="e_reset"></button></div>` +
-  sliderHtml("brush-size", "e_size", 2, 160, 28) +
-  sliderHtml("tol", "tol", 2, 120, 24);
+  `<div class="option-row" id="paint-options">${colorButtonHtml("brush-color", "#ffffff")}<button class="chip" id="btn-clone-source" data-i="cl_src"></button>` +
+  `<div class="option-sliders">${sliderHtml("brush-size", "e_size", 2, 160, 28)}${sliderHtml("tol", "tol", 2, 120, 24)}</div></div>` +
+  `<div class="option-row view-row"><div class="chips segmented" id="crop-zoom"><button class="chip" data-zoom="-1">${icon("minus")}</button><button class="chip" data-zoom="1">${icon("plus")}</button><button class="chip" data-zoom="0">${icon("fit")}</button></div>` +
+  `<button class="chip" id="btn-edit-reset">${icon("reset")}<span data-i="e_reset"></span></button></div>`;
 
 $("#panel-adjust").innerHTML =
   ADJUSTMENTS.map(([key, min, max, v]) => sliderHtml("adj-" + key, key, min, max, v)).join("") +
@@ -230,9 +245,9 @@ async function encodeSourcePhoto() {
 
 export function translateWizard() {
   translatePage();
-  $("#btn-mirror").innerHTML = icon("flip") + " " + t("mir");
-  $("#btn-rotate").innerHTML = icon("rot") + " " + t("rotb");
-  $("#btn-flipv").innerHTML = `<span class="icon-turned">${icon("flip")}</span> ` + t("flipv");
+  $("#btn-mirror").innerHTML = icon("flip") + `<span>${t("mir")}</span>`;
+  $("#btn-flipv").innerHTML = icon("flipv") + `<span>${t("flipv")}</span>`;
+  $("#btn-rotate").innerHTML = icon("rot") + `<span>${t("rotb")}</span>`;
   $("#wiz-back").innerHTML = icon("back");
   $("#wiz-undo").innerHTML = icon("undo");
   $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
@@ -985,6 +1000,7 @@ function updateEditorUi() {
   const cloneReady = wiz.tool === "clone" && wiz.clone;
   $("#editor-hint").textContent = t("h_" + wiz.tool + (cloneReady ? "2" : ""));
   const tool = wiz.tool;
+  $("#frame-options").hidden = tool !== "crop";
   $("#brush-color").hidden = !COLOR_TOOLS.includes(tool);
   $("#brush-color").style.background = wiz.color;
   $("#shape-kinds").hidden = tool !== "shape";
@@ -992,6 +1008,8 @@ function updateEditorUi() {
   $("#btn-clone-source").hidden = tool !== "clone";
   $("#brush-size").closest(".field").hidden = !SIZE_TOOLS.includes(tool);
   $("#tol").closest(".field").hidden = !TOL_TOOLS.includes(tool);
+  $("#paint-options").hidden = ![...COLOR_TOOLS, ...SIZE_TOOLS].includes(tool);
+  $("#btn-edit-reset").hidden = tool === "crop";
   drawCrop();
 }
 
@@ -1770,7 +1788,7 @@ const cellsToSlider = (n) => Math.round((1000 * (Math.log(Math.max(MIN_CELLS, n)
 function syncPixelCount() {
   const n = clampSize($("#px-width").value) * clampSize($("#px-height").value);
   $("#pixel-count").value = cellsToSlider(n);
-  $("#pixel-count-value").textContent = n.toLocaleString() + " px";
+  $("#pixel-count-value").textContent = formatCount(n) + " px";
 }
 
 function setPixelCount(v) {
@@ -1782,7 +1800,7 @@ function setPixelCount(v) {
   const H = clampSize(n / W);
   $("#px-width").value = W;
   $("#px-height").value = H;
-  $("#pixel-count-value").textContent = (W * H).toLocaleString() + " px";
+  $("#pixel-count-value").textContent = formatCount(W * H) + " px";
 }
 
 $("#panel-pixel").addEventListener("input", (e) => {

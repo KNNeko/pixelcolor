@@ -88,11 +88,12 @@
           <button class="icon-btn" id="play-back" data-ic="back"></button>
           <i></i>
           <span id="play-progress">0%</span>
+          <button class="icon-btn" id="play-parts" hidden></button>
           <i></i>
           <button class="icon-btn" id="play-panel-toggle" data-ic="panel"></button>
           <button class="icon-btn" id="play-more" data-ic="more"></button>
         </div>
-        <div id="part-chips"></div>
+        <div id="part-menu" hidden></div>
         <canvas id="minimap" width="84" height="84" hidden></canvas>
       </div>
       <div id="play-dock">
@@ -109,17 +110,19 @@
     </div>
     <div class="overlay" id="timelapse" hidden>
       <div class="sheet">
-        <b data-i="tlapse"></b>
+        <div class="sheet-head">
+          <b data-i="tlapse"></b>
+          <button class="icon-btn flat" id="tl-close" data-ic="close" aria-label="close"></button>
+        </div>
         <canvas id="timelapse-canvas"></canvas>
         <div class="field">
           <span data-i="secs"></span><b id="tl-duration-value">20</b>
           <div class="range" id="tl-duration" data-min="5" data-max="120" data-v="20" data-step="1"></div>
         </div>
-        <div class="chips">
+        <div class="chips segmented">
           <button class="chip" id="tl-preview" data-i="prev"></button>
           <button class="chip" id="tl-video" data-i="vid"></button>
           <button class="chip" id="tl-gif" data-i="gif"></button>
-          <button class="chip" id="tl-close" data-i="close"></button>
         </div>
       </div>
     </div>

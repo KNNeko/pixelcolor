@@ -11,28 +11,31 @@ import { totalsHtml } from "./stats.js";
 /** Picking a custom color also switches its theme select to "custom", so the color is actually used. */
 const COLOR_SELECT = { cc: ["ct", "cus"], sic: ["sit", "cus"] };
 
-// [key, kind, options]: kind = toggle | select | color
+// [key, kind, options]: kind = toggle | select | color; a plain string starts a group (its title's key)
 const ROWS = [
+  "g_look",
   ["lang", "select", ["en", "ru"]],
   ["ap", "select", ["sys", "light", "dark"]],
   ["ct", "select", ["cw", "clg", "gl1", "gl2", "cd", "cb", "gd1", "gd2", "cus"]],
   ["cc", "color"],
-  ["hide", "toggle"],
-  ["slide", "toggle"],
-  ["two", "toggle"],
-  ["hl", "toggle"],
-  ["dbl", "toggle"],
   ["sil", "toggle"],
   ["sit", "select", ["sg", "se", "sb", "sm", "sr", "sv", "cus"]],
   ["sic", "color"],
-  ["oth", "toggle"],
-  ["mini", "toggle"],
-  ["vib", "toggle"],
-  ["wrong", "toggle"],
-  ["aim", "select", [0, 1, 2, 3]],
   ["grid", "toggle"],
-  ["asv", "select", [1, 2, 5]],
+  ["mini", "toggle"],
   ["full", "toggle"],
+  "g_paint",
+  ["slide", "toggle"],
+  ["two", "toggle"],
+  ["dbl", "toggle"],
+  ["hl", "toggle"],
+  ["aim", "select", [0, 1, 2, 3]],
+  ["hide", "toggle"],
+  ["oth", "toggle"],
+  ["wrong", "toggle"],
+  ["vib", "toggle"],
+  "g_app",
+  ["asv", "select", [1, 2, 5]],
   ["gl", "toggle"],
 ];
 
@@ -43,7 +46,15 @@ const optionLabel = (key, v) =>
 function renderSettings() {
   const list = $("#settings-list");
   list.innerHTML = "";
-  for (const [key, kind, options] of ROWS) {
+  for (const entry of ROWS) {
+    if (typeof entry === "string") {
+      const title = document.createElement("h3");
+      title.className = "settings-group";
+      title.textContent = t(entry);
+      list.append(title);
+      continue;
+    }
+    const [key, kind, options] = entry;
     const row = document.createElement("div");
     row.className = "row";
     const control =
