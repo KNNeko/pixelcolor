@@ -40,20 +40,23 @@ const unionRect = (a, b) =>
 
 /**
  * The picture as raw pixels (one per cell) that remembers which rectangle changed.
- * Two things read it: the WebGL renderer (uploads the changed rectangle to a texture) and this.canvas, a 2D
- * copy for everything that draws with the 2D API (minimap, time-lapse, the fallback renderer).
+ * Three things read it: the WebGL renderer (uploads the changed rectangle to a texture), the minimap
+ * (redraws the part of itself that covers the changed rectangle) and this.canvas, a 2D copy for the
+ * fallback renderer.
  * Each of them asks for "what changed since I last looked" with take().
  */
 export class PixelBuffer {
   constructor(width, height) {
     this.width = width;
     this.height = height;
-    this.canvas = createCanvas(width, height);
-    this.ctx = this.canvas.getContext("2d");
-    this.image = this.ctx.createImageData(width, height);
+    // The 2D copy is made on the first flush(): with WebGL nothing needs it, and for a 4000x4000 canvas
+    // it would be another 64 MB of memory.
+    this.canvas = null;
+    this.ctx = null;
+    this.image = new ImageData(width, height);
     this.pixels = new Uint32Array(this.image.data.buffer);
     this.dirty = null; // [x0, y0, x1, y1] changed since anyone looked
-    this.pending = { "2d": null, gl: null }; // changed, not yet seen by that reader
+    this.pending = { "2d": null, gl: null, mini: null }; // changed, not yet seen by that reader
     this.version = 0; // goes up on every change
   }
   set(i, value) {
@@ -74,7 +77,7 @@ export class PixelBuffer {
     this.dirty = [0, 0, this.width - 1, this.height - 1];
     this.version++;
   }
-  /** The rectangle that changed since this reader ("2d" or "gl") last asked, or null. */
+  /** The rectangle that changed since this reader ("2d", "gl" or "mini") last asked, or null. */
   take(reader) {
     if (this.dirty) {
       for (const name in this.pending) this.pending[name] = unionRect(this.pending[name], this.dirty);
@@ -84,8 +87,13 @@ export class PixelBuffer {
     this.pending[reader] = null;
     return rect;
   }
-  /** Brings this.canvas up to date. */
+  /** Brings this.canvas up to date (creating it the first time). */
   flush() {
+    if (!this.canvas) {
+      this.canvas = createCanvas(this.width, this.height);
+      this.ctx = this.canvas.getContext("2d");
+      this.pending["2d"] = [0, 0, this.width - 1, this.height - 1];
+    }
     const d = this.take("2d");
     if (d) this.ctx.putImageData(this.image, 0, 0, d[0], d[1], d[2] - d[0] + 1, d[3] - d[1] + 1);
   }
@@ -216,15 +224,21 @@ export function updateColors() {
     }
   }
   game.partTint = PART_TINTS.map(hexToPixel);
+  if (game.useGl) glView.setHighlightColors(game.highlightPixel);
 }
 
 /** What a cell looks like on screen right now. */
+/**
+ * Pixel of cell i in the pixel buffer. The highlight of the selected number is only stored here for the
+ * 2D drawing; with WebGL the shader adds it (and the minimap adds it by itself), so that choosing another
+ * number does not rewrite and re-upload every cell of the two colors.
+ */
 export function cellPixel(i) {
   const painted = game.paint[i];
   const target = game.canvas.target[i];
   let c = painted
     ? game.colorPixel[painted - 1]
-    : settings.hl && target + 1 === game.selected
+    : settings.hl && !game.useGl && target + 1 === game.selected
       ? game.highlightPixel[target]
       : game.emptyPixel[target];
   const part = game.canvas.partOf[i];
@@ -301,12 +315,13 @@ export async function openGame(canvas, events, isNew = false) {
       if (!game.canvas) return;
       game.useGl = !!settings.gl && glView.setCanvas(game.canvas.width, game.canvas.height, game.canvas.target);
       if (game.useGl && !game.flags) game.flags = new Uint8Array(game.canvas.target.length);
-      game.buffer.markAll();
-      requestDraw();
+      updateColors(); // also sends the highlight shades again
+      redrawAll(); // the highlight belongs in the pixel buffer only without WebGL
+      minimapCache.full = true;
     });
   game.useGl = !!(settings.gl && glView && glView.setCanvas(canvas.width, canvas.height, canvas.target));
   game.flags = game.useGl ? new Uint8Array(N) : null;
-  minimapCache.version = -1;
+  minimapCache.full = true;
   minimapRegion.key = "";
   indexCellsByColor();
   recountProgress();
@@ -488,9 +503,13 @@ export function selectColor(n) {
     scrollPaletteTo(swatches[n - 1]);
   }
   if (settings.hl && previous !== n) {
-    const redraw = (k) => forEachCellOfColor(k, (i) => game.buffer.set(i, cellPixel(i)));
-    if (previous) redraw(previous - 1);
-    if (n) redraw(n - 1);
+    if (game.useGl)
+      minimapCache.full = true; // the shader highlights by itself; only the minimap redraws
+    else {
+      const redraw = (k) => forEachCellOfColor(k, (i) => game.buffer.set(i, cellPixel(i)));
+      if (previous) redraw(previous - 1);
+      if (n) redraw(n - 1);
+    }
     requestDraw();
   }
 }
@@ -1103,8 +1122,20 @@ function draw2d(fades) {
 }
 
 const minimapElement = $("#minimap");
-/** Scaled-down picture for the minimap; rebuilt only when the picture changed, a few times a second at most. */
-const minimapCache = { canvas: createCanvas(1, 1), version: -1, background: "", time: 0, timer: 0 };
+/** The minimap picture, kept between frames; only the part over changed cells is redrawn. */
+const minimapCache = {
+  canvas: createCanvas(1, 1),
+  ctx: null,
+  image: null, // ImageData of the whole minimap
+  out: null, // the same pixels as Uint32Array
+  full: true, // redraw everything next time
+  nw: 0,
+  nh: 0,
+  k: 1,
+  ox: 0,
+  oy: 0,
+  background: "",
+};
 /** Panel color of the current app theme as [r, g, b] (the minimap frame uses it). */
 const panelColor = { theme: "", rgb: [29, 31, 59] };
 function panelRgb() {
@@ -1158,46 +1189,49 @@ function updateMinimapRegion() {
   region.cssH = Math.max(MINIMAP_SIDE / 3, Math.round(region.h * scale));
   minimapElement.style.width = region.cssW + "px";
   minimapElement.style.height = region.cssH + "px";
-  minimapCache.version = -1;
+  minimapCache.full = true;
 }
 
 /**
- * Draws the minimap picture into the cache straight from the pixel array: 4 samples per minimap pixel.
- * The cost depends on the minimap size only, so a 4000x4000 canvas is as cheap as a small one.
- * (ox, oy): where the region's top-left corner lands in the minimap, k: minimap pixels per cell.
+ * Draws minimap pixels u0..u1-1 x v0..v1-1 into the cached image, straight from the pixel array: each
+ * minimap pixel is the average of 4 cells under it. Only the changed area is redrawn while painting, so
+ * the cost follows what changed, not the size of the canvas.
  */
-function renderMinimapPicture(nw, nh, k, ox, oy) {
-  const W = game.canvas.width;
-  const region = minimapRegion;
+function renderMinimapPixels(u0, v0, u1, v1) {
   const cache = minimapCache;
-  cache.canvas.width = nw;
-  cache.canvas.height = nh;
-  const cctx = cache.canvas.getContext("2d");
-  const image = cctx.createImageData(nw, nh);
-  const out = new Uint32Array(image.data.buffer);
+  const { width: W, target, partOf } = game.canvas;
+  const region = minimapRegion;
+  const { out, nw, k, ox, oy } = cache;
   const px = game.buffer.pixels;
+  const paint = game.paint;
   const bg = game.backgroundPixel;
-  out.fill(bg);
-  const x0 = Math.max(0, Math.ceil(ox));
-  const y0 = Math.max(0, Math.ceil(oy));
-  const x1 = Math.min(nw, Math.floor(ox + region.w * k));
-  const y1 = Math.min(nh, Math.floor(oy + region.h * k));
-  for (let v = y0; v < y1; v++)
-    for (let u = x0; u < x1; u++) {
+  // with WebGL the highlight is not in the pixel buffer (see cellPixel): add it here
+  const selected = game.useGl && settings.hl ? game.selected : 0;
+  const highlight = selected ? game.highlightPixel[selected - 1] : 0;
+  const part = game.part;
+  const xEnd = ox + region.w * k;
+  const yEnd = oy + region.h * k;
+  for (let v = v0; v < v1; v++)
+    for (let u = u0; u < u1; u++) {
+      if (u < ox || v < oy || u + 1 > xEnd || v + 1 > yEnd) {
+        out[v * nw + u] = bg; // margin around a picture that does not fill the minimap
+        continue;
+      }
       let r = 0;
       let g = 0;
       let b = 0;
       for (let n = 0; n < 4; n++) {
         const cx = region.x + Math.min(region.w - 1, ((u + 0.25 + (n & 1) * 0.5 - ox) / k) | 0);
         const cy = region.y + Math.min(region.h - 1, ((v + 0.25 + (n >> 1) * 0.5 - oy) / k) | 0);
-        const c = px[cy * W + cx] || bg; // 0 = hidden cell: background
+        const i = cy * W + cx;
+        let c = px[i] || bg; // 0 = hidden cell: background
+        if (selected && !paint[i] && target[i] + 1 === selected && (part < 0 || partOf[i] === part)) c = highlight;
         r += c & 255;
         g += (c >> 8) & 255;
         b += (c >> 16) & 255;
       }
       out[v * nw + u] = 0xff000000 | ((b >> 2) << 16) | ((g >> 2) << 8) | (r >> 2);
     }
-  cctx.putImageData(image, 0, 0);
 }
 
 function drawMinimap() {
@@ -1212,7 +1246,11 @@ function drawMinimap() {
   // "!!": settings.mini is 0 or 1, and mm.hidden must be compared with a real boolean
   const visible = !!(settings.mini && !game.splitting && s >= 16 && (c - a) * (d - b) < 0.9 * W * H);
   if (mm.hidden === visible) mm.hidden = !visible;
-  if (!visible) return;
+  const cache = minimapCache;
+  if (!visible) {
+    cache.full = true; // changes are not followed while hidden: start from scratch when it comes back
+    return;
+  }
   updateMinimapRegion();
   const region = minimapRegion;
   const dpr = screen.dpr;
@@ -1222,26 +1260,34 @@ function drawMinimap() {
     mm.width = nw;
     mm.height = nh;
   }
-  const mctx = mm.getContext("2d");
   const k = Math.min(nw / region.w, nh / region.h);
   const ox = (nw - region.w * k) / 2;
   const oy = (nh - region.h * k) / 2;
 
-  const cache = minimapCache;
-  const resized = cache.canvas.width !== nw || cache.canvas.height !== nh || cache.background !== game.theme.bg;
-  if (resized || cache.version !== game.buffer.version) {
-    const now = performance.now();
-    if (resized || cache.version < 0 || now - cache.time > 300) {
-      cache.background = game.theme.bg;
-      cache.version = game.buffer.version;
-      cache.time = now;
-      renderMinimapPicture(nw, nh, k, ox, oy);
-    } else if (!cache.timer)
-      cache.timer = setTimeout(() => {
-        cache.timer = 0;
-        if (game.canvas) requestDraw();
-      }, 320);
+  const changed = game.buffer.take("mini");
+  if (cache.full || cache.nw !== nw || cache.nh !== nh || cache.background !== game.theme.bg) {
+    cache.full = false;
+    cache.background = game.theme.bg;
+    cache.nw = cache.canvas.width = nw;
+    cache.nh = cache.canvas.height = nh;
+    cache.ctx = cache.canvas.getContext("2d");
+    cache.image = cache.ctx.createImageData(nw, nh);
+    cache.out = new Uint32Array(cache.image.data.buffer);
+    Object.assign(cache, { k, ox, oy });
+    renderMinimapPixels(0, 0, nw, nh);
+    cache.ctx.putImageData(cache.image, 0, 0);
+  } else if (changed) {
+    // minimap pixels that cover the changed cells (+1 pixel around: each pixel samples its neighbourhood)
+    const u0 = Math.max(0, Math.floor(ox + (changed[0] - region.x) * k) - 1);
+    const v0 = Math.max(0, Math.floor(oy + (changed[1] - region.y) * k) - 1);
+    const u1 = Math.min(nw, Math.ceil(ox + (changed[2] + 1 - region.x) * k) + 1);
+    const v1 = Math.min(nh, Math.ceil(oy + (changed[3] + 1 - region.y) * k) + 1);
+    if (u1 > u0 && v1 > v0) {
+      renderMinimapPixels(u0, v0, u1, v1);
+      cache.ctx.putImageData(cache.image, 0, 0, u0, v0, u1 - u0, v1 - v0);
+    }
   }
+  const mctx = mm.getContext("2d");
   mctx.drawImage(cache.canvas, 0, 0);
   // Where you are: a frame in the panel color around the visible area, at its true size and position
   // (cut off at the minimap's edge). The smaller the visible area, the thinner the line, so the frame

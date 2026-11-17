@@ -26,6 +26,7 @@ uniform sampler2D uColor;   // W x H, what every cell looks like (premultiplied;
 uniform sampler2D uFlags;   // W x H, bit 0: painted, bit 1: belongs to another part than the one being colored
 uniform sampler2D uTarget;  // W x H, color index of the cell (low byte, high byte)
 uniform sampler2D uGlyphs;  // digits 0-9 in a row
+uniform sampler2D uHiPal;   // K x 1: the "highlighted" shade of every color number (index = number - 1)
 uniform vec2 uView;         // screen position of the picture's top-left corner, device pixels
 uniform float uK;           // device pixels per cell
 uniform vec2 uSize;         // picture size in cells
@@ -78,9 +79,16 @@ void main() {
     col = px.rgb + bg * (1.0 - px.a);
     bool painted = (f & 1) != 0;
     bool outside = (f & 2) != 0;
-    if (!painted && !(outside && uShowOthers < 0.5) && (uCellFade > 0.0 || uNumberFade > 0.0)) {
+    int n = 0; // number of an empty, visible cell (0 = painted or hidden)
+    if (!painted && !(outside && uShowOthers < 0.5) && (uSelected > 0 || uCellFade > 0.0 || uNumberFade > 0.0)) {
       vec2 tg = texelFetch(uTarget, ci, 0).rg * 255.0 + 0.5;
-      int n = int(tg.x) + int(tg.y) * 256 + 1;
+      n = int(tg.x) + int(tg.y) * 256 + 1;
+    }
+    // Empty cells of the selected number. Done here rather than stored in uColor, so choosing another
+    // color changes one uniform instead of re-sending every cell of both colors to the GPU.
+    // (Zoomed out below one pixel per cell it is skipped: a single cell would only flicker.)
+    if (n > 0 && n == uSelected && !outside && uK >= 1.0) col = texelFetch(uHiPal, ivec2(n - 1, 0), 0).rgb;
+    if (n > 0 && (uCellFade > 0.0 || uNumberFade > 0.0)) {
       if (uCellFade > 0.0) {
         col = mix(col, (!outside && n == uSelected) ? uHighlight : uCell, uCellFade);
         if (outside) col = mix(col, bg, 0.62 * uCellFade);
@@ -128,6 +136,7 @@ const UNIFORMS = [
   "uFlags",
   "uTarget",
   "uGlyphs",
+  "uHiPal",
   "uView",
   "uK",
   "uSize",
@@ -250,11 +259,19 @@ export function createGlView(element, onRestored) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    textures = { glyphs: tex, color: null, flags: null, target: null };
+    // highlight shades: filled in by setHighlightColors
+    const hiPal = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, hiPal);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    textures = { glyphs: tex, hiPal, color: null, flags: null, target: null };
     gl.uniform1i(uniform.uColor, 0);
     gl.uniform1i(uniform.uFlags, 1);
     gl.uniform1i(uniform.uTarget, 2);
     gl.uniform1i(uniform.uGlyphs, 3);
+    gl.uniform1i(uniform.uHiPal, 4);
     gl.uniform4f(uniform.uGlyph, glyphs.advanceCells, glyphs.heightCells, glyphs.advanceU, glyphs.padU);
     gl.uniform1f(uniform.uGlyphPx, glyphs.boxHeight);
     size = null;
@@ -316,6 +333,28 @@ export function createGlView(element, onRestored) {
     gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
     gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
     mipsStale = true;
+  };
+
+  /**
+   * The shade an empty cell of each number gets while that number is selected (pixels as in the pixel
+   * buffer: 0xAABBGGRR). Sent once per canvas / theme change; selecting a number then costs nothing.
+   */
+  view.setHighlightColors = (pixels) => {
+    if (!view.ready || !pixels.length) return;
+    const data = Uint32Array.from(pixels);
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, textures.hiPal);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA8,
+      data.length,
+      1,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      new Uint8Array(data.buffer),
+    );
   };
 
   /** Matches the drawing buffer to the element's size in device pixels. */
