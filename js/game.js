@@ -1181,15 +1181,22 @@ const brushActive = () => game.tool === "brush";
 
 /** Aim assist reach in screen pixels for settings.aim = 0..3 (off, light, medium, strong). */
 const AIM_REACH = [0, 8, 14, 20];
+/** ...and in cells: the most a touch is corrected by, for the first touch of a stroke and while dragging. */
+const AIM_CELLS_TAP = 0.7;
+const AIM_CELLS_DRAG = 0.35;
 
 /**
  * Cell the brush should act on for a touch at screen point (px, py).
- * Normally the cell under the finger. With aim assist on, if that cell is not one the selected color can
- * paint, the nearest cell that is (within AIM_REACH pixels of the finger) is used instead: like a phone
- * keyboard, the cells you probably mean have an invisible bigger hit area. The reach is in screen pixels,
- * so the further out you zoom, the more cells it covers.
+ * Normally the cell under the finger. With aim assist on, a touch that lands on a cell of ANOTHER number,
+ * close to a cell the selected color can paint, counts as that cell: like a phone keyboard, the cells you
+ * probably mean have a slightly bigger invisible hit area.
+ * It must stay unnoticeable, so:
+ *   - on a cell of the selected number (painted or not) nothing is corrected: dragging along a row of your
+ *     color never spills into the rows beside it;
+ *   - the correction is at most AIM_REACH screen pixels and never more than a part of one cell
+ *     (dragging: AIM_CELLS_DRAG, the first touch of a stroke: AIM_CELLS_TAP), however far out you zoom.
  */
-function aimCell(px, py) {
+function aimCell(px, py, dragging = false) {
   const { width: W, height: H, target } = game.canvas;
   const s = view.scale;
   const fx = (px - view.x) / s;
@@ -1203,8 +1210,8 @@ function aimCell(px, py) {
     const i = y * W + x;
     return target[i] + 1 === game.selected && game.paint[i] !== game.selected && inCurrentPart(i);
   };
-  if (under && wanted(cx, cy)) return under;
-  const r = reach / s; // reach in cells
+  if (under && target[cy * W + cx] + 1 === game.selected) return under;
+  const r = Math.min(reach / s, dragging ? AIM_CELLS_DRAG : AIM_CELLS_TAP); // reach in cells
   let best = null;
   let bestD = r * r;
   for (let y = Math.max(0, Math.floor(fy - r)); y <= Math.min(H - 1, Math.floor(fy + r)); y++)
@@ -1303,7 +1310,7 @@ playCanvas.addEventListener("pointermove", (e) => {
     const dy = now[1] - old[1];
     const steps = Math.max(1, Math.min(64, Math.ceil(Math.hypot(dx, dy) / Math.max(2, view.scale / 2))));
     for (let n = 1; n <= steps; n++) {
-      const c = aimCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps);
+      const c = aimCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps, true);
       if (c && input.lastCell) brushLine(input.lastCell, c);
       input.lastCell = c || input.lastCell;
     }

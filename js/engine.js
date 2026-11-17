@@ -26,7 +26,7 @@ export const DEFAULT_MODE = "art";
 /** "Cleanliness" slider, 0..10: how hard weak noise, stray dots and tiny islands are removed. */
 export const DEFAULT_CLEAN = 3;
 
-export const NO_ADJUST = { bri: 100, con: 100, sat: 100, tmp: 0, shp: 0, blk: 0, wht: 255 };
+export const NO_ADJUST = { bri: 100, con: 100, sat: 100, tmp: 0, shp: 0, blk: 0, wht: 255, enh: 0 };
 
 /** Style ids stored with canvases made before the three modes existed. */
 const OLD_STYLES = {
@@ -131,11 +131,60 @@ export function boxScale(source, W, H) {
 }
 
 /**
- * Brightness / contrast / saturation / temperature / sharpen / black & white point, in place.
- * a = { bri, con, sat (percent), tmp (-50..50), shp (0..150), blk (0..40), wht (200..255) }
+ * "Enhance": cleans up a picture before it is pixelized. level 1..10, in place.
+ * Compression artifacts (the speckle around edges and the faint 8x8 blocks of JPEG) are small differences
+ * between neighbouring pixels, real edges are big ones. Every pixel is averaged with those neighbours that
+ * differ from it only a little; across an edge nothing is mixed, so the picture gets cleaner without getting
+ * softer. applyAdjustments then sharpens the cleaned picture a little.
+ */
+function cleanArtifacts(rgba, w, h, level) {
+  const limit = 8 + 4 * level; // |dR|+|dG|+|dB| that still counts as "the same surface"
+  const weight = new Float32Array(766);
+  for (let d = 0; d < 766; d++) weight[d] = Math.max(0, Math.min(1, 2 - d / limit));
+  const out = new Uint8ClampedArray(rgba.length);
+  for (let pass = level >= 6 ? 2 : 1; pass > 0; pass--) {
+    for (let y = 0; y < h; y++) {
+      const y0 = y > 0 ? y - 1 : 0;
+      const y1 = y < h - 1 ? y + 1 : y;
+      for (let x = 0; x < w; x++) {
+        const p = (y * w + x) * 4;
+        const r = rgba[p];
+        const g = rgba[p + 1];
+        const b = rgba[p + 2];
+        const x0 = x > 0 ? x - 1 : 0;
+        const x1 = x < w - 1 ? x + 1 : x;
+        let sr = 0;
+        let sg = 0;
+        let sb = 0;
+        let sw = 0;
+        for (let yy = y0; yy <= y1; yy++)
+          for (let xx = x0; xx <= x1; xx++) {
+            const q = (yy * w + xx) * 4;
+            const k = weight[Math.abs(rgba[q] - r) + Math.abs(rgba[q + 1] - g) + Math.abs(rgba[q + 2] - b)];
+            sr += rgba[q] * k;
+            sg += rgba[q + 1] * k;
+            sb += rgba[q + 2] * k;
+            sw += k;
+          }
+        out[p] = sr / sw;
+        out[p + 1] = sg / sw;
+        out[p + 2] = sb / sw;
+        out[p + 3] = 255;
+      }
+    }
+    rgba.set(out);
+  }
+}
+
+/**
+ * Enhance / brightness / contrast / saturation / temperature / sharpen / black & white point, in place.
+ * a = { enh (0..10), bri, con, sat (percent), tmp (-50..50), shp (0..150), blk (0..40), wht (200..255) }
  */
 export function applyAdjustments(rgba, w, h, a) {
-  if (a.bri === 100 && a.con === 100 && a.sat === 100 && !a.tmp && !a.shp && !a.blk && a.wht === 255) return rgba;
+  const enhance = a.enh || 0; // settings saved before "enhance" existed have no such field
+  if (a.bri === 100 && a.con === 100 && a.sat === 100 && !a.tmp && !a.shp && !a.blk && a.wht === 255 && !enhance)
+    return rgba;
+  if (enhance) cleanArtifacts(rgba, w, h, enhance);
   const lut = new Uint8ClampedArray(256);
   for (let i = 0; i < 256; i++) {
     let v = ((i - a.blk * 2.55) / Math.max(1, a.wht - a.blk * 2.55)) * 255;
@@ -154,9 +203,9 @@ export function applyAdjustments(rgba, w, h, a) {
     rgba[p + 1] = luma + (g - luma) * saturation;
     rgba[p + 2] = luma + (b - luma) * saturation - warm;
   }
-  if (a.shp) {
+  if (a.shp || enhance) {
     // unsharp-style 4-neighbour sharpen
-    const s = a.shp / 100;
+    const s = a.shp / 100 + enhance * 0.07;
     const copy = new Uint8ClampedArray(rgba);
     const stride = w * 4;
     for (let y = 1; y < h - 1; y++)
@@ -232,6 +281,11 @@ const FLAT_RANGE = 12;
  * drawn, and "two clearly separate groups of samples" already filters out noise.
  */
 const LINE_CONTRAST = 16;
+/**
+ * A neighbour cell counts as "mixed" when between this share and (1 - this share) of its samples belong to
+ * the smaller group. A two-color cell whose four neighbours are all mixed is fine texture, not an edge.
+ */
+const TEXTURE_MIX = 0.12;
 /** ...and covers at least this share of the cell. */
 const LINE_SHARE = 0.15;
 
@@ -243,14 +297,17 @@ const LINE_SHARE = 0.15;
  *   - two clear groups (the border of two areas): the cell takes the bigger group's color, so the border
  *     stays crisp and no in-between color appears;
  *   - the smaller group is a thin line or a dot (not the rim of an area of that color in a neighbour cell):
- *     the cell on the line's ridge takes the line color, so lines stay one cell wide and unbroken.
+ *     the cell on the line's ridge takes the line color, so lines stay one cell wide and unbroken;
+ *   - both colors run through all the neighbouring cells too (hatching finer than the grid): the cell is the
+ *     average again, so the hatched patch keeps its overall tone instead of turning into one of the colors.
  */
 export function pickCellColors(rgba, W, H, k) {
   const n = k * k;
   const rowWidth = W * k;
   const out = new Uint8ClampedArray(W * H * 4);
-  const minorShare = new Float32Array(W * H); // > 0: the cell has a line/detail candidate
-  const pair = new Uint8ClampedArray(W * H * 6); // candidate cells: bigger group RGB, smaller group RGB
+  const minorShare = new Float32Array(W * H); // > 0: a two-color cell; the smaller group's share of it
+  const lineCandidate = new Uint8Array(W * H); // the smaller group may be a thin line or a dot
+  const pair = new Uint8ClampedArray(W * H * 6); // two-color cells: bigger group RGB, smaller group RGB
   const R = new Float32Array(n);
   const G = new Float32Array(n);
   const B = new Float32Array(n);
@@ -339,19 +396,24 @@ export function pickCellColors(rgba, W, H, k) {
       out[q] = mr + (c[major] - mr) * edge;
       out[q + 1] = mg + (c[major + 1] - mg) * edge;
       out[q + 2] = mb + (c[major + 2] - mb) * edge;
+      // remembered for the second pass, which needs the neighbours' samples too
+      const i = y * W + x;
       const share = (major ? n - countB : countB) / n;
-      if (edge > 0.2 && gap >= LINE_CONTRAST && share >= LINE_SHARE) {
-        const i = y * W + x;
-        minorShare[i] = share;
-        for (let j = 0; j < 3; j++) {
-          pair[i * 6 + j] = c[major + j];
-          pair[i * 6 + 3 + j] = c[minor + j];
-        }
+      minorShare[i] = share;
+      lineCandidate[i] = edge > 0.2 && gap >= LINE_CONTRAST && share >= LINE_SHARE ? 1 : 0;
+      for (let j = 0; j < 3; j++) {
+        pair[i * 6 + j] = c[major + j];
+        pair[i * 6 + 3 + j] = c[minor + j];
       }
     }
 
-  // thin lines and dots: the smaller group wins on the ridge of a line
+  // Second pass over the two-color cells, looking at their four neighbours:
+  //   - fine texture (hatching, screentone: both colors show up in every neighbour as well): no single
+  //     color is right, "bigger group wins" would turn the whole patch into its darker or lighter color.
+  //     The cell becomes the average again, which keeps the patch's overall tone;
+  //   - thin lines and dots: the smaller group wins on the ridge of a line.
   const changes = [];
+  const averaged = [];
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
@@ -374,6 +436,12 @@ export function pickCellColors(rgba, W, H, k) {
       const right = shareIn(x + 1, y);
       const up = shareIn(x, y - 1);
       const down = shareIn(x, y + 1);
+      const isMixed = (v) => v > TEXTURE_MIX && v < 1 - TEXTURE_MIX;
+      if (isMixed(left) && isMixed(right) && isMixed(up) && isMixed(down)) {
+        averaged.push(i);
+        continue;
+      }
+      if (!lineCandidate[i]) continue;
       // The line runs along the axis where it continues on both sides; a and b are the cells across it.
       // If one of those holds mostly this color, the cell is the rim of an area (or of a thicker line that
       // the neighbour already shows) and keeps the bigger group's color.
@@ -384,6 +452,10 @@ export function pickCellColors(rgba, W, H, k) {
       const ridge = f > a && f >= b; // of two cells sharing a line, exactly one takes it
       if (ridge) changes.push(i);
     }
+  for (const i of averaged) {
+    const f = minorShare[i];
+    for (let j = 0; j < 3; j++) out[i * 4 + j] = pair[i * 6 + j] * (1 - f) + pair[i * 6 + 3 + j] * f;
+  }
   for (const i of changes) for (let j = 0; j < 3; j++) out[i * 4 + j] = pair[i * 6 + 3 + j];
   return out;
 }
@@ -975,10 +1047,14 @@ function subsamplesFor(source, W, H) {
 /** One color per cell (W*H RGBA): resized, adjusted, mode-specific cell colors, weak noise flattened. */
 export function prepareImage(source, params, userAdjust) {
   const { width: W, height: H, style, clean } = normalizeParams(params);
-  const k = style === "art" ? subsamplesFor(source, W, H) : 1;
+  // art mode looks at several samples per cell; "enhance" also wants finer detail than one cell to work on
+  const finest = subsamplesFor(source, W, H);
+  const k = style === "art" ? finest : userAdjust.enh ? Math.min(2, finest) : 1;
   let rgba = boxScale(source, W * k, H * k);
   applyAdjustments(rgba, W * k, H * k, userAdjust);
-  if (k > 1) rgba = pickCellColors(rgba, W, H, k);
+  if (k > 1)
+    rgba =
+      style === "art" ? pickCellColors(rgba, W, H, k) : boxScale({ data: rgba, width: W * k, height: H * k }, W, H);
   return smoothFlat(rgba, W, H, clean);
 }
 

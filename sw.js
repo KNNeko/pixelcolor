@@ -1,5 +1,5 @@
 // Service worker: offline cache (network first, cache as fallback) + "Share to Pixel Color" from the gallery.
-const VERSION = "pxc-v21";
+const VERSION = "pxc-v22";
 const SHARE_CACHE = "pxc-share"; // holds a shared image until the page picks it up
 const APP_FILES = [
   "./",

@@ -24,6 +24,7 @@ import { library } from "./library.js";
 
 const ADJUSTMENTS = [
   // [key, min, max, default]
+  ["enh", 0, 10, 0],
   ["bri", 50, 150, 100],
   ["con", 50, 150, 100],
   ["sat", 0, 200, 100],
@@ -165,7 +166,7 @@ function applyState(st) {
   wiz.rect = { ...st.rect };
   wiz.ratio = st.ratio;
   highlightRatio();
-  wiz.adjust = { ...st.adjust };
+  wiz.adjust = { ...NO_ADJUST, ...st.adjust };
   ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
   const p = normalizeParams(st.params); // canvases made by older versions stored other style ids and sliders
   $("#px-width").value = p.width;
@@ -888,7 +889,13 @@ $("#btn-auto-enhance").onclick = () => {
       hi = i;
       break;
     }
-  Object.assign(wiz.adjust, { blk: Math.min(40, Math.round(lo / 2.55)), wht: Math.max(200, hi), con: 108, sat: 112 });
+  Object.assign(wiz.adjust, {
+    blk: Math.min(40, Math.round(lo / 2.55)),
+    wht: Math.max(200, hi),
+    con: 108,
+    sat: 112,
+    enh: 4,
+  });
   ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
   wiz.result = null;
   drawAdjustPreview();

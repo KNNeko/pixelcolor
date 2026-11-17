@@ -73,6 +73,7 @@ export const STRINGS = {
   orig: "Original|Оригинал",
   mir: "Mirror|Зеркало",
   rotb: "Rotate|Повернуть",
+  enh: "Enhance (clarity, artifacts)|Улучшение (чёткость, артефакты)",
   bri: "Brightness|Яркость",
   con: "Contrast|Контраст",
   sat: "Saturation|Насыщенность",
