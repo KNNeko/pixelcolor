@@ -91,7 +91,7 @@ function toCanvas(rec) {
     name: rec.name,
     width: rec.W,
     height: rec.H,
-    mode: rec.mode, // "n" = numbers, "s" = silhouette only
+    mode: rec.mode, // "n" = numbers, "s" = silhouette only, "b" = numbers over the silhouette
     palette: rec.pal, // RGB bytes, 3 per color
     target: rec.idx, // palette index of every cell
     done: !!rec.done,

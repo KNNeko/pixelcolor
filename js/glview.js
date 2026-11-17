@@ -38,6 +38,7 @@ uniform vec3 uNumber;       // digit color
 uniform vec4 uGrid;         // grid line color; alpha already includes the zoom fade (0 = no grid)
 uniform float uCellFade;    // 0..1: empty cells turn from the silhouette shade into uCell / uHighlight
 uniform float uNumberFade;  // 0..1: numbers fade in
+uniform float uNumberAuto;  // 1: every number is black or white, whichever contrasts with its cell
 uniform int uSelected;      // selected color number (1-based), 0 = none or highlighting is off
 uniform float uShowOthers;  // 1: cells of other parts are shown dimmed, 0: they are hidden
 uniform float uLine;        // half the width of a grid line, device pixels
@@ -96,7 +97,9 @@ void main() {
           // atlas pixels per screen pixel decide the mip level (computed by hand: the automatic choice
           // breaks at the seams between digits, where the texture coordinate jumps)
           float lod = log2(max(1.0, uGlyphPx / (uGlyph.y * fit * uK)));
-          col = mix(col, uNumber, textureLod(uGlyphs, guv, lod).r * uNumberFade);
+          vec3 ink = uNumber;
+          if (uNumberAuto > 0.5) ink = dot(col, vec3(0.3, 0.59, 0.11)) > 0.55 ? vec3(0.08, 0.08, 0.12) : vec3(0.96, 0.96, 0.98);
+          col = mix(col, ink, textureLod(uGlyphs, guv, lod).r * uNumberFade);
         }
       }
     }
@@ -137,6 +140,7 @@ const UNIFORMS = [
   "uGrid",
   "uCellFade",
   "uNumberFade",
+  "uNumberAuto",
   "uSelected",
   "uShowOthers",
   "uLine",
@@ -322,7 +326,7 @@ export function createGlView(element, onRestored) {
 
   /**
    * Draws a frame.
-   * p: { x, y, scale (CSS px), dpr, theme, cellFade, gridFade, numberFade, selected, showOthers }
+   * p: { x, y, scale (CSS px), dpr, theme, cellFade, gridFade, numberFade, contrastNumbers, selected, showOthers }
    */
   view.draw = (p) => {
     if (!view.ready || !size) return false;
@@ -353,6 +357,7 @@ export function createGlView(element, onRestored) {
     gl.uniform4f(uniform.uGrid, gridColor[0], gridColor[1], gridColor[2], gridColor[3] * p.gridFade);
     gl.uniform1f(uniform.uCellFade, p.cellFade);
     gl.uniform1f(uniform.uNumberFade, p.numberFade);
+    gl.uniform1f(uniform.uNumberAuto, p.contrastNumbers ? 1 : 0);
     gl.uniform1i(uniform.uSelected, p.selected);
     gl.uniform1f(uniform.uShowOthers, p.showOthers ? 1 : 0);
     gl.uniform1f(uniform.uLine, p.dpr / 2);

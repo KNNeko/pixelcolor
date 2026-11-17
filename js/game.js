@@ -307,6 +307,7 @@ export async function openGame(canvas, events, isNew = false) {
   game.useGl = !!(settings.gl && glView && glView.setCanvas(canvas.width, canvas.height, canvas.target));
   game.flags = game.useGl ? new Uint8Array(N) : null;
   minimapCache.version = -1;
+  minimapRegion.key = "";
   indexCellsByColor();
   recountProgress();
   updateColors();
@@ -433,13 +434,28 @@ export function renderPalette() {
   }
 }
 
-export function updateSwatch(k) {
+/** The parts of a swatch that change while painting: cells left and the progress ring. */
+function updateSwatchProgress(k) {
   const btn = swatches[k];
   if (!btn) return;
   const left = remainingOf(k);
   const total = game.part < 0 ? game.totalOfColor[k] : game.partColorCount[k];
   btn.querySelector("i").textContent = left || "✓";
   btn.querySelector(".ring-progress").style.strokeDasharray = (total ? (100 * (total - left)) / total : 100) + " 101";
+}
+
+/** Percentage in the pill at the top. */
+function updateProgressPill() {
+  const total = game.part < 0 ? cellCount() : game.partTotal;
+  const correct = game.part < 0 ? game.correct : game.partCorrect;
+  $("#play-progress").textContent = (total ? (correct / total) * 100 : 0).toFixed(1) + "%";
+}
+
+export function updateSwatch(k) {
+  const btn = swatches[k];
+  if (!btn) return;
+  const left = remainingOf(k);
+  updateSwatchProgress(k);
   btn.classList.toggle("on", game.selected === k + 1);
   btn.classList.toggle("done", !left);
   btn.style.display = settings.hide && !left ? "none" : "";
@@ -456,10 +472,10 @@ function cyclePaletteSort() {
  * Scrolls the palette strip so the swatch is centered. Done by hand: scrollIntoView would also scroll
  * the screen itself when the panel is hidden, pushing the top buttons out of reach.
  */
-function scrollPaletteTo(btn) {
+function scrollPaletteTo(btn, behavior = "smooth") {
   if (!btn || game.dockHidden) return;
   const strip = $("#palette");
-  strip.scrollTo({ left: btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2, behavior: "smooth" });
+  strip.scrollTo({ left: btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2, behavior });
 }
 
 /** Selects color number n (1-based, 0 = none). With highlighting on, only the two affected colors are redrawn. */
@@ -589,9 +605,7 @@ export function commitStroke() {
 
 /** Progress pill, swatches, auto-advance to the next color, "finished" sheet. */
 export function updateStatus() {
-  const total = game.part < 0 ? cellCount() : game.partTotal;
-  const correct = game.part < 0 ? game.correct : game.partCorrect;
-  $("#play-progress").textContent = (total ? (correct / total) * 100 : 0).toFixed(1) + "%";
+  updateProgressPill();
   if (game.selected && game.touchedColors.has(game.selected - 1) && remainingOf(game.selected - 1) === 0)
     selectNextColor();
   game.touchedColors.forEach(updateSwatch);
@@ -707,13 +721,28 @@ function tapCell([x, y]) {
   game.stroke = { cells: [], values: [] };
   if (game.tool === "bucket") bucketFill(i);
   else if (game.tool === "wand") wandFill(i);
-  // record the fill nearest-first, so the time-lapse shows it spreading in a circle from the tap
+  // Record the fill nearest-first, so the time-lapse shows it spreading in a circle from the tap.
+  // Sorting numbers in a typed array is many times faster than sorting with a compare function, which
+  // matters when a fill covers a hundred thousand cells: key = distance² * 2^24 + position in the list.
   const s = game.stroke;
-  const order = s.cells.map((c, k) => k);
-  const dist = s.cells.map((c) => ((c % W) - x) ** 2 + (((c / W) | 0) - y) ** 2);
-  order.sort((a, b) => dist[a] - dist[b]);
-  s.cells = order.map((k) => s.cells[k]);
-  s.values = order.map((k) => s.values[k]);
+  const count = s.cells.length;
+  if (count > 1) {
+    const keys = new Float64Array(count);
+    for (let m = 0; m < count; m++) {
+      const c = s.cells[m];
+      keys[m] = (((c % W) - x) ** 2 + (((c / W) | 0) - y) ** 2) * 16777216 + m;
+    }
+    keys.sort();
+    const cells = new Array(count);
+    const values = new Array(count);
+    for (let m = 0; m < count; m++) {
+      const k = keys[m] % 16777216;
+      cells[m] = s.cells[k];
+      values[m] = s.values[k];
+    }
+    s.cells = cells;
+    s.values = values;
+  }
   commitStroke();
 }
 
@@ -795,7 +824,14 @@ let drawQueued = false;
 export function requestDraw() {
   if (drawQueued) return;
   drawQueued = true;
-  requestAnimationFrame(draw);
+  requestAnimationFrame(() => drawQueued && draw());
+}
+/**
+ * Draws right now instead of at the next animation frame. A finger touching down is reported between
+ * frames; waiting for the next frame would show the first dab of paint one frame late.
+ */
+function drawNow() {
+  if (game.canvas) draw();
 }
 
 const dockHeight = () => (game.dockHidden && !game.splitting ? 0 : $("#play-dock").offsetHeight);
@@ -884,14 +920,23 @@ function draw() {
   if (!game.canvas || !game.buffer || !screen.width) return;
   const s = view.scale;
   // details fade in with zoom: flat cell color, then grid, then numbers
-  const numbersMode = game.canvas.mode === "n";
+  // canvas.mode: "n" numbers (the silhouette gives way to plain cells with numbers when zoomed in),
+  //              "s" silhouette only, "b" both (numbers on top of the silhouette)
+  const mode = game.canvas.mode;
   const fades = {
-    cell: numbersMode && settings.sil ? smoothstep(4, 16, s) : 0,
-    number: numbersMode ? smoothstep(10, 18, s) : 0,
+    cell: mode === "n" && settings.sil ? smoothstep(4, 16, s) : 0,
+    number: mode !== "s" ? smoothstep(10, 18, s) : 0,
     grid: settings.grid ? smoothstep(5, 10, s) : 0,
+    // over a silhouette every number picks black or white, whichever reads better on its cell
+    contrastNumbers: mode === "b",
   };
-  const withGl = game.useGl && glView.ready && drawGl(fades);
+  const withGl = !!(game.useGl && glView.ready && drawGl(fades));
   if (glCanvas.hidden === withGl) glCanvas.hidden = !withGl;
+  if (game.stroke && game.touchedColors.size) {
+    // the finger is still down: keep the progress rings and the percentage up to date as it paints
+    game.touchedColors.forEach(updateSwatchProgress);
+    updateProgressPill();
+  }
   ctx.setTransform(screen.dpr, 0, 0, screen.dpr, 0, 0);
   ctx.globalAlpha = 1;
   if (!withGl) {
@@ -941,6 +986,7 @@ function drawGl(fades) {
     cellFade: fades.cell,
     gridFade: fades.grid,
     numberFade: fades.number,
+    contrastNumbers: fades.contrastNumbers,
     selected: settings.hl ? game.selected : 0,
     showOthers: !!settings.oth,
   });
@@ -1044,8 +1090,13 @@ function draw2d(fades) {
     for (let y = y0; y < y1; y++)
       for (let x = x0; x < x1; x++) {
         const i = y * W + x;
-        if (!game.paint[i] && inCurrentPart(i))
-          ctx.fillText(target[i] + 1, view.x + (x + 0.5) * s, view.y + (y + 0.5) * s);
+        if (game.paint[i] || !inCurrentPart(i)) continue;
+        if (fades.contrastNumbers) {
+          const c = game.buffer.pixels[i];
+          const luma = 0.3 * (c & 255) + 0.59 * ((c >> 8) & 255) + 0.11 * ((c >> 16) & 255);
+          ctx.fillStyle = luma > 140 ? "#14151f" : "#f4f4fa";
+        }
+        ctx.fillText(target[i] + 1, view.x + (x + 0.5) * s, view.y + (y + 0.5) * s);
       }
     ctx.globalAlpha = 1;
   }
@@ -1053,7 +1104,7 @@ function draw2d(fades) {
 
 const minimapElement = $("#minimap");
 /** Scaled-down picture for the minimap; rebuilt only when the picture changed, a few times a second at most. */
-const minimapCache = { canvas: createCanvas(1, 1), version: -1, size: 0, background: "", time: 0, timer: 0 };
+const minimapCache = { canvas: createCanvas(1, 1), version: -1, background: "", time: 0, timer: 0 };
 /** Panel color of the current app theme as [r, g, b] (the minimap frame uses it). */
 const panelColor = { theme: "", rgb: [29, 31, 59] };
 function panelRgb() {
@@ -1068,38 +1119,83 @@ function panelRgb() {
   return panelColor.rgb;
 }
 
+/** Longest side of the minimap in CSS pixels (the other side follows the picture's proportions). */
+const MINIMAP_SIDE = 84;
+/** What the minimap shows: the whole canvas, or the bounding box of the part being colored. */
+const minimapRegion = { key: "", x: 0, y: 0, w: 1, h: 1, cssW: MINIMAP_SIDE, cssH: MINIMAP_SIDE };
+function updateMinimapRegion() {
+  const { width: W, height: H, partOf, id } = game.canvas;
+  const region = minimapRegion;
+  const key = `${id}:${game.part}:${game.part < 0 ? 0 : game.partTotal}:${W}x${H}`;
+  if (region.key === key) return;
+  region.key = key;
+  let x0 = 0;
+  let y0 = 0;
+  let x1 = W - 1;
+  let y1 = H - 1;
+  if (game.part >= 0) {
+    x0 = W;
+    y0 = H;
+    x1 = y1 = -1;
+    for (let i = 0; i < partOf.length; i++) {
+      if (partOf[i] !== game.part) continue;
+      const x = i % W;
+      const y = (i / W) | 0;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+    if (x1 < 0) [x0, y0, x1, y1] = [0, 0, W - 1, H - 1]; // empty part: show everything
+  }
+  region.x = x0;
+  region.y = y0;
+  region.w = x1 - x0 + 1;
+  region.h = y1 - y0 + 1;
+  // the longer side gets MINIMAP_SIDE; the shorter one is never thinner than a third of it
+  const scale = MINIMAP_SIDE / Math.max(region.w, region.h);
+  region.cssW = Math.max(MINIMAP_SIDE / 3, Math.round(region.w * scale));
+  region.cssH = Math.max(MINIMAP_SIDE / 3, Math.round(region.h * scale));
+  minimapElement.style.width = region.cssW + "px";
+  minimapElement.style.height = region.cssH + "px";
+  minimapCache.version = -1;
+}
+
 /**
- * Draws the picture into the minimap cache straight from the pixel array: 4 samples per minimap pixel.
+ * Draws the minimap picture into the cache straight from the pixel array: 4 samples per minimap pixel.
  * The cost depends on the minimap size only, so a 4000x4000 canvas is as cheap as a small one.
+ * (ox, oy): where the region's top-left corner lands in the minimap, k: minimap pixels per cell.
  */
-function renderMinimapPicture(N, k, ox, oy) {
-  const { width: W, height: H } = game.canvas;
+function renderMinimapPicture(nw, nh, k, ox, oy) {
+  const W = game.canvas.width;
+  const region = minimapRegion;
   const cache = minimapCache;
-  cache.canvas.width = cache.canvas.height = cache.size = N;
+  cache.canvas.width = nw;
+  cache.canvas.height = nh;
   const cctx = cache.canvas.getContext("2d");
-  const image = cctx.createImageData(N, N);
+  const image = cctx.createImageData(nw, nh);
   const out = new Uint32Array(image.data.buffer);
   const px = game.buffer.pixels;
   const bg = game.backgroundPixel;
   out.fill(bg);
   const x0 = Math.max(0, Math.ceil(ox));
   const y0 = Math.max(0, Math.ceil(oy));
-  const x1 = Math.min(N, Math.floor(ox + W * k));
-  const y1 = Math.min(N, Math.floor(oy + H * k));
+  const x1 = Math.min(nw, Math.floor(ox + region.w * k));
+  const y1 = Math.min(nh, Math.floor(oy + region.h * k));
   for (let v = y0; v < y1; v++)
     for (let u = x0; u < x1; u++) {
       let r = 0;
       let g = 0;
       let b = 0;
       for (let n = 0; n < 4; n++) {
-        const cx = Math.min(W - 1, ((u + 0.25 + (n & 1) * 0.5 - ox) / k) | 0);
-        const cy = Math.min(H - 1, ((v + 0.25 + (n >> 1) * 0.5 - oy) / k) | 0);
+        const cx = region.x + Math.min(region.w - 1, ((u + 0.25 + (n & 1) * 0.5 - ox) / k) | 0);
+        const cy = region.y + Math.min(region.h - 1, ((v + 0.25 + (n >> 1) * 0.5 - oy) / k) | 0);
         const c = px[cy * W + cx] || bg; // 0 = hidden cell: background
         r += c & 255;
         g += (c >> 8) & 255;
         b += (c >> 16) & 255;
       }
-      out[v * N + u] = 0xff000000 | ((b >> 2) << 16) | ((g >> 2) << 8) | (r >> 2);
+      out[v * nw + u] = 0xff000000 | ((b >> 2) << 16) | ((g >> 2) << 8) | (r >> 2);
     }
   cctx.putImageData(image, 0, 0);
 }
@@ -1108,30 +1204,38 @@ function drawMinimap() {
   const mm = minimapElement;
   const { width: W, height: H } = game.canvas;
   const s = view.scale;
+  // visible part of the canvas, in cells
   const a = Math.max(0, -view.x / s);
   const b = Math.max(0, -view.y / s);
   const c = Math.min(W, (screen.width - view.x) / s);
   const d = Math.min(H, (screen.height - view.y) / s);
-  const visible = settings.mini && !game.splitting && s >= 16 && (c - a) * (d - b) < 0.9 * W * H;
+  // "!!": settings.mini is 0 or 1, and mm.hidden must be compared with a real boolean
+  const visible = !!(settings.mini && !game.splitting && s >= 16 && (c - a) * (d - b) < 0.9 * W * H);
   if (mm.hidden === visible) mm.hidden = !visible;
   if (!visible) return;
+  updateMinimapRegion();
+  const region = minimapRegion;
+  const dpr = screen.dpr;
+  const nw = Math.round(region.cssW * dpr);
+  const nh = Math.round(region.cssH * dpr);
+  if (mm.width !== nw || mm.height !== nh) {
+    mm.width = nw;
+    mm.height = nh;
+  }
   const mctx = mm.getContext("2d");
-  const dpr = devicePixelRatio || 1;
-  const N = Math.round((mm.clientWidth || 78) * dpr);
-  if (mm.width !== N || mm.height !== N) mm.width = mm.height = N;
-  const k = Math.min(N / W, N / H);
-  const ox = (N - W * k) / 2;
-  const oy = (N - H * k) / 2;
+  const k = Math.min(nw / region.w, nh / region.h);
+  const ox = (nw - region.w * k) / 2;
+  const oy = (nh - region.h * k) / 2;
 
   const cache = minimapCache;
-  const resized = cache.size !== N || cache.background !== game.theme.bg;
+  const resized = cache.canvas.width !== nw || cache.canvas.height !== nh || cache.background !== game.theme.bg;
   if (resized || cache.version !== game.buffer.version) {
     const now = performance.now();
     if (resized || cache.version < 0 || now - cache.time > 300) {
       cache.background = game.theme.bg;
       cache.version = game.buffer.version;
       cache.time = now;
-      renderMinimapPicture(N, k, ox, oy);
+      renderMinimapPicture(nw, nh, k, ox, oy);
     } else if (!cache.timer)
       cache.timer = setTimeout(() => {
         cache.timer = 0;
@@ -1139,17 +1243,19 @@ function drawMinimap() {
       }, 320);
   }
   mctx.drawImage(cache.canvas, 0, 0);
-  // Where you are: a thin frame in the panel color around the visible area.
-  // At least 6 px, so it can still be found on a huge canvas.
-  const min = 6 * dpr;
-  const w = Math.max(min, (c - a) * k);
-  const h = Math.max(min, (d - b) * k);
-  const x = Math.max(0, Math.min(N - w, ox + ((a + c) / 2) * k - w / 2));
-  const y = Math.max(0, Math.min(N - h, oy + ((b + d) / 2) * k - h / 2));
+  // Where you are: a frame in the panel color around the visible area, at its true size and position
+  // (cut off at the minimap's edge). The smaller the visible area, the thinner the line, so the frame
+  // never covers what it points at; drawn just outside the area for the same reason.
+  const x0 = Math.max(0, ox + (a - region.x) * k);
+  const y0 = Math.max(0, oy + (b - region.y) * k);
+  const x1 = Math.min(nw, ox + (c - region.x) * k);
+  const y1 = Math.min(nh, oy + (d - region.y) * k);
+  if (x1 <= x0 || y1 <= y0) return; // looking at another part of the canvas
+  const line = Math.max(1, Math.min(1.5 * dpr, Math.min(x1 - x0, y1 - y0) / 8));
   const [pr, pg, pb] = panelRgb();
-  mctx.lineWidth = dpr;
+  mctx.lineWidth = line;
   mctx.strokeStyle = `rgb(${pr},${pg},${pb})`;
-  mctx.strokeRect(x - dpr / 2, y - dpr / 2, w + dpr, h + dpr);
+  mctx.strokeRect(x0 - line / 2, y0 - line / 2, x1 - x0 + line, y1 - y0 + line);
 }
 
 /* ---------- touch / mouse input ---------- */
@@ -1181,10 +1287,10 @@ export const rawCellAt = (e) => [
 const brushActive = () => game.tool === "brush";
 
 /** Aim assist reach in screen pixels for settings.aim = 0..3 (off, light, medium, strong). */
-const AIM_REACH = [0, 8, 14, 20];
+const AIM_REACH = [0, 10, 17, 24];
 /** ...and in cells: the most a touch is corrected by, for the first touch of a stroke and while dragging. */
-const AIM_CELLS_TAP = 0.7;
-const AIM_CELLS_DRAG = 0.35;
+const AIM_CELLS_TAP = 0.85;
+const AIM_CELLS_DRAG = 0.45;
 
 /**
  * Cell the brush should act on for a touch at screen point (px, py).
@@ -1276,6 +1382,7 @@ playCanvas.addEventListener("pointerdown", (e) => {
     game.stroke = { cells: [], values: [] };
     input.lastCell = start;
     stampBrush(start);
+    drawNow();
   }
 });
 
@@ -1329,6 +1436,7 @@ function pointerUp(e) {
       game.stroke = { cells: [], values: [] };
       stampBrush(aimCell(e.offsetX, e.offsetY) || c);
       commitStroke();
+      drawNow();
     }
   } else if (brushActive()) commitStroke();
   else if (isTap) tapCell(c);
@@ -1336,7 +1444,16 @@ function pointerUp(e) {
   if (isTap && settings.dbl) {
     const i = c[1] * game.canvas.width + c[0];
     const now = Date.now();
-    if (now - input.lastTapTime < 320 && input.lastTapCell === i) selectColor(game.canvas.target[i] + 1);
+    if (now - input.lastTapTime < 320 && input.lastTapCell === i) {
+      // pick the cell's color, and paint the cell itself while we are at it
+      const number = game.canvas.target[i] + 1;
+      selectColor(number);
+      if (game.paint[i] !== number && inCurrentPart(i)) {
+        game.stroke = { cells: [], values: [] };
+        paintCell(i, number);
+        commitStroke();
+      }
+    }
     input.lastTapTime = now;
     input.lastTapCell = i;
   }
@@ -1352,7 +1469,14 @@ $("#play-back").onclick = () => closeGame();
 $("#play-panel-toggle").onclick = () => {
   game.dockHidden = !game.dockHidden;
   updateLayout();
+  // while the panel was hidden the strip was not scrolled: put the selected color back in the middle
+  if (!game.dockHidden && game.selected) scrollPaletteTo(swatches[game.selected - 1], "auto");
 };
+
+/** The eye button cycles: numbers -> silhouette with numbers -> silhouette only -> numbers. */
+const NEXT_MODE = { n: "b", b: "s", s: "n" };
+/** Label of the button = the mode it switches to. */
+const NEXT_MODE_LABEL = { n: "mboth", b: "msil", s: "mn" };
 
 $("#play-more").onclick = () => {
   const toggle = (key) =>
@@ -1363,7 +1487,7 @@ $("#play-more").onclick = () => {
       .join("");
   const sheet = openSheet(
     `<div class="actions">` +
-      actionButton("eye", game.canvas.mode === "n" ? "msil" : "mn", "menu-mode") +
+      actionButton("eye", NEXT_MODE_LABEL[game.canvas.mode] || "mboth", "menu-mode") +
       actionButton("split", "parts", "menu-parts") +
       actionButton("plus", "split", "menu-split") +
       actionButton("film", "tlapse", "menu-timelapse") +
@@ -1401,7 +1525,7 @@ $("#play-more").onclick = () => {
     applyColors();
   };
   sheet.querySelector("#menu-mode").onclick = () => {
-    game.canvas.mode = game.canvas.mode === "n" ? "s" : "n";
+    game.canvas.mode = NEXT_MODE[game.canvas.mode] || "b";
     markCanvasChanged();
     closeSheet();
     requestDraw();

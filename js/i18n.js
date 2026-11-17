@@ -90,6 +90,7 @@ export const STRINGS = {
   mode: "Mode|Режим",
   mn: "Numbers|Номера",
   msil: "Silhouette|Силуэт",
+  mboth: "Silhouette + numbers|Силуэт и номера",
   upd: "Update preview|Обновить просмотр",
   gray: "Gray|Ч/б",
   color: "Color|Цвет",

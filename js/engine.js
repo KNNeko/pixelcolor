@@ -312,6 +312,8 @@ export function pickCellColors(rgba, W, H, k) {
   const G = new Float32Array(n);
   const B = new Float32Array(n);
   const side = new Uint8Array(n);
+  const c = new Float64Array(6); // the two group centers of the cell being looked at: RGB, RGB
+  const sum = new Float64Array(6);
   // perceptual-ish squared distance; equals d*d for a gray difference of d levels
   const dist2 = (r, g, b) => (3 * r * r + 4 * g * g + 2 * b * b) / 9;
 
@@ -357,10 +359,15 @@ export function pickCellColors(rgba, W, H, k) {
       if (best < FLAT_RANGE * FLAT_RANGE) continue; // flat cell: keep the average
 
       // 2-means from those two samples
-      const c = [R[a], G[a], B[a], R[b], G[b], B[b]];
+      c[0] = R[a];
+      c[1] = G[a];
+      c[2] = B[a];
+      c[3] = R[b];
+      c[4] = G[b];
+      c[5] = B[b];
       let countB = 0;
       for (let round = 0; round < 3; round++) {
-        const sum = [0, 0, 0, 0, 0, 0];
+        sum.fill(0);
         countB = 0;
         for (let j = 0; j < n; j++) {
           const toA = dist2(R[j] - c[0], G[j] - c[1], B[j] - c[2]);
@@ -420,23 +427,10 @@ export function pickCellColors(rgba, W, H, k) {
       const f = minorShare[i];
       if (!f) continue;
       const o = i * 6;
-      /** Share of the neighbour cell's samples that belong to this cell's smaller group. */
-      const shareIn = (cx, cy) => {
-        if (cx < 0 || cy < 0 || cx >= W || cy >= H) return 0;
-        let count = 0;
-        for (let j = 0; j < n; j++) {
-          const p = ((cy * k + ((j / k) | 0)) * rowWidth + cx * k + (j % k)) * 4;
-          const toMajor = dist2(rgba[p] - pair[o], rgba[p + 1] - pair[o + 1], rgba[p + 2] - pair[o + 2]);
-          const toMinor = dist2(rgba[p] - pair[o + 3], rgba[p + 1] - pair[o + 4], rgba[p + 2] - pair[o + 5]);
-          if (toMinor < toMajor) count++;
-        }
-        return count / n;
-      };
-      const left = shareIn(x - 1, y);
-      const right = shareIn(x + 1, y);
-      const up = shareIn(x, y - 1);
-      const down = shareIn(x, y + 1);
-      const isMixed = (v) => v > TEXTURE_MIX && v < 1 - TEXTURE_MIX;
+      const left = shareIn(o, x - 1, y);
+      const right = shareIn(o, x + 1, y);
+      const up = shareIn(o, x, y - 1);
+      const down = shareIn(o, x, y + 1);
       if (isMixed(left) && isMixed(right) && isMixed(up) && isMixed(down)) {
         averaged.push(i);
         continue;
@@ -458,6 +452,22 @@ export function pickCellColors(rgba, W, H, k) {
   }
   for (const i of changes) for (let j = 0; j < 3; j++) out[i * 4 + j] = pair[i * 6 + 3 + j];
   return out;
+
+  /** Share of cell (cx, cy)'s samples that belong to the smaller group of the cell whose colors start at pair[o]. */
+  function shareIn(o, cx, cy) {
+    if (cx < 0 || cy < 0 || cx >= W || cy >= H) return 0;
+    let count = 0;
+    for (let j = 0; j < n; j++) {
+      const p = ((cy * k + ((j / k) | 0)) * rowWidth + cx * k + (j % k)) * 4;
+      const toMajor = dist2(rgba[p] - pair[o], rgba[p + 1] - pair[o + 1], rgba[p + 2] - pair[o + 2]);
+      const toMinor = dist2(rgba[p] - pair[o + 3], rgba[p + 1] - pair[o + 4], rgba[p + 2] - pair[o + 5]);
+      if (toMinor < toMajor) count++;
+    }
+    return count / n;
+  }
+  function isMixed(v) {
+    return v > TEXTURE_MIX && v < 1 - TEXTURE_MIX;
+  }
 }
 
 /* ---------- color space ---------- */
@@ -558,6 +568,7 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
     if ((k & 63) === 63 && !(await hooks.pause())) return null;
   }
 
+  let nearestDistance = 0; // squared distance found by the last nearestCenter call
   const nearestCenter = (i) => {
     let best = 0;
     let bestD = 1e12;
@@ -574,7 +585,8 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
         best = k;
       }
     }
-    return [best, bestD];
+    nearestDistance = bestD;
+    return best;
   };
 
   const sums = new Float64Array(K * 3);
@@ -583,7 +595,7 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
     sums.fill(0);
     mass.fill(0);
     for (let i = 0; i < S; i++) {
-      const [k] = nearestCenter(i);
+      const k = nearestCenter(i);
       const w = weight[i];
       mass[k] += w;
       sums[k * 3] += pts[i * 3] * w;
@@ -599,9 +611,9 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
   mass.fill(0);
   let error = 0;
   for (let i = 0; i < S; i++) {
-    const [k, d] = nearestCenter(i);
+    const k = nearestCenter(i);
     const w = weight[i];
-    error += Math.sqrt(d);
+    error += Math.sqrt(nearestDistance);
     mass[k] += w;
     sums[k * 3] += rgb[i * 3] * w;
     sums[k * 3 + 1] += rgb[i * 3 + 1] * w;
@@ -772,6 +784,15 @@ export function settle(idx, rgba, W, H, pal, K, clean) {
   const labels = new Int32Array(8);
   const weights = new Float32Array(8);
   const passes = W * H > 4e6 ? 1 : clean >= 5 ? 3 : 2;
+  /** Cost of giving the current cell (its Lab color is in `lab`, its m neighbours in `labels`) color c. */
+  const cost = (c, m) => {
+    const a = lab[0] - palLab[c * 3];
+    const b = lab[1] - palLab[c * 3 + 1];
+    const e = lab[2] - palLab[c * 3 + 2];
+    let disagree = 0;
+    for (let n = 0; n < m; n++) if (labels[n] !== c) disagree += weights[n];
+    return a * a + b * b + e * e + strength * disagree;
+  };
   for (let pass = 0; pass < passes; pass++) {
     let changed = 0;
     for (let y = 0; y < H; y++)
@@ -794,20 +815,12 @@ export function settle(idx, rgba, W, H, pal, K, clean) {
         }
         if (!different) continue;
         srgbToLab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], lab, 0);
-        const cost = (c) => {
-          const a = lab[0] - palLab[c * 3];
-          const b = lab[1] - palLab[c * 3 + 1];
-          const e = lab[2] - palLab[c * 3 + 2];
-          let disagree = 0;
-          for (let n = 0; n < m; n++) if (labels[n] !== c) disagree += weights[n];
-          return a * a + b * b + e * e + strength * disagree;
-        };
         let best = own;
-        let bestCost = cost(own);
+        let bestCost = cost(own, m);
         for (let n = 0; n < m; n++) {
           const c = labels[n];
           if (c === best || c === own) continue;
-          const v = cost(c);
+          const v = cost(c, m);
           if (v < bestCost - 1e-6) {
             bestCost = v;
             best = c;
@@ -920,7 +933,24 @@ export function ditherRamps(idx, rgba, W, H, pal, K, width) {
       // the neighbouring color that differs from this cell's, nearest in color if there are several
       let b = -1;
       let gap2 = RAMP_REACH * RAMP_REACH;
-      for (const j of [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, y > 0 ? i - W : -1, y < H - 1 ? i + W : -1]) {
+      for (let side = 0; side < 4; side++) {
+        // left, right, up, down
+        const j =
+          side === 0
+            ? x > 0
+              ? i - 1
+              : -1
+            : side === 1
+              ? x < W - 1
+                ? i + 1
+                : -1
+              : side === 2
+                ? y > 0
+                  ? i - W
+                  : -1
+                : y < H - 1
+                  ? i + W
+                  : -1;
         if (j < 0 || before[j] === a) continue;
         const c = before[j];
         const d0 = palLab[c * 3] - palLab[a * 3];
