@@ -315,6 +315,8 @@ export async function saveGame(withThumbs) {
     width: canvas.width,
     height: canvas.height,
     progress: g.correct / cellCount(),
+    colors: colorCount(),
+    colorsDone: g.remaining.reduce((n, left) => n + (left === 0), 0),
     done: canvas.done,
     folderId: canvas.folderId,
     updated: Date.now(),
@@ -755,7 +757,6 @@ export function updateLayout() {
   $("#palette").hidden = game.splitting;
   $("#split-bar").hidden = !game.splitting;
   $("#play-dock").classList.toggle("hidden", game.dockHidden && !game.splitting);
-  $("#play-panel-toggle").classList.toggle("active", game.dockHidden);
   placeMinimap();
 }
 

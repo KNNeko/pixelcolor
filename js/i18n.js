@@ -41,6 +41,7 @@ export const STRINGS = {
   mv: "Move…|Переместить…",
   root: "Library|Библиотека",
   itm: "items|шт.",
+  clr: "colors|цв.",
   fdel: "Delete folder? Canvases return to the library.|Удалить папку? Раскраски вернутся в библиотеку.",
   s_num: "By number|По номеру",
   s_col: "By color|По цвету",

@@ -25,6 +25,7 @@ import {
   setFolder,
   deleteFolderEntry,
   getSource,
+  setColorStats,
 } from "./storage.js";
 import { startWizard } from "./wizard.js";
 import { renderThumbnails } from "./render.js";
@@ -93,6 +94,38 @@ const lazyLoader = new IntersectionObserver(
 
 const lazyImg = (entry) => `<img data-thumb="${entry.id}" alt="">`;
 
+/** "12% · 34/180 colors": progress, then finished colors / all colors. */
+const statsText = (entry) =>
+  `${Math.floor(entry.progress * 100)}%` +
+  (entry.colors ? ` · ${entry.colorsDone}/${entry.colors} ${t("clr")}` : "");
+
+/* ---------- color counters for canvases saved before they were stored ---------- */
+
+const statsQueue = [];
+let statsRunning = false;
+async function fillMissingStats() {
+  if (statsRunning) return;
+  statsRunning = true;
+  while (statsQueue.length) {
+    const entry = statsQueue.shift();
+    try {
+      const { canvas, events } = await loadCanvas(entry.id);
+      const paint = paintFromEvents(canvas, events);
+      const left = new Uint32Array(canvas.palette.length / 3);
+      for (let i = 0; i < paint.length; i++) if (paint[i] !== canvas.target[i] + 1) left[canvas.target[i]]++;
+      entry.colors = left.length;
+      entry.colorsDone = left.reduce((n, v) => n + (v === 0), 0);
+      await setColorStats(entry.id, entry.colors, entry.colorsDone);
+      const span = document.querySelector(`.card[data-id="${entry.id}"] > span`);
+      if (span) span.textContent = statsText(entry);
+    } catch {
+      /* canvas vanished meanwhile: nothing to count */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30)); // keep the home screen responsive
+  }
+  statsRunning = false;
+}
+
 /* ---------- list ---------- */
 
 export async function refreshLibrary() {
@@ -150,12 +183,15 @@ export async function refreshLibrary() {
   for (const entry of shown) {
     const card = document.createElement("div");
     card.className = "card";
-    card.innerHTML = `${lazyImg(entry)}<b></b><span>${Math.floor(entry.progress * 100)}%</span>${entry.done ? `<i class="paw">${PAW_SVG}</i>` : ""}`;
+    card.dataset.id = entry.id;
+    card.innerHTML = `${lazyImg(entry)}<b></b><span>${statsText(entry)}</span>${entry.done ? `<i class="paw">${PAW_SVG}</i>` : ""}`;
     card.querySelector("b").textContent = entry.name;
+    if (!entry.colors && !statsQueue.some((e) => e.id === entry.id)) statsQueue.push(entry);
     card.onclick = () => openCanvasMenu(entry);
     grid.append(card);
   }
   grid.querySelectorAll("img[data-thumb]").forEach((img) => lazyLoader.observe(img));
+  fillMissingStats();
 }
 
 export function renderSortOptions() {
@@ -202,7 +238,7 @@ function paintFromEvents(canvas, events) {
 async function openCanvasMenu(entry) {
   const sheet = openSheet(
     `<div class="carousel"></div><b></b>` +
-      `<span class="muted">${entry.width}×${entry.height} · ${Math.floor(entry.progress * 100)}% ${t("pct")}</span>` +
+      `<span class="muted">${entry.width}×${entry.height} · ${statsText(entry)}</span>` +
       `<div class="actions">` +
       actionButton("play", "cont", "act-continue") +
       actionButton("film", "tlapse", "act-timelapse") +
@@ -263,7 +299,7 @@ async function openCanvasMenu(entry) {
         await saveCanvas({
           canvas,
           writeCanvas: true,
-          meta: { ...entry, progress: 0, done: false, updated: Date.now() },
+          meta: { ...entry, progress: 0, colorsDone: 0, done: false, updated: Date.now() },
           events: [],
           rewriteEvents: true,
           thumbs,

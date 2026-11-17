@@ -2,7 +2,7 @@
 //
 // Database "pxc3", version 3. Object stores:
 //   p   canvases  { id, fid, name, W, H, mode, pal, idx, done, parts:[{id,n}], pm }   (pixel data, rarely rewritten)
-//   m   library   { id, name, W, H, pct, done, fid, ts }  or folders { id, folder:1, name, ts }   (small, listed often)
+//   m   library   { id, name, W, H, pct, done, fid, ts, nc, nd }  or folders { id, folder:1, name, ts }   (small, listed often)
 //   ev  events    { id, seq, cells: Int32Array, values: Uint16Array }   one record per paint action, append-only
 //   th  thumbnails{ id, main, parts:[...] }   Blob (new) or data-URL string (migrated), loaded lazily
 //   src source    { id, image: Blob (JPEG), state }   the photo + wizard settings, for "recreate" / "copy"
@@ -127,6 +127,8 @@ function toMeta(rec) {
     done: !!rec.done,
     folderId: rec.fid || "",
     updated: rec.ts,
+    colors: rec.nc || 0, // palette size (0 = entry saved before this was stored)
+    colorsDone: rec.nd || 0, // colors with no cells left to paint
   };
 }
 
@@ -141,6 +143,8 @@ function fromMeta(m) {
     done: m.done,
     fid: m.folderId,
     ts: m.updated,
+    nc: m.colors || 0,
+    nd: m.colorsDone || 0,
   };
 }
 
@@ -211,6 +215,20 @@ export async function deleteCanvas(id) {
     tx.objectStore(LIBRARY).delete(id);
     tx.objectStore(THUMBS).delete(id);
     tx.objectStore(EVENTS).delete(eventRange(id));
+  });
+}
+
+/** Stores the color counters of a library entry without touching its "last changed" time. */
+export async function setColorStats(id, colors, colorsDone) {
+  await run([LIBRARY], "readwrite", (tx) => {
+    const store = tx.objectStore(LIBRARY);
+    const get = store.get(id);
+    get.onsuccess = () => {
+      if (!get.result) return;
+      get.result.nc = colors;
+      get.result.nd = colorsDone;
+      store.put(get.result);
+    };
   });
 }
 
