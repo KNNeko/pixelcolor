@@ -16,7 +16,8 @@ import {
   translatePage,
 } from "./ui.js";
 import { t } from "./i18n.js";
-import { boxScale, applyAdjustments, STYLE_GROUPS, NO_ADJUST } from "./engine.js";
+import { boxScale, applyAdjustments, MODES, DEFAULT_CLEAN, NO_ADJUST, normalizeParams } from "./engine.js";
+import { settings, saveSettings } from "./settings.js";
 import { openGame, saveGame } from "./game.js";
 import { putSource, deleteCanvas } from "./storage.js";
 import { library } from "./library.js";
@@ -80,8 +81,7 @@ $("#panel-pixel").innerHTML =
   sliderHtml("colors", "cols", 2, 1000, 32) +
   `<div class="chips"><label class="field grow"><span data-i="cn"></span><input id="colors-exact" type="number" min="2" max="1000" value="32"></label></div>` +
   `<button class="chip" id="btn-auto-colors" data-i="autoc"></button>` +
-  sliderHtml("denoise", "dn", 0, 5, 2) +
-  sliderHtml("specks", "simp", 0, 12, 3);
+  sliderHtml("clean", "clean", 0, 10, DEFAULT_CLEAN);
 
 $$("#panel-crop .range,#panel-adjust .range,#panel-pixel .range").forEach(initRangeSlider);
 
@@ -119,7 +119,7 @@ export async function startWizard(file, restore = null) {
     step: 1,
     gray: true, // preview in gray (judge shapes, not colors)
     adjust: { ...NO_ADJUST },
-    style: "smooth",
+    style: settings.pm, // the mode and cleanliness used last time
     tool: "crop",
     brushSize: 28,
     zoom: 1, // crop view zoom/pan
@@ -136,6 +136,7 @@ export async function startWizard(file, restore = null) {
   originalKey = "";
   $("#wiz-undo").disabled = true;
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
+  setSlider("clean", settings.pcl);
   resetOrientation();
   showScreen("screen-wizard");
   if (restore) applyState(restore.state);
@@ -166,13 +167,12 @@ function applyState(st) {
   highlightRatio();
   wiz.adjust = { ...st.adjust };
   ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
-  const p = st.params;
+  const p = normalizeParams(st.params); // canvases made by older versions stored other style ids and sliders
   $("#px-width").value = p.width;
   $("#px-height").value = p.height;
   setSlider("colors", p.colors);
   $("#colors-exact").value = p.colors;
-  setSlider("denoise", p.denoise);
-  setSlider("specks", p.specks);
+  setSlider("clean", p.clean);
   wiz.style = p.style;
   wiz.sized = true;
 }
@@ -899,15 +899,9 @@ $("#btn-auto-enhance").onclick = () => {
 function renderStyleList() {
   const list = $("#style-list");
   if (!list.firstChild)
-    list.innerHTML = STYLE_GROUPS.map(
-      ([group, ids]) =>
-        `<div class="style-group" data-i="${group}">${t(group)}</div>` +
-        ids
-          .map(
-            (id) =>
-              `<button class="style-row" data-style="${id}"><b data-i="${id}">${t(id)}</b><span data-i="d_${id}">${t("d_" + id)}</span></button>`,
-          )
-          .join(""),
+    list.innerHTML = MODES.map(
+      (id) =>
+        `<button class="style-row" data-style="${id}"><b data-i="m_${id}">${t("m_" + id)}</b><span data-i="d_${id}">${t("d_" + id)}</span></button>`,
     ).join("");
   $$("#style-list .style-row").forEach((b) => b.classList.toggle("on", b.dataset.style === wiz.style));
 }
@@ -930,8 +924,7 @@ function pixelParams() {
     height,
     colors: Math.max(2, Math.min(+$("#colors").value, width * height)),
     style: wiz.style,
-    specks: +$("#specks").value,
-    denoise: +$("#denoise").value,
+    clean: +$("#clean").value,
   };
 }
 
@@ -1164,6 +1157,9 @@ async function createCanvasFromResult() {
       return setBusy(false);
     }
     const id = String(Date.now());
+    settings.pm = p.style;
+    settings.pcl = p.clean;
+    saveSettings();
     const { blob, scale } = await encodeSourcePhoto();
     const state = sourceState(p, scale);
     const replaceId = wiz.replaceId;

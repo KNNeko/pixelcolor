@@ -10,10 +10,14 @@ import {
   quantize,
   removeSpecks,
   finalizePalette,
-  retroPalette,
   generate,
   suggestColorCount,
-  STYLE_IDS,
+  MODES,
+  normalizeParams,
+  pickCellColors,
+  smoothFlat,
+  settle,
+  cleanPalette,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -76,14 +80,14 @@ test("kmeansFit finds the clear clusters and is deterministic", async () => {
 test("quantize maps pixels to the nearest palette color", async () => {
   const pal = new Float32Array([0, 0, 0, 255, 255, 255]);
   const src = image(4, 1, (x) => [x * 80, x * 80, x * 80]); // 0, 80, 160, 240
-  const idx = await quantize(src.data, 4, 1, pal, 2, "smooth");
+  const idx = await quantize(src.data, 4, 1, pal, 2);
   assert.deepEqual([...idx], [0, 0, 1, 1]);
 });
 
 test("quantize stops when the job is cancelled", async () => {
   const pal = new Float32Array([0, 0, 0, 255, 255, 255]);
   const src = image(10, 200, () => [10, 10, 10]);
-  const idx = await quantize(src.data, 10, 200, pal, 2, "smooth", { pause: async () => false, progress() {} });
+  const idx = await quantize(src.data, 10, 200, pal, 2, false, { pause: async () => false, progress() {} });
   assert.equal(idx, null);
 });
 
@@ -111,16 +115,104 @@ test("finalizePalette drops unused colors and numbers them dark to light", () =>
   assert.deepEqual([...idx], [1, 0, 0, 1]);
 });
 
-test("retroPalette snaps to 4 levels per channel and removes duplicates", () => {
-  const out = retroPalette(new Float32Array([250, 10, 10, 240, 20, 0, 100, 100, 100]));
-  for (const v of out) assert.ok([0, 85, 170, 255].includes(v));
-  assert.equal(out.length / 3, 2);
+test("removeSpecks leaves a small island alone when it clearly stands out", () => {
+  const idx = new Uint16Array(25);
+  idx[12] = 1; // white dot on black: an eye highlight, not noise
+  removeSpecks(idx, 5, 5, 3, new Uint8Array([0, 0, 0, 250, 250, 250]), 8);
+  assert.equal(idx[12], 1);
+  const dull = new Uint16Array(25);
+  dull[12] = 1; // nearly the same gray: noise
+  removeSpecks(dull, 5, 5, 3, new Uint8Array([100, 100, 100, 104, 104, 104]), 8);
+  assert.equal(dull[12], 0);
 });
 
-test("generate works for every style", async () => {
+test("quantize with dithering mixes two colors for an in-between shade and never uses a far-off one", async () => {
+  const pal = new Float32Array([100, 100, 100, 120, 120, 120, 250, 20, 20]); // two grays and a red
+  const src = image(40, 40, () => [110, 110, 110]);
+  const idx = await quantize(src.data, 40, 40, pal, 3, true);
+  const counts = [0, 0, 0];
+  for (const v of idx) counts[v]++;
+  assert.equal(counts[2], 0);
+  assert.ok(Math.abs(counts[0] - counts[1]) < 200, `${counts}`); // about half and half
+});
+
+test("pickCellColors: a border cell takes one side's color, not a mix", () => {
+  // 3 sub-samples per cell; the border between red and blue runs through the middle column of cells
+  const red = [220, 40, 40];
+  const blue = [30, 40, 200];
+  const src = image(9, 9, (x) => (x < 4 ? red : blue)); // cell 1 holds 1 red column and 2 blue ones
+  const out = pickCellColors(src.data, 3, 3, 3);
+  for (let y = 0; y < 3; y++) {
+    assert.deepEqual([...out.subarray((y * 3 + 0) * 4, (y * 3 + 0) * 4 + 3)], red);
+    assert.deepEqual([...out.subarray((y * 3 + 1) * 4, (y * 3 + 1) * 4 + 3)], blue);
+    assert.deepEqual([...out.subarray((y * 3 + 2) * 4, (y * 3 + 2) * 4 + 3)], blue);
+  }
+});
+
+test("pickCellColors keeps a thin dark line as an unbroken one-cell line", () => {
+  // 4 sub-samples per cell, a 2-sample-wide black line on white: straddling cells 2 and 3 (1 sample each side
+  // would be lost by "bigger group wins"; here the line sits 1 sample in cell 2 and 1 in cell 3)
+  const src = image(24, 24, (x) => (x === 11 || x === 12 ? [10, 10, 10] : [240, 240, 240]));
+  const out = pickCellColors(src.data, 6, 6, 4);
+  for (let y = 0; y < 6; y++) {
+    const dark = [];
+    for (let x = 0; x < 6; x++) if (out[(y * 6 + x) * 4] < 60) dark.push(x);
+    assert.equal(dark.length, 1, `row ${y}: ${dark}`);
+    assert.ok(dark[0] === 2 || dark[0] === 3);
+  }
+});
+
+test("pickCellColors averages a soft gradient instead of picking a side", () => {
+  const src = image(16, 4, (x) => [x * 16, x * 16, x * 16]);
+  const out = pickCellColors(src.data, 4, 1, 4);
+  for (let x = 0; x < 4; x++) assert.ok(Math.abs(out[x * 4] - (x * 4 + 1.5) * 16) <= 4, `cell ${x}: ${out[x * 4]}`);
+});
+
+test("smoothFlat flattens weak noise but does not blur a real border", () => {
+  const src = image(12, 6, (x, y) => (x < 6 ? [100 + ((x + y) % 2) * 4, 100, 100] : [200, 100, 100]));
+  const out = smoothFlat(src.data, 12, 6, 3);
+  assert.ok(Math.abs(out[(2 * 12 + 2) * 4] - 102) <= 1); // noise averaged
+  assert.equal(out[(2 * 12 + 8) * 4], 200); // other side untouched
+  assert.ok(out[(2 * 12 + 5) * 4] < 106); // cell right at the border did not pick up the other side
+});
+
+test("settle moves a noise dot to its surroundings and keeps a dot that really differs", () => {
+  const pal = new Float32Array([100, 100, 100, 104, 104, 104, 250, 250, 250]);
+  const src = image(5, 5, () => [102, 102, 102]);
+  src.data.set([250, 250, 250, 255], 18 * 4);
+  const idx = new Uint16Array(25);
+  idx[12] = 1; // cell 12 is really 102 gray: as close to color 0 as to color 1
+  idx[18] = 2; // cell 18 is really white
+  settle(idx, src.data, 5, 5, pal, 3, 3);
+  assert.equal(idx[12], 0);
+  assert.equal(idx[18], 2);
+});
+
+test("cleanPalette merges look-alike colors and colors used by a couple of cells", () => {
+  // 0: gray, 1: nearly the same gray, 2: a slightly different gray used by one cell, 3: red used by one cell
+  const pal = new Float32Array([100, 100, 100, 101, 100, 100, 110, 110, 110, 230, 30, 30]);
+  const idx = new Uint16Array(100).fill(0);
+  idx.fill(1, 50, 98);
+  idx[98] = 2;
+  idx[99] = 3;
+  cleanPalette(idx, pal, 4, 2);
+  assert.equal(idx[60], idx[0]); // look-alikes merged
+  assert.equal(idx[98], idx[0]); // tiny color joined its close neighbour
+  assert.equal(idx[99], 3); // tiny color that stands out stays
+});
+
+test("normalizeParams maps settings of older versions", () => {
+  assert.equal(normalizeParams({ style: "klines", denoise: 2, specks: 3 }).style, "art");
+  assert.equal(normalizeParams({ style: "fs" }).style, "dither");
+  assert.equal(normalizeParams({ style: "photo", clean: 7 }).clean, 7);
+  const old = normalizeParams({ style: "smooth", denoise: 5, specks: 12 }).clean;
+  assert.ok(old >= 0 && old <= 10);
+});
+
+test("generate works for every mode", async () => {
   const src = image(64, 48, (x, y) => [x * 4, y * 5, (x * y) % 255]);
-  for (const style of STYLE_IDS) {
-    const r = await generate(src, { width: 32, height: 24, colors: 12, style, specks: 2, denoise: 1 }, NO_ADJUST);
+  for (const style of [...MODES, "klines"]) {
+    const r = await generate(src, { width: 32, height: 24, colors: 12, style, clean: 2 }, NO_ADJUST);
     assert.equal(r.idx.length, 32 * 24, style);
     const K = r.pal.length / 3;
     assert.ok(K >= 2 && K <= 12, `${style}: ${K} colors`);
@@ -129,7 +221,7 @@ test("generate works for every style", async () => {
 });
 
 test("suggestColorCount: few colors for a flat image, more for a detailed one, not the maximum for a simple one", async () => {
-  const params = { width: 60, height: 60, style: "smooth", denoise: 0 };
+  const params = { width: 60, height: 60, style: "photo", clean: 0 };
   const maxK = Math.floor((60 * 60) / 12);
   const flat = image(60, 60, (x) => (x < 30 ? [200, 40, 40] : [40, 40, 200]));
   const ramp = image(120, 120, (x) => [x * 2, 60, 90]); // one smooth gradient

@@ -24,6 +24,8 @@ export const DEFAULTS = {
   sit: "sg", // silhouette tint
   sic: "#8a6fd6", // custom silhouette tint
   so: "rec", // library sort
+  pm: "art", // pixelization mode used last (art | photo | dither)
+  pcl: 3, // pixelization "cleanliness" used last, 0..10
 };
 
 export const settings = { ...DEFAULTS };

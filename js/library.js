@@ -96,8 +96,7 @@ const lazyImg = (entry) => `<img data-thumb="${entry.id}" alt="">`;
 
 /** "12% · 34/180 colors": progress, then finished colors / all colors. */
 const statsText = (entry) =>
-  `${Math.floor(entry.progress * 100)}%` +
-  (entry.colors ? ` · ${entry.colorsDone}/${entry.colors} ${t("clr")}` : "");
+  `${Math.floor(entry.progress * 100)}%` + (entry.colors ? ` · ${entry.colorsDone}/${entry.colors} ${t("clr")}` : "");
 
 /* ---------- color counters for canvases saved before they were stored ---------- */
 

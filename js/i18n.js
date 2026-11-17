@@ -2,18 +2,16 @@
 import { settings } from "./settings.js";
 
 export const STRINGS = {
-  klines: "Fine lines|Тонкие линии",
-  retro: "Retro console|Ретро-приставка",
-  halo: "Halftone dots|Полутоновые точки",
-  d_klines:
-    "Keeps thin dark details (outlines, hair, eyelashes, text) that averaging would wash out.|Сохраняет тонкие тёмные детали (контуры, волосы, ресницы, надписи), которые при усреднении пропадают.",
-  d_retro:
-    "Snaps every color to the 64-color palette of 8-bit consoles. Chunky and saturated; may end up with fewer colors than you set.|Приводит все цвета к 64-цветной палитре 8-битных приставок. Грубо и насыщенно; цветов может получиться меньше, чем задано.",
-  d_halo:
-    "Newspaper-print look: shades are built from dots that grow larger in darker areas.|Вид газетной печати: оттенки строятся из точек, которые крупнее в тёмных местах.",
-  paint: "Edge-preserving|Сохранение краёв",
-  d_paint:
-    "Smooths texture and noise inside areas but keeps the borders between them sharp. Fewer tiny specks, easier to color.|Сглаживает текстуру и шум внутри областей, но оставляет границы между ними чёткими. Меньше мелких пятнышек — проще раскрашивать.",
+  m_art: "Art|Арт",
+  d_art:
+    "For drawings, anime and digital art. Borders between areas stay crisp, with no mixed in-between colors; thin lines and highlights are kept.|Для рисунков, аниме и диджитал-арта. Границы областей чёткие, без промежуточных «смешанных» цветов; тонкие линии и блики сохраняются.",
+  m_photo: "Photo|Фото",
+  d_photo:
+    "For real photos. Each cell is the average of the photo under it; weak noise and stray dots are cleaned up.|Для реальных фото. Клетка — средний цвет участка под ней; слабый шум и случайные точки убираются.",
+  m_dither: "Dithering|Дизеринг",
+  d_dither:
+    "For pictures with compression artifacts or banding. In-between shades are built from dots of nearby colors, which hides the artifacts. More single cells to color.|Для картинок с артефактами сжатия и полосами на градиентах. Промежуточные оттенки набираются точками соседних цветов и прячут артефакты. Одиночных клеток больше.",
+  clean: "Cleanliness|Чистота",
   cn: "Exact number of colors|Точное число цветов",
   e_crop: "Crop frame|Рамка кадра",
   e_pan: "Pan & zoom|Сдвиг и зум",
@@ -81,16 +79,10 @@ export const STRINGS = {
   h: "Height (px)|Высота (px)",
   lock: "Keep ratio|Сохранять пропорции",
   cols: "Colors|Цвета",
-  simp: "Remove specks (cells)|Убрать пятна (клеток)",
   style: "Pixel style|Стиль пикселизации",
   mode: "Mode|Режим",
   mn: "Numbers|Номера",
   msil: "Silhouette|Силуэт",
-  smooth: "Classic pixel|Классический пиксель",
-  dom: "Clean blocks|Чистые блоки",
-  fs: "Dithered (Floyd–Steinberg)|Дизеринг (Флойд–Стейнберг)",
-  bay: "Grid pattern (Bayer)|Узор-сетка (Байер)",
-  outl: "Cartoon outlines|Мультяшный контур",
   upd: "Update preview|Обновить просмотр",
   gray: "Gray|Ч/б",
   color: "Color|Цвет",
@@ -164,25 +156,10 @@ export const STRINGS = {
   sets: "Settings|Настройки",
   pxc: "Pixel count|Количество пикселей",
   autoc: "Auto colors|Авто-подбор цветов",
-  dn: "Noise smoothing|Сглаживание шума",
   gl1: "Soft light · lavender|Светлый · лаванда",
   gl2: "Soft light · peach|Светлый · персик",
   gd1: "Soft dark · indigo|Тёмный · индиго",
   gd2: "Soft dark · teal|Тёмный · бирюза",
-  d_smooth:
-    "Each cell takes the average color of the photo area it covers. The standard, faithful pixel look.|Каждая клетка — средний цвет участка фото под ней. Стандартный, точный пиксельный вид.",
-  d_dom:
-    "Each cell takes the most common color in its area and ignores stray pixels. Flat, tidy patches with crisp borders.|Клетка берёт самый частый цвет своего участка и игнорирует случайные пиксели. Ровные плоские пятна с чёткими границами.",
-  d_fs: "Scatters dots of nearby colors to fake in-between shades. Smooth gradients from few colors, grainy texture.|Рассыпает точки соседних цветов, имитируя промежуточные оттенки. Плавные переходы из малого числа цветов, зернистая текстура.",
-  d_bay:
-    "Mixes colors in a regular crosshatch grid, like classic 8- and 16-bit games.|Смешивает цвета ровной сеткой-штриховкой, как в классических 8- и 16-битных играх.",
-  d_outl:
-    "Bold flat colors plus a dark outline where light and dark areas meet. Comic-book look.|Яркие плоские цвета и тёмный контур там, где встречаются светлые и тёмные области. Стиль комикса.",
-  g_pix: "Pixel|Пиксель",
-  g_det: "Detail & contrast|Детали и контраст",
-  g_ret: "Retro & dithering|Ретро и дизеринг",
-  hc: "High contrast|Высокий контраст",
-  d_hc: "Deeper shadows, brighter highlights, punchier colors. Good for dull or hazy photos.|Глубже тени, ярче светлые места, сочнее цвета. Хорошо для тусклых и блёклых фото.",
   png: "Export PNG|Экспорт PNG",
   png_full: "Finished picture|Готовая картинка",
   png_prog: "Current progress|Текущий прогресс",
