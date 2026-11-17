@@ -757,6 +757,19 @@ header b {
   flex: 1;
   pointer-events: none;
 }
+/* "hide everything" (setting): only the panel button stays, faint */
+#play-top > *,
+#minimap {
+  transition: opacity 0.2s;
+}
+#play-wrap.bare #play-top > :not(#play-panel-toggle),
+#play-wrap.bare #minimap {
+  opacity: 0;
+  pointer-events: none;
+}
+#play-wrap.bare #play-panel-toggle {
+  opacity: 0.45;
+}
 #play-progress {
   font-variant-numeric: tabular-nums;
   background: var(--panel);
@@ -1276,6 +1289,19 @@ header b {
 .tool-tile.on {
   background: var(--accent);
   color: #fff;
+}
+/* shapes: 9 icons in a grid */
+.shape-grid {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.shape-grid .tool-tile {
+  padding: 8px 0;
+}
+#shape-options[hidden] + * {
+  margin-top: 0;
 }
 /* mirror / upside down / rotate: three equal tiles */
 .tile-row {

@@ -921,6 +921,9 @@ export function updateLayout() {
   $("#palette").hidden = game.splitting;
   $("#split-bar").hidden = !game.splitting;
   $("#play-dock").classList.toggle("hidden", game.dockHidden && !game.splitting);
+  // "hide everything": only the (faint) panel button stays, to bring the interface back
+  $("#play-wrap").classList.toggle("bare", game.dockHidden && !game.splitting && !!settings.hall);
+  if (game.dockHidden && settings.hall) closePartMenu();
   placeMinimap();
 }
 
@@ -1370,13 +1373,24 @@ const pointers = new Map(); // pointerId -> [x, y]
 const input = {
   panning: false,
   multiTouch: false, // a second finger joined during this gesture
-  moved: 0,
+  downAt: [0, 0], // where the finger went down
+  moved: 0, // farthest the finger got from there, CSS px
+  dragging: false, // the picture follows the finger (it moved past TAP_SLOP)
   lastCell: null,
   pinchDist: 0,
   pinchCenter: null,
-  lastTapTime: 0,
+  lastTapTime: -1e9, // first tap of a possible double tap: event time, place, cell
+  lastTapAt: [0, 0],
   lastTapCell: -1,
+  doubleTap: false, // this touch is the second tap of a double tap
 };
+/**
+ * A finger that stays within TAP_SLOP of where it went down is a tap, and does not move the picture: a
+ * picture shaken by a trembling finger would put the second tap of a double tap on another cell.
+ */
+const TAP_SLOP = 10;
+const DOUBLE_TAP_MS = 400; // from the first tap's lift to the second touch
+const DOUBLE_TAP_PX = 30; // the second tap may land this far from the first (zoomed out, cells are tiny)
 
 /** Cell under the pointer, or null outside the picture. */
 export function cellAt(e) {
@@ -1478,14 +1492,18 @@ playCanvas.addEventListener("pointerdown", (e) => {
   if (pointers.size > 1) {
     commitStroke();
     input.panning = true;
+    input.dragging = true; // the finger left after a pinch moves the picture right away
     input.pinchDist = 0;
     input.multiTouch = true;
     if (game.splitting) splitPointerDown(null);
     return;
   }
   input.multiTouch = false;
+  input.downAt = [e.offsetX, e.offsetY];
   input.moved = 0;
+  input.dragging = false;
   if (game.splitting && e.button < 1) return splitPointerDown(e);
+  input.doubleTap = e.button < 1 && doubleTapDown(e);
   input.panning = game.tool === "hand" || e.button > 0 || (brushActive() && !settings.slide);
   // One finger moves the picture instead of painting when the brush would do nothing where it starts:
   // no color chosen, outside the picture, an already finished cell, or a cell of another number
@@ -1493,12 +1511,37 @@ playCanvas.addEventListener("pointerdown", (e) => {
   const start = brushActive() ? strokeCell(e.offsetX, e.offsetY) : null;
   if (!input.panning && brushActive() && !brushCanStartAt(start)) input.panning = true;
   if (!input.panning && brushActive()) {
-    game.stroke = { cells: [], values: [] };
+    if (!game.stroke) game.stroke = { cells: [], values: [] }; // after a double tap: one action with its cell
     input.lastCell = start;
     stampBrush(start);
     drawNow();
-  }
+  } else if (input.doubleTap && !(brushActive() && !settings.slide)) commitStroke();
+  // (brush without sliding: the double tap's cell joins the stamp this tap makes when the finger lifts)
 });
+
+/**
+ * Double tap: picks the number of the first tap's cell and paints that cell (brush, bucket, wand; not the hand
+ * or the eraser). It acts as soon as the second tap touches, like Android's own double tap, so it feels
+ * instant; the finger may then keep going (brush: paints on with the new color). Leaves game.stroke open.
+ */
+function doubleTapDown(e) {
+  if (!settings.dbl || !DOUBLE_TAP_TOOLS.includes(game.tool)) return false;
+  if (input.lastTapCell < 0 || input.lastTapCell >= cellCount()) return false;
+  const c = cellAt(e);
+  const sameCell = c && c[1] * game.canvas.width + c[0] === input.lastTapCell;
+  const near = sameCell || Math.hypot(e.offsetX - input.lastTapAt[0], e.offsetY - input.lastTapAt[1]) < DOUBLE_TAP_PX;
+  // timed with the events' own times: a busy moment between the taps must not make them too far apart
+  if (e.timeStamp - input.lastTapTime >= DOUBLE_TAP_MS || !near) return false;
+  input.lastTapTime = -1e9; // a third tap starts a new double tap
+  // the cell of the first tap: at small zoom the two taps often hit neighbouring cells
+  const i = input.lastTapCell;
+  const number = game.canvas.target[i] + 1;
+  selectColor(number);
+  game.stroke = { cells: [], values: [] };
+  paintCell(i, number);
+  drawNow();
+  return true;
+}
 
 playCanvas.addEventListener("pointermove", (e) => {
   const old = pointers.get(e.pointerId);
@@ -1521,11 +1564,18 @@ playCanvas.addEventListener("pointermove", (e) => {
     input.pinchCenter = center;
     return requestDraw();
   }
-  input.moved += Math.abs(now[0] - old[0]) + Math.abs(now[1] - old[1]);
+  input.moved = Math.max(input.moved, Math.hypot(now[0] - input.downAt[0], now[1] - input.downAt[1]));
   if (game.splitting && splitPointerMove(e)) return;
-  if (input.panning || (!brushActive() && input.moved > 8)) {
-    view.x += now[0] - old[0];
-    view.y += now[1] - old[1];
+  if (input.panning || !brushActive()) {
+    if (input.dragging) {
+      view.x += now[0] - old[0];
+      view.y += now[1] - old[1];
+    } else if (input.moved > TAP_SLOP) {
+      // past the slop: from now on the picture follows the finger, from where it went down
+      input.dragging = true;
+      view.x += now[0] - input.downAt[0];
+      view.y += now[1] - input.downAt[1];
+    } else return;
     requestDraw();
   } else if (game.stroke && brushActive()) {
     // walk along the finger's path in steps of about half a cell, so aim assist sees every spot it passed
@@ -1546,35 +1596,28 @@ function pointerUp(e) {
   if (!pointers.delete(e.pointerId) || pointers.size) return;
   if (game.splitting && splitPointerUp()) return;
   const c = cellAt(e);
-  const isTap = input.moved < 10 && !input.multiTouch && c;
+  // a touch the system took away (pointercancel) is no tap
+  const isTap = e.type === "pointerup" && input.moved <= TAP_SLOP && !input.multiTouch && c;
   if (input.panning) {
     // brush without "sliding": a tap paints one stamp
     if (isTap && brushActive() && !settings.slide && (game.selected || game.tool === "eraser")) {
-      game.stroke = { cells: [], values: [] };
+      if (!game.stroke) game.stroke = { cells: [], values: [] };
       stampBrush(strokeCell(e.offsetX, e.offsetY) || c);
+    }
+    if (game.stroke) {
       commitStroke();
       drawNow();
     }
   } else if (brushActive()) commitStroke();
   else if (isTap) tapCell(c);
 
-  // double tap picks the cell's number (and paints the cell); not with the hand or the eraser
-  if (isTap && settings.dbl && DOUBLE_TAP_TOOLS.includes(game.tool)) {
-    const i = c[1] * game.canvas.width + c[0];
-    const now = Date.now();
-    if (now - input.lastTapTime < 320 && input.lastTapCell === i) {
-      // pick the cell's color, and paint the cell itself while we are at it
-      const number = game.canvas.target[i] + 1;
-      selectColor(number);
-      if (game.paint[i] !== number && inCurrentPart(i)) {
-        game.stroke = { cells: [], values: [] };
-        paintCell(i, number);
-        commitStroke();
-      }
-    }
-    input.lastTapTime = now;
-    input.lastTapCell = i;
+  // a tap that may become the first half of a double tap (the second half acts when it touches: doubleTapDown)
+  if (isTap && !input.doubleTap && settings.dbl && DOUBLE_TAP_TOOLS.includes(game.tool)) {
+    input.lastTapTime = e.timeStamp;
+    input.lastTapAt = [e.offsetX, e.offsetY];
+    input.lastTapCell = c[1] * game.canvas.width + c[0];
   }
+  input.doubleTap = false;
   input.panning = false;
   input.pinchDist = 0;
 }
@@ -1607,7 +1650,7 @@ $("#play-more").onclick = () => {
     `<div class="actions">` +
       actionButton("eye", NEXT_MODE_LABEL[game.canvas.mode] || "mboth", "menu-mode") +
       actionButton("split", "parts", "menu-parts") +
-      actionButton("split", "split", "menu-split") +
+      actionButton("cut", "split", "menu-split") +
       actionButton("film", "tlapse", "menu-timelapse") +
       actionButton("wand", "tset", "menu-tools") +
       actionButton("image", "png", "menu-png") +

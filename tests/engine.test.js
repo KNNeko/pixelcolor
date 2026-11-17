@@ -19,6 +19,7 @@ import {
   settle,
   cleanPalette,
   ditherRamps,
+  smoothGradients,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -293,4 +294,73 @@ test("suggestColorCount: few colors for a flat image, more for a detailed one, n
   assert.ok(a <= 16, `flat: ${a}`);
   assert.ok(b > a && b < maxK, `ramp: ${b} (max ${maxK})`);
   assert.ok(c > b, `detailed: ${c}`);
+});
+
+test("pickCellColors: a thin slanted anti-aliased line becomes one unbroken one-cell line of one color", () => {
+  // 4 samples per cell; a dark line 1.5 samples wide, slanted, anti-aliased, on light skin
+  const k = 4;
+  const W = 20;
+  const H = 20;
+  const src = image(W * k, H * k, (x, y) => {
+    const center = 10 + y * 0.45; // in samples
+    const cover = Math.max(0, Math.min(1, 0.75 + 0.5 - Math.abs(x + 0.5 - center)));
+    const v = (c, line) => Math.round(c * (1 - cover) + line * cover);
+    return [v(250, 30), v(225, 20), v(210, 25)];
+  });
+  const out = pickCellColors(src.data, W, H, k);
+  const dark = (x, y) => out[(y * W + x) * 4] < 120;
+  for (let y = 1; y < H - 1; y++) {
+    const row = [];
+    for (let x = 0; x < W; x++) if (dark(x, y)) row.push(x);
+    assert.ok(row.length >= 1 && row.length <= 2, `row ${y}: ${row}`); // never broken, at most a step
+    // connected to the next row (8-neighbours)
+    const next = [];
+    for (let x = 0; x < W; x++) if (dark(x, y + 1)) next.push(x);
+    assert.ok(
+      row.some((a) => next.some((b) => Math.abs(a - b) <= 1)),
+      `rows ${y}-${y + 1}: ${row} / ${next}`,
+    );
+  }
+  // the line keeps one color along its length (no paler cells where it only grazes a cell)
+  const reds = [];
+  for (let i = 0; i < W * H; i++) if (out[i * 4] < 120) reds.push(out[i * 4]);
+  assert.ok(Math.max(...reds) - Math.min(...reds) <= 25, `line colors ${Math.min(...reds)}..${Math.max(...reds)}`);
+  // cells beside the line keep the skin color: no half-line shades
+  for (let i = 0; i < W * H; i++) {
+    const r = out[i * 4];
+    assert.ok(r < 120 || r > 235, `cell ${i % W},${(i / W) | 0}: ${r}`);
+  }
+});
+
+test("pickCellColors: an anti-aliased border between two flat areas gets no in-between cells", () => {
+  // 3 samples per cell (few, so a blended border cell looks like a gradient); a slanted border, anti-aliased
+  const k = 3;
+  const W = 12;
+  const H = 12;
+  const src = image(W * k, H * k, (x, y) => {
+    const t = Math.max(0, Math.min(1, x - (8 + y * 0.6) + 0.5));
+    return [Math.round(230 * (1 - t) + 40 * t), Math.round(220 * (1 - t) + 30 * t), Math.round(225 * (1 - t) + 60 * t)];
+  });
+  const out = pickCellColors(src.data, W, H, k);
+  for (let y = 1; y < H - 1; y++)
+    for (let x = 1; x < W - 1; x++) {
+      const r = out[(y * W + x) * 4];
+      assert.ok(r < 60 || r > 210, `cell ${x},${y}: ${r}`);
+    }
+});
+
+test("smoothGradients flattens noise inside a soft gradient but leaves a border alone", () => {
+  const W = 20;
+  const H = 6;
+  const noise = (x, y) => ((x * 7 + y * 13) % 5) - 2;
+  const src = image(W, H, (x, y) => (x < 10 ? [100 + x * 2 + noise(x, y), 120, 140] : [230, 60, 60]));
+  const out = smoothGradients(src.data, W, H, 36);
+  // inside the gradient: the noise is averaged away (neighbouring cells differ by about the slope only)
+  for (let x = 3; x < 6; x++) {
+    const d = out[(2 * W + x + 1) * 4] - out[(2 * W + x) * 4];
+    assert.ok(d >= 0 && d <= 4, `cells ${x}-${x + 1}: ${d}`);
+  }
+  // near the border nothing is mixed
+  assert.equal(out[(2 * W + 12) * 4], 230);
+  assert.ok(out[(2 * W + 9) * 4] < 130);
 });

@@ -23,6 +23,7 @@ const ROWS = [
   ["sic", "color"],
   ["grid", "toggle"],
   ["mini", "toggle"],
+  ["hall", "toggle"],
   ["full", "toggle"],
   "g_paint",
   ["slide", "toggle"],

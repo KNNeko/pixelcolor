@@ -2,18 +2,22 @@
 // Runs inside the Web Worker (engine.worker.js) and in Node tests.
 //
 // Three modes:
-//   art     stylized pictures (digital art, anime). A cell on the border of two areas takes the color of
-//           one side instead of a mix of both; thin lines and small highlights survive.
+//   art     stylized pictures (digital art, anime). Thin lines (line art, strands) become unbroken one-cell
+//           lines in their own color; a cell on the border of two areas takes the color of one side instead of
+//           a mix of both; soft gradients are smoothed so their bands run as clean curves.
 //   photo   realistic photos. A cell is the average of the photo under it.
 //   dither  photos with compression artifacts or banding: in-between shades are built from dots.
 //
 // Pipeline (generate):
 //   source photo pixels
-//   -> prepareImage: one color per cell (art: chosen from k*k sub-samples, photo/dither: area average),
-//      then smoothFlat flattens weak noise and JPEG blocks inside areas without touching borders
-//   -> kmeansPalette: pick K colors (k-means in Lab; rare colors count for more than their share of cells)
+//   -> prepareImage: one color per cell (art: chosen from k*k sub-samples with thin lines drawn separately,
+//      then gradients smoothed; photo/dither: area average), then smoothFlat flattens weak noise and JPEG
+//      blocks inside areas without touching borders
+//   -> kmeansPalette: pick K colors (k-means in Lab with lightness weighted double; rare colors count for more
+//      than their share of cells)
 //   -> quantize: map every cell to the nearest palette color (dither: with error diffusion)
-//   -> settle: a cell that fits its neighbours' color almost as well as its own joins them (no stray dots)
+//   -> settle: a cell that fits its neighbours' color almost as well as its own joins them (no stray dots;
+//      strongly inside gradients, gently elsewhere; thin-line cells are left alone by this and what follows)
 //   -> removeSpecks: tiny islands that barely differ from their surroundings join a neighbour
 //   -> ditherRamps: borders between the bands of a gradient get a soft one-cell checker edge
 //   -> cleanPalette: merge colors the eye cannot tell apart and colors used by a couple of cells
@@ -227,7 +231,7 @@ export function applyAdjustments(rgba, w, h, a) {
  * keeps the gradient smooth. (A bell-shaped weight pulls every cell towards its own value and turns gradients
  * into flat blotches.)
  */
-export function smoothFlat(rgba, w, h, clean) {
+export function smoothFlat(rgba, w, h, clean, lines = null) {
   if (clean <= 0) return rgba;
   const limit = 6 * clean; // |dR|+|dG|+|dB| that still counts as "the same area"
   const weight = new Float32Array(766);
@@ -247,6 +251,14 @@ export function smoothFlat(rgba, w, h, clean) {
         const r = src[p];
         const g = src[p + 1];
         const b = src[p + 2];
+        if (lines && lines[y * w + x]) {
+          // thin-line cells keep their color
+          out[p] = r;
+          out[p + 1] = g;
+          out[p + 2] = b;
+          out[p + 3] = 255;
+          continue;
+        }
         const x0 = Math.max(0, x - radius);
         const x1 = Math.min(w - 1, x + radius);
         let sr = 0;
@@ -273,45 +285,504 @@ export function smoothFlat(rgba, w, h, clean) {
   return src;
 }
 
+/**
+ * Art mode: inside soft gradients and flat areas (the 5x5 block around a cell holds only close colors) each
+ * cell becomes the average of its block. Then noise (JPEG, grain) no longer decides on which side of a band
+ * border a cell falls, and the borders between the bands of a gradient run as smooth curves instead of ragged
+ * blotches. Blocks with any real detail or border in them are left as they are. Thin-line cells are skipped.
+ * range: largest |dR|+|dG|+|dB| between any two cells of a block that still counts as smooth.
+ */
+export function smoothGradients(rgba, W, H, range, lines = null) {
+  if (range <= 0) return rgba;
+  const out = new Uint8ClampedArray(rgba);
+  const smooth = new Uint8Array(W * H); // 1 = inside a soft gradient or flat area (for settle)
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (lines && lines[i]) continue;
+      let r0 = 255;
+      let r1 = 0;
+      let g0 = 255;
+      let g1 = 0;
+      let b0 = 255;
+      let b1 = 0;
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
+      let m = 0;
+      for (let yy = Math.max(0, y - 2); yy <= Math.min(H - 1, y + 2); yy++)
+        for (let xx = Math.max(0, x - 2); xx <= Math.min(W - 1, x + 2); xx++) {
+          const j = yy * W + xx;
+          if (lines && lines[j]) continue;
+          const r = rgba[j * 4];
+          const g = rgba[j * 4 + 1];
+          const b = rgba[j * 4 + 2];
+          if (r < r0) r0 = r;
+          if (r > r1) r1 = r;
+          if (g < g0) g0 = g;
+          if (g > g1) g1 = g;
+          if (b < b0) b0 = b;
+          if (b > b1) b1 = b;
+          sr += r;
+          sg += g;
+          sb += b;
+          m++;
+        }
+      if (r1 - r0 + g1 - g0 + b1 - b0 > range) continue;
+      smooth[i] = 1;
+      out[i * 4] = sr / m;
+      out[i * 4 + 1] = sg / m;
+      out[i * 4 + 2] = sb / m;
+    }
+  out.smooth = smooth;
+  return out;
+}
+
 /** Sub-samples of one cell closer than this (in color levels) are one flat color. */
 const FLAT_RANGE = 12;
-/**
- * A thin line or small detail is kept only if it differs from its surroundings by at least this much (color
- * levels). Low on purpose: faint strokes (blush hatching, soft hair strands) are what makes a drawing look
- * drawn, and "two clearly separate groups of samples" already filters out noise.
- */
-const LINE_CONTRAST = 16;
+/** A neighbour cell whose samples differ by less than this counts as nearly flat (border detection). */
+const FLAT_NEIGHBOUR = 26;
+/** ...and two such neighbours on opposite sides that differ by at least this have a border between them. */
+const STEP = 40;
 /**
  * A neighbour cell counts as "mixed" when between this share and (1 - this share) of its samples belong to
  * the smaller group. A two-color cell whose four neighbours are all mixed is fine texture, not an edge.
  */
 const TEXTURE_MIX = 0.12;
-/** ...and covers at least this share of the cell. */
-const LINE_SHARE = 0.15;
+
+/* ---------- thin lines (art mode) ----------
+   Line art and strands thinner than about 1.75 cells are found on the sub-samples and drawn as unbroken
+   one-cell lines in their own color. Cells next to a line take their color from the samples that are not
+   line, so no half-line, half-background colors appear along contours. */
+
+/**
+ * Luma difference (0..255) from its surroundings that makes a sub-sample part of a thin dark or light line:
+ * LINE_MIN_CONTRAST on a light background, less on a dark one (the eye sees small steps in the dark; a strand
+ * on black hair is only a few levels apart). The anti-aliased rim along a plain border stays below it.
+ */
+const LINE_MIN_CONTRAST = 32;
+const lineThreshold = new Uint8Array(256);
+for (let v = 0; v < 256; v++) lineThreshold[v] = Math.round(18 + ((LINE_MIN_CONTRAST - 18) * v) / 255);
+/** Share of a cell covered by a line from which it is drawn as line whatever the thinning says. */
+const LINE_CORE = 0.5;
+/** A one-cell dot with no line next to it is kept only if it stands out at least this much (luma, rms). */
+const LONE_DOT_CONTRAST = 60;
+
+/**
+ * Running maximum (or minimum) over a window of 2r+1 samples along the rows of a w x h byte image, in O(1) per
+ * sample (van Herk / Gil-Werman: running extremes inside blocks of 2r+1, read from both ends).
+ * For the minimum, call it on the inverted image (255 - v): the loops stay simple and fast.
+ * g and hb are scratch rows of length >= w.
+ */
+function maxRows(src, dst, w, h, r, g, hb) {
+  const s = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const base = y * w;
+    g[0] = src[base];
+    for (let x = 1, c = 1; x < w; x++, c++) {
+      if (c === s) c = 0;
+      const v = src[base + x];
+      if (c === 0) g[x] = v;
+      else {
+        const p = g[x - 1];
+        g[x] = v > p ? v : p;
+      }
+    }
+    hb[w - 1] = src[base + w - 1];
+    for (let x = w - 2; x >= 0; x--) {
+      const v = src[base + x];
+      if ((x + 1) % s === 0) hb[x] = v;
+      else {
+        const p = hb[x + 1];
+        hb[x] = v > p ? v : p;
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      const right = g[x + r < w ? x + r : w - 1];
+      if (x < r) dst[base + x] = right;
+      else {
+        const left = hb[x - r];
+        dst[base + x] = left > right ? left : right;
+      }
+    }
+  }
+}
+
+/** The same along the columns, worked row by row (memory in order); G and HB are scratch images of w x h. */
+function maxCols(src, dst, w, h, r, G, HB) {
+  const s = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    if (y % s === 0) for (let x = 0; x < w; x++) G[row + x] = src[row + x];
+    else
+      for (let x = 0; x < w; x++) {
+        const v = src[row + x];
+        const p = G[row - w + x];
+        G[row + x] = v > p ? v : p;
+      }
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    if (y === h - 1 || (y + 1) % s === 0) for (let x = 0; x < w; x++) HB[row + x] = src[row + x];
+    else
+      for (let x = 0; x < w; x++) {
+        const v = src[row + x];
+        const p = HB[row + w + x];
+        HB[row + x] = v > p ? v : p;
+      }
+  }
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    const right = (y + r < h ? y + r : h - 1) * w;
+    if (y < r) for (let x = 0; x < w; x++) dst[row + x] = G[right + x];
+    else {
+      const left = (y - r) * w;
+      for (let x = 0; x < w; x++) {
+        const a = HB[left + x];
+        const b = G[right + x];
+        dst[row + x] = a > b ? a : b;
+      }
+    }
+  }
+}
+
+/** Square running max over (2r+1)^2: rows then columns. */
+function dilate(src, dst, tmp, w, h, r, g, hb, G, HB) {
+  maxRows(src, tmp, w, h, r, g, hb);
+  maxCols(tmp, dst, w, h, r, G, HB);
+}
+
+/**
+ * Sub-samples on thin lines: darker (type 1) or lighter (type 2) than their surroundings by LINE_MIN_CONTRAST,
+ * in a feature narrower than 2r+1 samples (morphological closing / opening of the luma). The rim of a wide
+ * area is not a line: closing and opening leave plain borders where they are.
+ */
+function findThinLines(rgba, w, h, r) {
+  const N = w * h;
+  // luma, padded by r on every side with copies of the edge: at the picture's border a ramp would otherwise
+  // look like a valley (the window would see only one side of it)
+  const pw = w + 2 * r;
+  const ph = h + 2 * r;
+  const Y = new Uint8Array(pw * ph);
+  for (let y = 0; y < ph; y++) {
+    const sy = Math.min(h - 1, Math.max(0, y - r));
+    for (let x = 0; x < pw; x++) {
+      const p = (sy * w + Math.min(w - 1, Math.max(0, x - r))) * 4;
+      Y[y * pw + x] = (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
+    }
+  }
+  const P = pw * ph;
+  const a = new Uint8Array(P);
+  const b = new Uint8Array(P);
+  const tmp = new Uint8Array(P);
+  const G = new Uint8Array(P);
+  const HB = new Uint8Array(P);
+  const g = new Uint8Array(pw);
+  const hb = new Uint8Array(pw);
+  const type = new Uint8Array(N);
+  const strength = new Uint8Array(N);
+  // min(v) = 255 - max(255 - v): erosion is a dilation of the inverted image
+  const invert = (src, dst) => {
+    for (let i = 0; i < P; i++) dst[i] = 255 - src[i];
+  };
+  const morph = (closing) => {
+    if (closing) {
+      dilate(Y, a, tmp, pw, ph, r, g, hb, G, HB); // a = max
+      invert(a, a);
+      dilate(a, b, tmp, pw, ph, r, g, hb, G, HB); // b = 255 - min(max)
+      invert(b, b);
+    } else {
+      invert(Y, a);
+      dilate(a, b, tmp, pw, ph, r, g, hb, G, HB); // b = 255 - min
+      invert(b, b);
+      dilate(b, a, tmp, pw, ph, r, g, hb, G, HB); // a = max(min)
+      b.set(a);
+    }
+  };
+  morph(true); // closing: dark features narrower than the window are filled in
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const q = (y + r) * pw + x + r;
+      const d = b[q] - Y[q];
+      if (d >= lineThreshold[b[q]]) {
+        type[y * w + x] = 1;
+        strength[y * w + x] = d;
+      }
+    }
+  morph(false); // opening: light features narrower than the window are removed
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const q = (y + r) * pw + x + r;
+      const i = y * w + x;
+      const d = Y[q] - b[q];
+      if (d >= lineThreshold[b[q]] && d > strength[i]) {
+        type[i] = 2;
+        strength[i] = d;
+      }
+    }
+  const raw = new Uint8Array(type); // before the clean-up below: fine hatching shows as both kinds everywhere
+  // JPEG rings: a light line gets a faint dark shadow line beside it (and a dark one a light one). Of a dark
+  // and a light line sample lying within two samples of each other, only the stronger is a line.
+  const drop = [];
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const t = type[i];
+      if (!t) continue;
+      let weaker = false;
+      for (let yy = Math.max(0, y - 2); yy <= Math.min(h - 1, y + 2) && !weaker; yy++)
+        for (let xx = Math.max(0, x - 2); xx <= Math.min(w - 1, x + 2); xx++) {
+          const j = yy * w + xx;
+          if (type[j] && type[j] !== t && strength[j] > strength[i]) {
+            weaker = true;
+            break;
+          }
+        }
+      if (weaker) drop.push(i);
+    }
+  for (const i of drop) type[i] = strength[i] = 0;
+  return { type, strength, raw };
+}
+
+/**
+ * Zhang-Suen thinning of the pixels of type t in `type` (w x h), in place on `skel` (1 = skeleton).
+ * Works on the list of line pixels only, so it costs little when lines are a small part of the picture.
+ */
+function thinLines(type, t, w, h, skel) {
+  let list = [];
+  for (let i = 0; i < type.length; i++)
+    if (type[i] === t) {
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x > 0 && y > 0 && x < w - 1 && y < h - 1) {
+        skel[i] = 1;
+        list.push(i);
+      }
+    }
+  const nb = new Uint8Array(9);
+  const remove = [];
+  for (let iter = 0; iter < 20; iter++) {
+    let changed = false;
+    for (let sub = 0; sub < 2; sub++) {
+      remove.length = 0;
+      for (const i of list) {
+        // P2..P9 clockwise from north
+        nb[1] = skel[i - w];
+        nb[2] = skel[i - w + 1];
+        nb[3] = skel[i + 1];
+        nb[4] = skel[i + w + 1];
+        nb[5] = skel[i + w];
+        nb[6] = skel[i + w - 1];
+        nb[7] = skel[i - 1];
+        nb[8] = skel[i - w - 1];
+        let B = 0;
+        let A = 0;
+        for (let k = 1; k <= 8; k++) {
+          B += nb[k];
+          if (!nb[k] && nb[k === 8 ? 1 : k + 1]) A++;
+        }
+        if (B < 2 || B > 6 || A !== 1) continue;
+        if (sub === 0 ? nb[1] * nb[3] * nb[5] || nb[3] * nb[5] * nb[7] : nb[1] * nb[3] * nb[7] || nb[1] * nb[5] * nb[7])
+          continue;
+        remove.push(i);
+      }
+      for (const i of remove) skel[i] = 0;
+      if (remove.length) {
+        changed = true;
+        list = list.filter((i) => skel[i]);
+      }
+    }
+    if (!changed) break;
+  }
+  return list;
+}
+
+/**
+ * Which cells are drawn as thin line, and in what color. Returns { kind: Uint8Array (0 no, 1 dark, 2 light),
+ * color: Uint8ClampedArray RGB, texture: Uint8Array (1 = fine hatching: keep its average tone) }.
+ */
+function rasterizeThinLines(rgba, W, H, k) {
+  const w = W * k;
+  const h = H * k;
+  const n = k * k;
+  const { type, strength, raw } = findThinLines(rgba, w, h, Math.max(1, Math.floor(0.875 * k)));
+  const cells = W * H;
+  // per cell and line type: covered share, and color weighted by how strongly each sample stands out
+  const count = [null, new Uint16Array(cells), new Uint16Array(cells)];
+  const sum = [null, new Float32Array(cells * 4), new Float32Array(cells * 4)];
+  for (let y = 0; y < h; y++) {
+    const row = ((y / k) | 0) * W;
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const t = type[i];
+      if (!t) continue;
+      const c = row + ((x / k) | 0);
+      count[t][c]++;
+      const wt = strength[i] * strength[i];
+      const s = sum[t];
+      s[c * 4] += rgba[i * 4] * wt;
+      s[c * 4 + 1] += rgba[i * 4 + 1] * wt;
+      s[c * 4 + 2] += rgba[i * 4 + 2] * wt;
+      s[c * 4 + 3] += wt;
+    }
+  }
+  // skeleton of each line type, mapped to cells
+  const skel = new Uint8Array(w * h);
+  const onSkeleton = [null, new Uint8Array(cells), new Uint8Array(cells)];
+  for (const t of [1, 2]) {
+    skel.fill(0);
+    for (const i of thinLines(type, t, w, h, skel)) {
+      const x = i % w;
+      onSkeleton[t][(((i - x) / w / k) | 0) * W + ((x / k) | 0)] = 1;
+    }
+  }
+  const kind = new Uint8Array(cells);
+  const share = new Float32Array(cells);
+  for (let c = 0; c < cells; c++) {
+    const d = count[1][c] / n;
+    const l = count[2][c] / n;
+    const t = d >= l ? 1 : 2;
+    const f = t === 1 ? d : l;
+    if (f >= LINE_CORE || (onSkeleton[t][c] && f > 0)) {
+      kind[c] = t;
+      share[c] = f;
+    }
+  }
+  // Fine hatching (parallel lines closer than about 1.5 cells): no single line can be drawn, keep the patch's
+  // tone instead. There the dark lines and the light gaps between them both read as thin lines, in the cell
+  // and all around it.
+  const both = new Uint8Array(cells);
+  {
+    const rawCount = [null, new Uint16Array(cells), new Uint16Array(cells)];
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const t = raw[y * w + x];
+        if (t) rawCount[t][((y / k) | 0) * W + ((x / k) | 0)]++;
+      }
+    for (let c = 0; c < cells; c++) both[c] = rawCount[1][c] >= 0.15 * n && rawCount[2][c] >= 0.15 * n ? 1 : 0;
+  }
+  const texture = new Uint8Array(cells);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const c = y * W + x;
+      if (!both[c]) continue;
+      let around = 0;
+      if (x > 0) around += both[c - 1];
+      if (x < W - 1) around += both[c + 1];
+      if (y > 0) around += both[c - W];
+      if (y < H - 1) around += both[c + W];
+      if (around >= 3) texture[c] = 1;
+    }
+  for (let c = 0; c < cells; c++) if (texture[c]) kind[c] = 0;
+  const same = (x, y, t) => x >= 0 && y >= 0 && x < W && y < H && kind[y * W + x] === t;
+  // Clean one-cell lines, the way a pixel artist draws them. Cells that the line does not need go, the
+  // weakest first (core cells always stay):
+  //   - any cell whose line neighbours stay connected without it (a "simple" cell: the inner corner of an L,
+  //     a bump on the side, the second cell of a two-cell-wide stretch), unless it is the end of a line;
+  //   - a one-cell spur sticking out of a line;
+  //   - a faint dot alone (noise).
+  const order = [];
+  for (let c = 0; c < cells; c++) if (kind[c] && share[c] < LINE_CORE) order.push(c);
+  order.sort((p, q) => share[p] - share[q]);
+  const nb = new Uint8Array(8); // E, NE, N, NW, W, SW, S, SE
+  const DX = [1, 1, 0, -1, -1, -1, 0, 1];
+  const DY = [0, -1, -1, -1, 0, 1, 1, 1];
+  const countAround = (x, y, t) => {
+    let around = 0;
+    for (let d = 0; d < 8; d++) around += same(x + DX[d], y + DY[d], t) ? 1 : 0;
+    return around;
+  };
+  for (let round = 0; round < 2; round++)
+    for (const c of order) {
+      const t = kind[c];
+      if (!t) continue;
+      const x = c % W;
+      const y = (c - x) / W;
+      let around = 0;
+      for (let d = 0; d < 8; d++) around += nb[d] = same(x + DX[d], y + DY[d], t) ? 1 : 0;
+      let drop = false;
+      // alone: a real dot (a star, a highlight) stands out strongly; a faint one is ringing or noise
+      if (around === 0) drop = share[c] < 0.25 || sum[t][c * 4 + 3] < count[t][c] * LONE_DOT_CONTRAST ** 2;
+      else if (around === 1) {
+        // spur: its only neighbour is a junction of three or more line cells
+        const d = nb.indexOf(1);
+        drop = countAround(x + DX[d], y + DY[d], t) >= 3;
+      } else if (around < 8) {
+        // Yokoi's 8-connectivity number: 1 = removing the cell changes nothing about how the line connects
+        let connectivity = 0;
+        for (let d = 0; d < 8; d += 2) {
+          const a = 1 - nb[d];
+          connectivity += a - a * (1 - nb[(d + 1) & 7]) * (1 - nb[(d + 2) & 7]);
+        }
+        drop = connectivity === 1;
+      }
+      if (drop) kind[c] = 0;
+    }
+  // a line's color is pooled from the cell and its line neighbours: a cell the line only grazes would get
+  // a paler, half-blended color of its own, and the line would flicker between shades along its length
+  // samples on a line or touching one: the line's anti-aliased rim and its JPEG halo are neither line nor
+  // background, and a cell next to the line must not take its color from them
+  const near = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      if (!type[y * w + x]) continue;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++)
+        for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) near[yy * w + xx] = 1;
+    }
+  const color = new Uint8ClampedArray(cells * 3);
+  for (let c = 0; c < cells; c++) {
+    const t = kind[c];
+    if (!t) continue;
+    const s = sum[t];
+    const x = c % W;
+    const y = (c - x) / W;
+    let r = 0;
+    let gg = 0;
+    let b = 0;
+    let wt = 0;
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!same(x + dx, y + dy, t)) continue;
+        const o = ((y + dy) * W + x + dx) * 4;
+        r += s[o];
+        gg += s[o + 1];
+        b += s[o + 2];
+        wt += s[o + 3];
+      }
+    color[c * 3] = r / wt;
+    color[c * 3 + 1] = gg / wt;
+    color[c * 3 + 2] = b / wt;
+  }
+  return { kind, color, texture, type, near };
+}
 
 /**
  * Art mode: collapses each k*k block of a supersampled image into one cell color without mixing areas.
  *
- * Every cell's sub-samples are split into two groups (2-means). Three cases:
+ * Thin lines (rasterizeThinLines) become unbroken one-cell lines in their own color. For every other cell, its
+ * sub-samples that are not part of a thin line are split into two groups (2-means):
  *   - the samples are nearly equal, or spread evenly (a soft gradient): the cell is their average;
  *   - two clear groups (the border of two areas): the cell takes the bigger group's color, so the border
  *     stays crisp and no in-between color appears;
- *   - the smaller group is a thin line or a dot (not the rim of an area of that color in a neighbour cell):
- *     the cell on the line's ridge takes the line color, so lines stay one cell wide and unbroken;
  *   - both colors run through all the neighbouring cells too (hatching finer than the grid): the cell is the
  *     average again, so the hatched patch keeps its overall tone instead of turning into one of the colors.
+ * The returned array carries `.lines` (Uint8Array, 1 = thin-line cell), for the clean-up steps to leave alone.
  */
 export function pickCellColors(rgba, W, H, k) {
   const n = k * k;
   const rowWidth = W * k;
   const out = new Uint8ClampedArray(W * H * 4);
+  const thin = k >= 2 ? rasterizeThinLines(rgba, W, H, k) : null;
+  const lines = new Uint8Array(W * H);
   const minorShare = new Float32Array(W * H); // > 0: a two-color cell; the smaller group's share of it
-  const lineCandidate = new Uint8Array(W * H); // the smaller group may be a thin line or a dot
   const pair = new Uint8ClampedArray(W * H * 6); // two-color cells: bigger group RGB, smaller group RGB
-  const R = new Float32Array(n);
-  const G = new Float32Array(n);
-  const B = new Float32Array(n);
-  const side = new Uint8Array(n);
+  const avg = new Float32Array(W * H * 3); // average color of the cell's samples
+  const range2 = new Float32Array(W * H).fill(Infinity); // squared distance between its two most different samples
+  const soft = []; // two-color cells that came out as a blend of their average and their bigger group
+  const R = new Float32Array(9 * n);
+  const G = new Float32Array(9 * n);
+  const B = new Float32Array(9 * n);
+  const side = new Uint8Array(9 * n);
   const c = new Float64Array(6); // the two group centers of the cell being looked at: RGB, RGB
   const sum = new Float64Array(6);
   // perceptual-ish squared distance; equals d*d for a gray difference of d levels
@@ -319,28 +790,58 @@ export function pickCellColors(rgba, W, H, k) {
 
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const q = i * 4;
+      out[q + 3] = 255;
+      if (thin && thin.kind[i]) {
+        lines[i] = 1;
+        for (let j = 0; j < 3; j++) out[q + j] = avg[i * 3 + j] = thin.color[i * 3 + j];
+        range2[i] = 0;
+        continue;
+      }
+      // the cell's samples, without the ones on or right beside a thin line (unless the whole patch is fine
+      // hatching); if a line fills the cell, the background around it: the same samples of the neighbouring
+      // cells; failing that, all but the line samples; failing that, all of them
+      const skipLines = thin && !thin.texture[i];
+      let m = 0;
+      for (let pass = 0; pass < 4 && !m; pass++) {
+        if (pass === 1 && !skipLines) continue;
+        const x0 = pass === 1 ? Math.max(0, x - 1) : x;
+        const x1 = pass === 1 ? Math.min(W - 1, x + 1) : x;
+        const y0 = pass === 1 ? Math.max(0, y - 1) : y;
+        const y1 = pass === 1 ? Math.min(H - 1, y + 1) : y;
+        for (let cy = y0; cy <= y1; cy++)
+          for (let cx = x0; cx <= x1; cx++)
+            for (let j = 0; j < n; j++) {
+              const s = (cy * k + ((j / k) | 0)) * rowWidth + cx * k + (j % k);
+              if (skipLines && pass < 2 && thin.near[s]) continue;
+              if (skipLines && pass === 2 && thin.type[s]) continue;
+              if (m === R.length) continue; // (the 3x3 neighbourhood can hold more samples than one cell)
+              R[m] = rgba[s * 4];
+              G[m] = rgba[s * 4 + 1];
+              B[m] = rgba[s * 4 + 2];
+              m++;
+            }
+      }
       let mr = 0;
       let mg = 0;
       let mb = 0;
-      for (let j = 0; j < n; j++) {
-        const p = ((y * k + ((j / k) | 0)) * rowWidth + x * k + (j % k)) * 4;
-        mr += R[j] = rgba[p];
-        mg += G[j] = rgba[p + 1];
-        mb += B[j] = rgba[p + 2];
+      for (let j = 0; j < m; j++) {
+        mr += R[j];
+        mg += G[j];
+        mb += B[j];
       }
-      mr /= n;
-      mg /= n;
-      mb /= n;
-      const q = (y * W + x) * 4;
-      out[q] = mr;
-      out[q + 1] = mg;
-      out[q + 2] = mb;
-      out[q + 3] = 255;
+      mr /= m;
+      mg /= m;
+      mb /= m;
+      out[q] = avg[i * 3] = mr;
+      out[q + 1] = avg[i * 3 + 1] = mg;
+      out[q + 2] = avg[i * 3 + 2] = mb;
 
       // two samples far apart: the one farthest from the average, and the one farthest from that
       let a = 0;
       let best = -1;
-      for (let j = 0; j < n; j++) {
+      for (let j = 0; j < m; j++) {
         const d = dist2(R[j] - mr, G[j] - mg, B[j] - mb);
         if (d > best) {
           best = d;
@@ -349,13 +850,14 @@ export function pickCellColors(rgba, W, H, k) {
       }
       let b = 0;
       best = -1;
-      for (let j = 0; j < n; j++) {
+      for (let j = 0; j < m; j++) {
         const d = dist2(R[j] - R[a], G[j] - G[a], B[j] - B[a]);
         if (d > best) {
           best = d;
           b = j;
         }
       }
+      range2[i] = best;
       if (best < FLAT_RANGE * FLAT_RANGE) continue; // flat cell: keep the average
 
       // 2-means from those two samples
@@ -369,7 +871,7 @@ export function pickCellColors(rgba, W, H, k) {
       for (let round = 0; round < 3; round++) {
         sum.fill(0);
         countB = 0;
-        for (let j = 0; j < n; j++) {
+        for (let j = 0; j < m; j++) {
           const toA = dist2(R[j] - c[0], G[j] - c[1], B[j] - c[2]);
           const toB = dist2(R[j] - c[3], G[j] - c[4], B[j] - c[5]);
           const s = (side[j] = toB < toA ? 1 : 0);
@@ -378,79 +880,104 @@ export function pickCellColors(rgba, W, H, k) {
           sum[s * 3 + 1] += G[j];
           sum[s * 3 + 2] += B[j];
         }
-        if (!countB || countB === n) break;
+        if (!countB || countB === m) break;
         for (let j = 0; j < 3; j++) {
-          c[j] = sum[j] / (n - countB);
+          c[j] = sum[j] / (m - countB);
           c[3 + j] = sum[3 + j] / countB;
         }
       }
-      if (!countB || countB === n) continue;
+      if (!countB || countB === m) continue;
       // how tight the groups are compared with the gap between them:
       // an even spread (gradient) gives ~0.25, two clean colors with a few blended samples ~0.1
       let spread = 0;
-      for (let j = 0; j < n; j++) {
+      for (let j = 0; j < m; j++) {
         const o = side[j] * 3;
         spread += Math.sqrt(dist2(R[j] - c[o], G[j] - c[o + 1], B[j] - c[o + 2]));
       }
       const gap = Math.sqrt(dist2(c[0] - c[3], c[1] - c[4], c[2] - c[5]));
-      const edge = Math.max(0, Math.min(1, (0.26 - spread / n / gap) / 0.12));
+      const edge = Math.max(0, Math.min(1, (0.26 - spread / m / gap) / 0.12));
       if (!edge) continue;
       // bigger group wins; on a tie the darker one (keeps outlines whole)
       const lumaA = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
       const lumaB = 0.3 * c[3] + 0.59 * c[4] + 0.11 * c[5];
-      const major = countB * 2 > n || (countB * 2 === n && lumaB < lumaA) ? 3 : 0;
+      const major = countB * 2 > m || (countB * 2 === m && lumaB < lumaA) ? 3 : 0;
       const minor = 3 - major;
       out[q] = mr + (c[major] - mr) * edge;
       out[q + 1] = mg + (c[major + 1] - mg) * edge;
       out[q + 2] = mb + (c[major + 2] - mb) * edge;
+      if (edge < 1) soft.push(i);
       // remembered for the second pass, which needs the neighbours' samples too
-      const i = y * W + x;
-      const share = (major ? n - countB : countB) / n;
-      minorShare[i] = share;
-      lineCandidate[i] = edge > 0.2 && gap >= LINE_CONTRAST && share >= LINE_SHARE ? 1 : 0;
+      minorShare[i] = (major ? m - countB : countB) / m;
       for (let j = 0; j < 3; j++) {
         pair[i * 6 + j] = c[major + j];
         pair[i * 6 + 3 + j] = c[minor + j];
       }
     }
 
-  // Second pass over the two-color cells, looking at their four neighbours:
-  //   - fine texture (hatching, screentone: both colors show up in every neighbour as well): no single
-  //     color is right, "bigger group wins" would turn the whole patch into its darker or lighter color.
-  //     The cell becomes the average again, which keeps the patch's overall tone;
-  //   - thin lines and dots: the smaller group wins on the ridge of a line.
-  const changes = [];
+  // A blend that sits between two nearly flat neighbours of clearly different colors is not a soft gradient
+  // but an anti-aliased border (with few samples per cell the two look alike): the border cell takes the color
+  // of the side most of its samples are closer to, so contours stay crisp instead of getting a fringe of
+  // in-between shades (its own groups would still hold the blended samples).
+  for (const i of soft) {
+    const x = i % W;
+    const y = (i - x) / W;
+    for (const [dx, dy] of [
+      [1, 0],
+      [0, 1],
+      [1, 1],
+      [1, -1],
+    ]) {
+      const ax = x - dx;
+      const ay = y - dy;
+      const bx = x + dx;
+      const by = y + dy;
+      if (ax < 0 || ay < 0 || bx < 0 || by < 0 || ax >= W || bx >= W || ay >= H || by >= H) continue;
+      const a = ay * W + ax;
+      const b = by * W + bx;
+      if (range2[a] > FLAT_NEIGHBOUR * FLAT_NEIGHBOUR || range2[b] > FLAT_NEIGHBOUR * FLAT_NEIGHBOUR) continue;
+      if (
+        dist2(avg[a * 3] - avg[b * 3], avg[a * 3 + 1] - avg[b * 3 + 1], avg[a * 3 + 2] - avg[b * 3 + 2]) <
+        STEP * STEP
+      )
+        continue;
+      let toA = 0;
+      for (let j = 0; j < n; j++) {
+        const p = ((y * k + ((j / k) | 0)) * rowWidth + x * k + (j % k)) * 4;
+        const dA = dist2(rgba[p] - avg[a * 3], rgba[p + 1] - avg[a * 3 + 1], rgba[p + 2] - avg[a * 3 + 2]);
+        const dB = dist2(rgba[p] - avg[b * 3], rgba[p + 1] - avg[b * 3 + 1], rgba[p + 2] - avg[b * 3 + 2]);
+        toA += dA < dB ? 1 : dA > dB ? 0 : 0.5;
+      }
+      const lumaA = 0.3 * avg[a * 3] + 0.59 * avg[a * 3 + 1] + 0.11 * avg[a * 3 + 2];
+      const lumaB = 0.3 * avg[b * 3] + 0.59 * avg[b * 3 + 1] + 0.11 * avg[b * 3 + 2];
+      const side = toA * 2 > n || (toA * 2 === n && lumaA < lumaB) ? a : b; // on a tie the darker side
+      for (let j = 0; j < 3; j++) out[i * 4 + j] = avg[side * 3 + j];
+      minorShare[i] = 0; // decided: not part of a texture
+      break;
+    }
+  }
+
+  // Second pass over the two-color cells: fine texture (hatching, screentone: both colors show up in every
+  // neighbour as well) has no single right color; "bigger group wins" would turn the whole patch into its
+  // darker or lighter color. The cell becomes the average again, which keeps the patch's overall tone.
   const averaged = [];
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
-      const f = minorShare[i];
-      if (!f) continue;
+      if (!minorShare[i]) continue;
       const o = i * 6;
-      const left = shareIn(o, x - 1, y);
-      const right = shareIn(o, x + 1, y);
-      const up = shareIn(o, x, y - 1);
-      const down = shareIn(o, x, y + 1);
-      if (isMixed(left) && isMixed(right) && isMixed(up) && isMixed(down)) {
+      if (
+        isMixed(shareIn(o, x - 1, y)) &&
+        isMixed(shareIn(o, x + 1, y)) &&
+        isMixed(shareIn(o, x, y - 1)) &&
+        isMixed(shareIn(o, x, y + 1))
+      )
         averaged.push(i);
-        continue;
-      }
-      if (!lineCandidate[i]) continue;
-      // The line runs along the axis where it continues on both sides; a and b are the cells across it.
-      // If one of those holds mostly this color, the cell is the rim of an area (or of a thicker line that
-      // the neighbour already shows) and keeps the bigger group's color.
-      const alongRow = Math.min(left, right) > Math.min(up, down);
-      const a = alongRow ? up : left;
-      const b = alongRow ? down : right;
-      if (a >= 0.5 || b >= 0.5) continue;
-      const ridge = f > a && f >= b; // of two cells sharing a line, exactly one takes it
-      if (ridge) changes.push(i);
     }
   for (const i of averaged) {
     const f = minorShare[i];
     for (let j = 0; j < 3; j++) out[i * 4 + j] = pair[i * 6 + j] * (1 - f) + pair[i * 6 + 3 + j] * f;
   }
-  for (const i of changes) for (let j = 0; j < 3; j++) out[i * 4 + j] = pair[i * 6 + 3 + j];
+  out.lines = lines;
   return out;
 
   /** Share of cell (cx, cy)'s samples that belong to the smaller group of the cell whose colors start at pair[o]. */
@@ -498,8 +1025,16 @@ function paletteToLab(pal, K) {
   return lab;
 }
 
-/** Evenly spaced sample of `count` pixels, in Lab and RGB. */
-export function samplePixels(rgba, pixelCount, count) {
+/**
+ * Lightness counts this much more than hue and saturation when the palette is picked and cells are matched to
+ * it. Banding in a gradient is seen in its lightness first: with lightness weighted, the palette lays its colors
+ * out along the gradient's light-dark course, and the bands follow it as smooth, evenly ordered rings instead of
+ * flipping between two look-alike colors of slightly different hue. Dark shades get more colors of their own too.
+ */
+const L_WEIGHT = 2;
+
+/** Evenly spaced sample of `count` pixels, in Lab (lightness scaled by lightWeight) and RGB. */
+export function samplePixels(rgba, pixelCount, count, lightWeight = L_WEIGHT) {
   const step = pixelCount / count;
   const lab = new Float32Array(count * 3);
   const rgb = new Float32Array(count * 3);
@@ -509,6 +1044,7 @@ export function samplePixels(rgba, pixelCount, count) {
     rgb[i * 3 + 1] = rgba[p + 1];
     rgb[i * 3 + 2] = rgba[p + 2];
     srgbToLab(rgba[p] | 0, rgba[p + 1] | 0, rgba[p + 2] | 0, lab, i * 3);
+    lab[i * 3] *= lightWeight;
   }
   return { lab, rgb, count };
 }
@@ -523,8 +1059,8 @@ export function samplePixels(rgba, pixelCount, count) {
 const RARE_BOOST = 0.05;
 
 /** Evenly spaced sample of the cell image for the palette search, with rarity weights. */
-export function paletteSample(rgba, pixelCount, count) {
-  const sample = samplePixels(rgba, pixelCount, count);
+export function paletteSample(rgba, pixelCount, count, lightWeight = L_WEIGHT) {
+  const sample = samplePixels(rgba, pixelCount, count, lightWeight);
   const { rgb } = sample;
   const bins = new Uint32Array(32768); // 5 bits per channel
   const keys = new Uint16Array(count);
@@ -648,7 +1184,10 @@ function makeNearest(pal, K, inRgb = false) {
         out[1] = g;
         out[2] = b;
       }
-    : (r, g, b, out) => srgbToLab(r, g, b, out, 0);
+    : (r, g, b, out) => {
+        srgbToLab(r, g, b, out, 0);
+        out[0] *= L_WEIGHT;
+      };
   const points = new Float32Array(K * 3);
   const point = new Float32Array(3);
   for (let k = 0; k < K; k++) {
@@ -775,10 +1314,15 @@ export async function quantize(rgba, W, H, pal, K, dither = false, hooks = noHoo
  * and ragged band borders. Here a cell may switch to a color its neighbours have if that costs little:
  *   cost(color) = (Lab distance to the cell's real color)² + strength * (neighbours that have another color)
  * A dot that really differs from its surroundings (a highlight, a thin line) is far from their color, so it stays.
+ * Inside soft gradients (smooth[i], from smoothGradients) the pull of the neighbours is much stronger: there no
+ * detail can be lost, and it makes the borders between the bands of a gradient run straight instead of ragged.
+ * Elsewhere it is gentle, so small details survive the clean-up.
  */
-export function settle(idx, rgba, W, H, pal, K, clean) {
-  const strength = 0.18 * clean * clean;
-  if (!strength) return;
+export function settle(idx, rgba, W, H, pal, K, clean, lines = null, smooth = null) {
+  const detailStrength = 0.08 * clean * clean;
+  const smoothStrength = Math.max(detailStrength, 2 + 1.2 * clean);
+  if (!detailStrength) return;
+  let strength = detailStrength;
   const palLab = paletteToLab(pal, K);
   const lab = new Float32Array(3);
   const labels = new Int32Array(8);
@@ -798,6 +1342,8 @@ export function settle(idx, rgba, W, H, pal, K, clean) {
     for (let y = 0; y < H; y++)
       for (let x = 0; x < W; x++) {
         const i = y * W + x;
+        if (lines && lines[i]) continue;
+        strength = smooth && smooth[i] ? smoothStrength : detailStrength;
         const own = idx[i];
         let m = 0;
         let different = false;
@@ -841,7 +1387,7 @@ export function settle(idx, rgba, W, H, pal, K, clean) {
  * stands out (an eye highlight) is left alone.
  * Cells touching by a corner count as connected: a thin diagonal line is one region, not a row of specks.
  */
-export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
+export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity, lines = null) {
   if (minSize < 2) return;
   const N = W * H;
   const palLab = paletteToLab(pal, pal.length / 3);
@@ -849,6 +1395,7 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
   const queue = new Int32Array(N);
   const regionSize = [];
   const regionColor = [];
+  const regionKept = []; // holds a thin-line cell: never merged away
   let regions = 0;
 
   // label connected regions (8-neighbour flood fill)
@@ -857,10 +1404,12 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
     const c = idx[start];
     let head = 0;
     let tail = 0;
+    let kept = false;
     queue[tail++] = start;
     region[start] = regions;
     while (head < tail) {
       const i = queue[head++];
+      if (lines && lines[i]) kept = true;
       const x = i % W;
       const y = (i / W) | 0;
       for (let dy = -1; dy <= 1; dy++) {
@@ -877,7 +1426,7 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity) {
         }
       }
     }
-    regionSize.push(tail);
+    regionSize.push(kept ? Infinity : tail);
     regionColor.push(c);
     regions++;
   }
@@ -921,7 +1470,7 @@ const RAMP_REACH = 7;
  * colors stays as it is), and only where the cell's real color is about halfway between the two.
  * width 0..0.5: how far from "exactly halfway" a cell may be (0 = off).
  */
-export function ditherRamps(idx, rgba, W, H, pal, K, width) {
+export function ditherRamps(idx, rgba, W, H, pal, K, width, lines = null) {
   if (width <= 0) return;
   const palLab = paletteToLab(pal, K);
   const lab = new Float32Array(3);
@@ -929,6 +1478,7 @@ export function ditherRamps(idx, rgba, W, H, pal, K, width) {
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
+      if (lines && lines[i]) continue;
       const a = before[i];
       // the neighbouring color that differs from this cell's, nearest in color if there are several
       let b = -1;
@@ -951,7 +1501,7 @@ export function ditherRamps(idx, rgba, W, H, pal, K, width) {
                 : y < H - 1
                   ? i + W
                   : -1;
-        if (j < 0 || before[j] === a) continue;
+        if (j < 0 || before[j] === a || (lines && lines[j])) continue;
         const c = before[j];
         const d0 = palLab[c * 3] - palLab[a * 3];
         const d1 = palLab[c * 3 + 1] - palLab[a * 3 + 1];
@@ -1085,7 +1635,13 @@ export function prepareImage(source, params, userAdjust) {
   if (k > 1)
     rgba =
       style === "art" ? pickCellColors(rgba, W, H, k) : boxScale({ data: rgba, width: W * k, height: H * k }, W, H);
-  return smoothFlat(rgba, W, H, clean);
+  const lines = rgba.lines || null;
+  if (style === "art") rgba = smoothGradients(rgba, W, H, clean > 0 ? 24 + 4 * clean : 0, lines);
+  const smooth = rgba.smooth || null;
+  const out = smoothFlat(rgba, W, H, clean, lines);
+  out.lines = lines; // thin-line cells (art mode): the clean-up steps leave them alone
+  out.smooth = smooth; // cells inside soft gradients and flat areas (art mode)
+  return out;
 }
 
 /**
@@ -1099,17 +1655,20 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const { width: W, height: H, clean } = p;
   const dither = p.style === "dither";
   const rgba = prepareImage(source, p, userAdjust);
+  const lines = rgba.lines; // art mode: thin-line cells, left alone by the clean-up
+  const smooth = rgba.smooth; // art mode: cells inside soft gradients
   const K = Math.max(1, Math.min(p.colors, W * H));
   const pal = await kmeansPalette(rgba, W * H, K, hooks);
   if (!pal) return null;
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
   if (!dither && clean > 0) {
-    settle(idx, rgba, W, H, pal, K, clean);
-    removeSpecks(idx, W, H, 2 + (clean >> 1), pal, 3 + clean * 1.5);
+    settle(idx, rgba, W, H, pal, K, clean, lines, smooth);
+    // only specks that hardly differ from their surroundings: small details that stand out stay
+    removeSpecks(idx, W, H, 2 + (clean >> 2), pal, 3 + clean * 0.8, lines);
   }
   // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
-  if (!dither) ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean);
+  if (!dither) ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }
@@ -1122,13 +1681,15 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
 export const AUTO_COLOR_TARGET = 1.22;
 
 /**
- * Smallest color count whose average error is at most AUTO_COLOR_TARGET, +15% headroom.
+ * Smallest color count whose average error is at most AUTO_COLOR_TARGET, x1.5 headroom (more shades for
+ * gradients than the average error alone asks for).
  * Binary search over quick k-means runs on a sample (error goes down steadily as colors go up).
  */
 export async function suggestColorCount(source, params, userAdjust, hooks = noHooks) {
   const N = params.width * params.height;
   const rgba = prepareImage(source, params, userAdjust);
-  const sample = paletteSample(rgba, N, Math.min(N, 12000));
+  // plain Lab here: the target below is a perceived difference
+  const sample = paletteSample(rgba, N, Math.min(N, 12000), 1);
   const maxK = Math.max(2, Math.min(1000, Math.floor(N / 12)));
   const fitError = async (k) => {
     const fit = await kmeansFit(sample, k, 4, hooks);
@@ -1146,5 +1707,5 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
       hi = mid - 1;
     } else lo = mid + 1;
   }
-  return Math.min(maxK, Math.max(Math.min(maxK, 16), Math.round(best * 1.15)));
+  return Math.min(maxK, Math.max(Math.min(maxK, 16), Math.round(best * 1.5)));
 }

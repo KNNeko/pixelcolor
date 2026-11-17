@@ -31,13 +31,12 @@ partButton.innerHTML = icon("split") + `<span class="badge" hidden></span>`;
 
 const partName = (id) => (id ? game.canvas.parts.find((p) => p.id === id).name : t("rest"));
 
-/** Button state: shown when the canvas has parts; dark with the part's number while one part is chosen. */
+/** Button state: shown when the canvas has parts; a badge with the part's number while one part is chosen. */
 export function renderPartChips() {
   const canvas = game.canvas;
   const show = !!canvas && canvas.parts.length > 0 && !game.splitting;
   partButton.hidden = !show;
   if (!show) return closePartMenu();
-  partButton.classList.toggle("active", game.part >= 0);
   const badge = partButton.querySelector(".badge");
   badge.hidden = game.part < 0;
   if (game.part >= 0) {

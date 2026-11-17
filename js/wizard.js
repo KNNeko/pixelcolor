@@ -73,6 +73,11 @@ const previewWrap = $("#preview-wrap");
 
 /* ---------- panels ---------- */
 
+const SHAPES = ["rect", "oval", "line", "tri", "diamond", "hex", "star", "heart", "arrow"];
+const BLUR_STYLES = ["soft", "smart", "motion", "mosaic", "smudge"];
+const DEFAULT_PIXELS = 160000; // a new canvas: about 400 x 400 cells
+const DEFAULT_COLORS = 128;
+
 // [tool, icon]; under the grid only the active tool's options are shown
 const EDIT_TOOLS = [
   ["crop", "crop"],
@@ -93,9 +98,11 @@ $("#panel-crop").innerHTML =
   `<div class="tile-row"><button class="action" id="btn-mirror"></button><button class="action" id="btn-flipv"></button><button class="action" id="btn-rotate"></button></div>` +
   sliderHtml("tilt", "tilt", -45, 45, 0, 0.5) +
   `</div>` +
-  `<div class="chips" id="shape-kinds">${["rect", "oval", "line"].map((k) => `<button class="chip" data-shape="${k}" data-i="sh_${k}"></button>`).join("")}</div>` +
+  `<div id="shape-options"><div class="shape-grid" id="shape-kinds">${SHAPES.map((k) => `<button class="tool-tile" data-shape="${k}" aria-label="${k}">${icon("sh_" + k)}</button>`).join("")}</div>` +
+  `<div class="chips segmented" id="shape-mode"><button class="chip" data-outline="0" data-i="sh_fill"></button><button class="chip" data-outline="1" data-i="sh_outline"></button></div></div>` +
+  `<div class="chips" id="blur-styles">${BLUR_STYLES.map((k) => `<button class="chip" data-blur="${k}" data-i="bl_${k}"></button>`).join("")}</div>` +
   `<div class="option-row" id="paint-options">${colorButtonHtml("brush-color", "#ffffff")}<button class="chip" id="btn-clone-source" data-i="cl_src"></button>` +
-  `<div class="option-sliders">${sliderHtml("brush-size", "e_size", 2, 160, 28)}${sliderHtml("tol", "tol", 2, 120, 24)}</div></div>` +
+  `<div class="option-sliders">${sliderHtml("brush-size", "e_size", 2, 160, 28)}${sliderHtml("strength", "e_str", 1, 100, 50)}${sliderHtml("feather", "e_feather", 0, 100, 35)}${sliderHtml("tol", "tol", 2, 120, 24)}</div></div>` +
   `<div class="option-row view-row"><div class="chips segmented" id="crop-zoom"><button class="chip" data-zoom="-1">${icon("minus")}</button><button class="chip" data-zoom="1">${icon("plus")}</button><button class="chip" data-zoom="0">${icon("fit")}</button></div>` +
   `<button class="chip" id="btn-edit-reset">${icon("reset")}<span data-i="e_reset"></span></button></div>`;
 
@@ -149,9 +156,13 @@ export async function startWizard(file, restore = null) {
     pad: { on: false, color: null }, // margins: the crop frame may reach beyond the photo, filled with color
     strokes: [], // edits (brush, shapes, fill, ...), in original photo coordinates
     color: "#ffffff", // color of the brush, shapes, fill and color replace
-    shape: "rect", // rect | oval | line
+    shape: "rect", // one of SHAPES
     tol: 24, // tolerance of fill and color replace, in gray levels
-    clone: null, // clone tool: { source: [x, y] (original photo coordinates), off, shift }
+    stamp: null, // stamp tool: { points } the lasso around what it copies (original photo coordinates)
+    shapeOutline: false, // shapes: outline only (as thick as the brush) instead of filled
+    blur: "soft", // blur brush style: soft | smart | motion | mosaic | smudge
+    strength: 50, // blur brush strength, 1..100
+    feather: 35, // stamp and blur brush: soft edge, 0..100
     prevTool: null, // tool to return to after the eyedropper
     editVersion: 0, // bumps on every change to the photo pixels
     step: 1,
@@ -175,7 +186,11 @@ export async function startWizard(file, restore = null) {
   $("#wiz-undo").disabled = true;
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
+  setSlider("colors", DEFAULT_COLORS);
+  $("#colors-exact").value = DEFAULT_COLORS;
   setSlider("tol", wiz.tol);
+  setSlider("strength", wiz.strength);
+  setSlider("feather", wiz.feather);
   syncTiltSlider();
   resetOrientation();
   showScreen("screen-wizard");
@@ -203,6 +218,7 @@ function sourceState(params, scale) {
 const scaleEdit = (s, k) => ({
   ...s,
   ...(s.radius != null && { radius: s.radius * k }),
+  ...(s.feather != null && { feather: s.feather * k }),
   points: s.points.map((v) => v * k),
   ...(s.off && { off: s.off.map((v) => v * k) }),
 });
@@ -274,9 +290,10 @@ function goToStep(n) {
   } else adjRegions.clear(); // free the preview's pixel copies
   if (n === 3) {
     if (!wiz.sized) {
+      // a new canvas starts at DEFAULT_PIXELS cells in the frame's proportions
       const r = cropRatio();
-      $("#px-width").value = Math.max(1, r >= 1 ? 96 : Math.round(96 * r));
-      $("#px-height").value = Math.max(1, r >= 1 ? Math.round(96 / r) : 96);
+      $("#px-width").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS * r)));
+      $("#px-height").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS / r)));
       wiz.sized = true;
     }
     syncPixelCount();
@@ -809,12 +826,16 @@ cropCanvas.addEventListener("pointercancel", cropPointerUp);
    Every edit is one entry of wiz.strokes:
      brush    { color, radius, points }            (older canvases: same, restore: true = restore stroke)
      restore  { restore: true, radius, points }    copies the untouched photo back
-     shape    { kind: "shape", shape: "rect" | "oval" | "line", color, radius, points }
-              rect/oval: the four corners (top-left, top-right, bottom-right, bottom-left), line: two ends
+     shape    { kind: "shape", shape (one of SHAPES), outline, color, radius, points }
+              line: its two ends; the others: the four corners of their box (top-left, top-right, bottom-right,
+              bottom-left; an arrow lists them turned so the first side runs the way it points)
      fill     { kind: "fill", color, tol, seed: [r, g, b], points: [x, y] }
      recolor  { kind: "recolor", color, tol, from: [r, g, b], points: [x, y] }
-     blur     { kind: "blur", radius, points }
-     clone    { kind: "clone", radius, points, off: [dx, dy] }  copies from (point + off)
+     blur     { kind: "blur", style, strength, soft, radius, points }  (no style: older soft blur)
+              soft: 0..100, the outer share of the radius over which the stroke fades out
+     stamp    { kind: "stamp", points (the lasso), off: [dx, dy], feather }  copies what the lasso holds,
+              shifted by off, with edges fading out over `feather`
+     clone    { kind: "clone", radius, points, off: [dx, dy] }  (older canvases) copies from (point + off)
    points, radius and off are in original-photo coordinates. */
 
 const turn = (u, v, quarter) =>
@@ -849,7 +870,7 @@ function opPoints(op) {
   for (let i = 0; i < op.points.length; i += 2) p.push(...sourceToPhoto(op.points[i], op.points[i + 1]));
   return p;
 }
-/** Blur radius of the blur brush, in photo pixels, for a brush of radius r. */
+/** Blur radius of the older blur brush (edits without a style), in photo pixels, for a brush of radius r. */
 const blurPx = (r) => Math.max(1, r * 0.25);
 
 /** Draws a round-capped line through flat points p (one point = a dot). */
@@ -871,8 +892,10 @@ const scratch = createCanvas(1, 1);
 /**
  * Copies picture `src` onto the photo, but only under the brush path p (radius r): restore copies the
  * untouched photo, clone copies the photo shifted by (dx, dy), blur copies a blurred photo.
+ * process(ctx, w, h, x, y), if given, changes the copied piece (with `margin` pixels of surroundings around it,
+ * at photo position x, y) before it is cut to the brush: the blur styles.
  */
-function drawFrom(src, dx, dy, p, r, blur = 0) {
+function drawFrom(src, dx, dy, p, r, blur = 0, alpha = 1, process = null, margin = 0, soft = 0) {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -890,47 +913,364 @@ function drawFrom(src, dx, dy, p, r, blur = 0) {
   const w = X1 - X0;
   const h = Y1 - Y0;
   if (w < 1 || h < 1) return;
-  scratch.width = w;
-  scratch.height = h;
+  // the surroundings come along, so pixels near the edge of the brush blur with real neighbours
+  const m = Math.ceil(Math.max(blur * 3, margin));
+  scratch.width = w + 2 * m;
+  scratch.height = h + 2 * m;
   const c = scratch.getContext("2d");
-  // with blur, also take the surroundings, so pixels near the edge of the brush blur with real neighbours
-  const m = blur ? Math.ceil(blur * 3) : 0;
   if (blur) c.filter = `blur(${blur}px)`;
-  c.drawImage(src, X0 + dx - m, Y0 + dy - m, w + 2 * m, h + 2 * m, -m, -m, w + 2 * m, h + 2 * m);
+  c.drawImage(src, X0 + dx - m, Y0 + dy - m, w + 2 * m, h + 2 * m, 0, 0, w + 2 * m, h + 2 * m);
   c.filter = "none";
+  if (process) process(c, w + 2 * m, h + 2 * m, X0 - m, Y0 - m);
   c.globalCompositeOperation = "destination-in";
   c.fillStyle = c.strokeStyle = "#000";
-  tracePath(c, p, r, X0, Y0);
+  // soft: the brush fades out over its outer `soft` pixels (a smaller brush, blurred, still ends at r)
+  if (soft > 0.5) c.filter = `blur(${soft / 2.5}px)`;
+  tracePath(c, p, Math.max(0.5, r - soft), X0 - m, Y0 - m);
+  c.filter = "none";
   c.globalCompositeOperation = "source-over";
-  photo.getContext("2d").drawImage(scratch, X0, Y0);
+  const ctx = photo.getContext("2d");
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(scratch, m, m, w, h, X0, Y0, w, h);
+  ctx.globalAlpha = 1;
 }
 
+/* Blur brush styles. strength 1..100; r = brush radius, in photo pixels.
+     soft    plain blur
+     smart   blurs only where neighbours are alike: smooths noise, JPEG blocks and banding, keeps edges
+     motion  smears along the direction of the stroke
+     mosaic  squares of one color (aligned to the photo, so overlapping strokes match)
+     smudge  drags the colors under the finger along with it */
+const blurRadius = (strength, r) => Math.max(0.5, (strength / 100) * r * 0.6);
+
+/** Applies a blur-brush segment from photo point a to b (a === b: a dot). src: the photo before the stroke. */
+function blurSegment(op, src, a, b, r) {
+  const style = op.style || "soft";
+  const strength = op.strength ?? 50;
+  const soft = ((op.soft || 0) / 100) * r; // width of the fading edge, photo pixels
+  const p = a === b ? [a[0], a[1]] : [a[0], a[1], b[0], b[1]];
+  if (style === "soft") areaSegment(src, p, r, soft, blurRadius(strength, r));
+  else if (style === "smart")
+    areaSegment(src, p, r, soft, 0, (c, w, h) => smartBlur(c, w, h, strength, r), blurRadius(strength, r) * 3);
+  else if (style === "mosaic") {
+    const size = mosaicSize(strength, r);
+    areaSegment(src, p, r, soft, 0, (c, w, h, x, y) => mosaic(c, w, h, x, y, size), size);
+  } else if (style === "motion") {
+    if (a === b) return; // no direction yet
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    const ux = (b[0] - a[0]) / len;
+    const uy = (b[1] - a[1]) / len;
+    const reach = Math.max(1, (strength / 100) * r * 1.5);
+    drawFrom(
+      src,
+      0,
+      0,
+      p,
+      r,
+      0,
+      1,
+      (c, w, h, x, y) => {
+        // average of the piece shifted back and forth along the stroke (each draw weighs 1/(n+1): a running mean)
+        const steps = 12;
+        for (let i = 0; i <= steps; i++) {
+          const t = (i / steps - 0.5) * 2 * reach;
+          c.globalAlpha = 1 / (i + 1);
+          c.drawImage(src, x + ux * t, y + uy * t, w, h, 0, 0, w, h);
+        }
+        c.globalAlpha = 1;
+      },
+      reach + 1,
+      soft,
+    );
+  } else if (style === "smudge") {
+    // in short steps, each carries a bit of the color it starts from to where it ends
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (!len) return;
+    const steps = Math.max(1, Math.ceil(len / Math.max(1, r / 4)));
+    const alpha = 0.25 + (strength / 100) * 0.7;
+    for (let i = 0; i < steps; i++) {
+      const q0 = [a[0] + ((b[0] - a[0]) * i) / steps, a[1] + ((b[1] - a[1]) * i) / steps];
+      const q1 = [a[0] + ((b[0] - a[0]) * (i + 1)) / steps, a[1] + ((b[1] - a[1]) * (i + 1)) / steps];
+      drawFrom(photo, q0[0] - q1[0], q0[1] - q1[1], [q1[0], q1[1]], r, 0, alpha, null, 0, soft);
+    }
+  }
+}
+
+/*
+ * Blur styles that change an area (soft, smart, mosaic) keep the stroke's path so far in blurMask (its core,
+ * without the fading edge). Each segment rebuilds the photo around it from the stroke's starting picture:
+ * the changed picture where the blurred mask says so, the starting one elsewhere. The edge then fades evenly
+ * however often the finger went over a spot (drawing soft dabs on top of each other would harden it).
+ */
+const blurMask = createCanvas(1, 1);
+const maskScratch = createCanvas(1, 1);
+
+function beginBlurMask() {
+  if (blurMask.width !== photo.width || blurMask.height !== photo.height) {
+    blurMask.width = photo.width;
+    blurMask.height = photo.height;
+  } else blurMask.getContext("2d").clearRect(0, 0, blurMask.width, blurMask.height);
+}
+
+/** One segment (path p, flat photo points) of an area blur style, fading out over the outer `soft` pixels. */
+function areaSegment(src, p, r, soft, blur = 0, process = null, margin = 0) {
+  const core = Math.max(0.5, r - soft);
+  const sigma = soft > 0.5 ? soft / 2.5 : 0;
+  const mc = blurMask.getContext("2d");
+  mc.fillStyle = mc.strokeStyle = "#000";
+  tracePath(mc, p, core);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < p.length; i += 2) {
+    minX = Math.min(minX, p[i]);
+    maxX = Math.max(maxX, p[i]);
+    minY = Math.min(minY, p[i + 1]);
+    maxY = Math.max(maxY, p[i + 1]);
+  }
+  const X0 = Math.max(0, Math.floor(minX - r - 2));
+  const Y0 = Math.max(0, Math.floor(minY - r - 2));
+  const X1 = Math.min(photo.width, Math.ceil(maxX + r + 2));
+  const Y1 = Math.min(photo.height, Math.ceil(maxY + r + 2));
+  const w = X1 - X0;
+  const h = Y1 - Y0;
+  if (w < 1 || h < 1) return;
+  const m = Math.ceil(Math.max(blur * 3, margin, sigma * 3));
+  const W = w + 2 * m;
+  const H = h + 2 * m;
+  // the changed picture
+  scratch.width = W;
+  scratch.height = H;
+  const c = scratch.getContext("2d");
+  if (blur) c.filter = `blur(${blur}px)`;
+  c.drawImage(edgeExtended(src, X0 - m, Y0 - m, W, H), 0, 0); // at the photo's border it blurs with itself
+  c.filter = "none";
+  if (process) process(c, W, H, X0 - m, Y0 - m);
+  // its mask: the stroke's core, blurred (past the photo's border the mask goes on as at the border, so a
+  // stroke along the border does not fade towards it)
+  maskScratch.width = W;
+  maskScratch.height = H;
+  const k = maskScratch.getContext("2d");
+  if (sigma) k.filter = `blur(${sigma}px)`;
+  k.drawImage(edgeExtended(blurMask, X0 - m, Y0 - m, W, H), 0, 0);
+  k.filter = "none";
+  c.globalCompositeOperation = "destination-in";
+  c.drawImage(maskScratch, 0, 0);
+  c.globalCompositeOperation = "source-over";
+  const ctx = photo.getContext("2d");
+  ctx.drawImage(src, X0, Y0, w, h, X0, Y0, w, h);
+  ctx.drawImage(scratch, m, m, w, h, X0, Y0, w, h);
+}
+
+const edgeScratch = createCanvas(1, 1);
+/** The W x H piece of canvas src at (x, y); where it reaches past src's sides, their edge pixels repeat. */
+function edgeExtended(src, x, y, W, H) {
+  edgeScratch.width = W;
+  edgeScratch.height = H;
+  const e = edgeScratch.getContext("2d");
+  e.imageSmoothingEnabled = false;
+  // inside part
+  const ix0 = Math.max(0, x);
+  const iy0 = Math.max(0, y);
+  const ix1 = Math.min(src.width, x + W);
+  const iy1 = Math.min(src.height, y + H);
+  if (ix1 <= ix0 || iy1 <= iy0) return edgeScratch;
+  e.drawImage(src, ix0, iy0, ix1 - ix0, iy1 - iy0, ix0 - x, iy0 - y, ix1 - ix0, iy1 - iy0);
+  // stretch the edge rows and columns over what lies outside (first left/right, then top/bottom with corners)
+  const L = ix0 - x;
+  const R = x + W - ix1;
+  const T = iy0 - y;
+  const B = y + H - iy1;
+  const iw = ix1 - ix0;
+  const ih = iy1 - iy0;
+  if (L > 0) e.drawImage(edgeScratch, L, T, 1, ih, 0, T, L, ih);
+  if (R > 0) e.drawImage(edgeScratch, L + iw - 1, T, 1, ih, L + iw, T, R, ih);
+  if (T > 0) e.drawImage(edgeScratch, 0, T, W, 1, 0, 0, W, T);
+  if (B > 0) e.drawImage(edgeScratch, 0, T + ih - 1, W, 1, 0, T + ih, W, B);
+  return edgeScratch;
+}
+
+/** Smart blur of the w x h piece in c: each pixel moves towards the blurred image as far as it is alike. */
+function smartBlur(c, w, h, strength, r) {
+  const orig = c.getImageData(0, 0, w, h);
+  const blurred = createCanvas(w, h);
+  const b = blurred.getContext("2d");
+  b.filter = `blur(${blurRadius(strength, r)}px)`;
+  b.drawImage(c.canvas, 0, 0);
+  const soft = b.getImageData(0, 0, w, h).data;
+  const d = orig.data;
+  const limit = 12 + strength * 0.5; // luma difference beyond which a pixel is an edge and stays
+  for (let i = 0; i < d.length; i += 4) {
+    const diff = Math.abs(0.3 * (soft[i] - d[i]) + 0.59 * (soft[i + 1] - d[i + 1]) + 0.11 * (soft[i + 2] - d[i + 2]));
+    const t = Math.max(0, 1 - diff / limit);
+    for (let j = 0; j < 3; j++) d[i + j] += (soft[i + j] - d[i + j]) * t;
+  }
+  c.putImageData(orig, 0, 0);
+}
+
+const mosaicSize = (strength, r) => Math.max(2, Math.round(2 + (strength / 100) * r * 0.8));
+
+/** Mosaic of the w x h piece in c (at photo position X0, Y0): squares aligned to the photo's own grid. */
+function mosaic(c, w, h, X0, Y0, size) {
+  const ox = ((X0 % size) + size) % size;
+  const oy = ((Y0 % size) + size) % size;
+  const cols = Math.ceil((w + ox) / size);
+  const rows = Math.ceil((h + oy) / size);
+  const small = createCanvas(cols, rows);
+  const s = small.getContext("2d");
+  s.imageSmoothingEnabled = true;
+  s.imageSmoothingQuality = "high";
+  s.drawImage(c.canvas, -ox, -oy, cols * size, rows * size, 0, 0, cols, rows);
+  c.imageSmoothingEnabled = false;
+  c.clearRect(0, 0, w, h);
+  c.drawImage(small, 0, 0, cols, rows, -ox, -oy, cols * size, rows * size);
+  c.imageSmoothingEnabled = true;
+}
+
+/** Stamp: the lasso piece of the photo (feathered), drawn shifted by (dx, dy). The piece comes from `src`. */
+function drawStamp(target, src, lasso, dx, dy, feather) {
+  const piece = stampPiece(src, lasso, feather);
+  if (piece) target.drawImage(piece.canvas, piece.x + dx, piece.y + dy);
+}
+
+/** The lasso piece of `src` with its edge fading out over `feather` px: { canvas, x, y } (its photo position). */
+function stampPiece(src, lasso, feather) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < lasso.length; i += 2) {
+    minX = Math.min(minX, lasso[i]);
+    maxX = Math.max(maxX, lasso[i]);
+    minY = Math.min(minY, lasso[i + 1]);
+    maxY = Math.max(maxY, lasso[i + 1]);
+  }
+  const m = Math.ceil(feather * 2) + 2;
+  const X0 = Math.floor(minX) - m;
+  const Y0 = Math.floor(minY) - m;
+  const w = Math.ceil(maxX) + m - X0;
+  const h = Math.ceil(maxY) + m - Y0;
+  if (w < 1 || h < 1 || w * h > 40e6) return null;
+  // mask: the lasso filled, its edge blurred into a fade
+  const mask = createCanvas(w, h);
+  const mc = mask.getContext("2d");
+  if (feather > 0.5) mc.filter = `blur(${feather / 2}px)`;
+  mc.fillStyle = "#000";
+  mc.beginPath();
+  mc.moveTo(lasso[0] - X0, lasso[1] - Y0);
+  for (let i = 2; i < lasso.length; i += 2) mc.lineTo(lasso[i] - X0, lasso[i + 1] - Y0);
+  mc.closePath();
+  mc.fill();
+  const piece = createCanvas(w, h);
+  const c = piece.getContext("2d");
+  c.drawImage(src, X0, Y0, w, h, 0, 0, w, h);
+  c.globalCompositeOperation = "destination-in";
+  c.drawImage(mask, 0, 0);
+  return { canvas: piece, x: X0, y: Y0 };
+}
+
+/** Feather of a new stamp in photo pixels: the slider's share of a quarter of the lasso's smaller side. */
+function stampFeather(lasso) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < lasso.length; i += 2) {
+    minX = Math.min(minX, lasso[i]);
+    maxX = Math.max(maxX, lasso[i]);
+    minY = Math.min(minY, lasso[i + 1]);
+    maxY = Math.max(maxY, lasso[i + 1]);
+  }
+  return (wiz.feather / 100) * 0.25 * Math.min(maxX - minX, maxY - minY);
+}
+
+/** Outlines of the shapes in a unit box (u: 0..1 along the first side, v: 0..1 along the second). */
+const STAR = (() => {
+  const pts = [];
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const R = i % 2 ? 0.2 : 0.5;
+    pts.push([0.5 + R * Math.cos(a), 0.5 + R * Math.sin(a)]);
+  }
+  const xs = pts.map((q) => q[0]);
+  const ys = pts.map((q) => q[1]);
+  const x0 = Math.min(...xs);
+  const y0 = Math.min(...ys);
+  const sx = Math.max(...xs) - x0;
+  const sy = Math.max(...ys) - y0;
+  return pts.map(([x, y]) => [(x - x0) / sx, (y - y0) / sy]);
+})();
+const UNIT_POLYGONS = {
+  rect: [
+    [0, 0],
+    [1, 0],
+    [1, 1],
+    [0, 1],
+  ],
+  tri: [
+    [0.5, 0],
+    [1, 1],
+    [0, 1],
+  ],
+  diamond: [
+    [0.5, 0],
+    [1, 0.5],
+    [0.5, 1],
+    [0, 0.5],
+  ],
+  hex: [
+    [0.25, 0],
+    [0.75, 0],
+    [1, 0.5],
+    [0.75, 1],
+    [0.25, 1],
+    [0, 0.5],
+  ],
+  star: STAR,
+  arrow: [
+    [0, 0.32],
+    [0.58, 0.32],
+    [0.58, 0.06],
+    [1, 0.5],
+    [0.58, 0.94],
+    [0.58, 0.68],
+    [0, 0.68],
+  ],
+};
+
 function drawShape(ctx, op, p) {
+  const r = op.radius * tiltMatrix()[2];
   ctx.fillStyle = ctx.strokeStyle = op.color;
   if (op.shape === "line") {
-    tracePath(ctx, p, op.radius * tiltMatrix()[2]);
+    tracePath(ctx, p, r);
     return;
   }
+  // the unit shape stretched onto the box: u along the first side, v along the last one
+  ctx.save();
+  ctx.transform(p[2] - p[0], p[3] - p[1], p[6] - p[0], p[7] - p[1], p[0], p[1]);
   ctx.beginPath();
-  if (op.shape === "rect") {
-    ctx.moveTo(p[0], p[1]);
-    for (let i = 2; i < 8; i += 2) ctx.lineTo(p[i], p[i + 1]);
-    ctx.closePath();
+  if (op.shape === "oval") ctx.ellipse(0.5, 0.5, 0.5, 0.5, 0, 0, Math.PI * 2);
+  else if (op.shape === "heart") {
+    ctx.moveTo(0.5, 1);
+    ctx.bezierCurveTo(0.1, 0.72, 0, 0.5, 0, 0.3);
+    ctx.bezierCurveTo(0, 0.12, 0.14, 0, 0.29, 0);
+    ctx.bezierCurveTo(0.4, 0, 0.48, 0.07, 0.5, 0.17);
+    ctx.bezierCurveTo(0.52, 0.07, 0.6, 0, 0.71, 0);
+    ctx.bezierCurveTo(0.86, 0, 1, 0.12, 1, 0.3);
+    ctx.bezierCurveTo(1, 0.5, 0.9, 0.72, 0.5, 1);
   } else {
-    // ellipse inside the four corners: a unit circle stretched along the two sides
-    ctx.save();
-    ctx.transform(
-      (p[2] - p[0]) / 2,
-      (p[3] - p[1]) / 2,
-      (p[6] - p[0]) / 2,
-      (p[7] - p[1]) / 2,
-      (p[0] + p[4]) / 2,
-      (p[1] + p[5]) / 2,
-    );
-    ctx.arc(0, 0, 1, 0, Math.PI * 2);
-    ctx.restore();
+    const poly = UNIT_POLYGONS[op.shape] || UNIT_POLYGONS.rect;
+    ctx.moveTo(poly[0][0], poly[0][1]);
+    for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
   }
-  ctx.fill();
+  ctx.closePath();
+  ctx.restore(); // the path stays where it was drawn; the outline width is not stretched with it
+  if (op.outline) {
+    ctx.lineWidth = Math.max(1, 2 * r);
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  } else ctx.fill();
 }
 
 /** Fill and color replace work on the pixels of the whole photo. */
@@ -957,12 +1297,32 @@ function applyEdit(op) {
     ctx.fillStyle = ctx.strokeStyle = op.color;
     tracePath(ctx, p, r);
   } else if (kind === "restore") drawFrom(wiz.base, 0, 0, p, r);
-  else if (kind === "blur") drawFrom(photo, 0, 0, p, r, blurPx(r));
-  else if (kind === "clone") {
+  else if (kind === "blur") {
+    if (!op.style) drawFrom(photo, 0, 0, p, r, blurPx(r));
+    else replayBlur(op, p, r);
+  } else if (kind === "clone") {
     const [dx, dy] = cloneShift(op);
     drawFrom(photo, dx, dy, p, r);
+  } else if (kind === "stamp") {
+    const [dx, dy] = cloneShift(op);
+    drawStamp(ctx, photo, p, dx, dy, op.feather * tiltMatrix()[2]);
   } else if (kind === "shape") drawShape(ctx, op, p);
   else applyPixelEdit(op);
+}
+
+/** A blur stroke replayed the way it was drawn: a dot, then piece by piece (motion and smudge need that). */
+function replayBlur(op, p, r) {
+  const style = op.style;
+  // the styles that copy from the photo as it was when the stroke started work from a snapshot of it
+  const src = style === "smudge" ? photo : createCanvas(photo.width, photo.height);
+  if (src !== photo) src.getContext("2d").drawImage(photo, 0, 0);
+  if (style === "soft" || style === "smart" || style === "mosaic") {
+    beginBlurMask();
+    blurSegment(op, src, [p[0], p[1]], [p[0], p[1]], r);
+    for (let i = 2; i < p.length; i += 2) blurSegment(op, src, [p[i - 2], p[i - 1]], [p[i], p[i + 1]], r);
+    return;
+  }
+  for (let i = 2; i < p.length; i += 2) blurSegment(op, src, [p[i - 2], p[i - 1]], [p[i], p[i + 1]], r);
 }
 
 /** Clone offset of an edit, in photo pixels (the same everywhere: the photo transform is linear). */
@@ -992,23 +1352,33 @@ function ensureOwnPhoto() {
 
 /* tools that need a color, a size, a tolerance, a shape kind or a clone source */
 const COLOR_TOOLS = ["brush", "shape", "fill", "recolor", "pick"];
-const SIZE_TOOLS = ["brush", "shape", "blur", "clone", "rest"];
+const SIZE_TOOLS = ["brush", "shape", "blur", "rest"];
 const TOL_TOOLS = ["fill", "recolor"];
 
 function updateEditorUi() {
   $$("#editor-tools [data-tool]").forEach((b) => b.classList.toggle("on", b.dataset.tool === wiz.tool));
-  const cloneReady = wiz.tool === "clone" && wiz.clone;
-  $("#editor-hint").textContent = t("h_" + wiz.tool + (cloneReady ? "2" : ""));
+  const stampReady = wiz.tool === "clone" && wiz.stamp;
+  $("#editor-hint").textContent = t("h_" + wiz.tool + (stampReady ? "2" : ""));
   const tool = wiz.tool;
   $("#frame-options").hidden = tool !== "crop";
   $("#brush-color").hidden = !COLOR_TOOLS.includes(tool);
   $("#brush-color").style.background = wiz.color;
-  $("#shape-kinds").hidden = tool !== "shape";
+  $("#shape-options").hidden = tool !== "shape";
   $$("#shape-kinds [data-shape]").forEach((b) => b.classList.toggle("on", b.dataset.shape === wiz.shape));
-  $("#btn-clone-source").hidden = tool !== "clone";
-  $("#brush-size").closest(".field").hidden = !SIZE_TOOLS.includes(tool);
+  $$("#shape-mode [data-outline]").forEach((b) =>
+    b.classList.toggle("on", (b.dataset.outline === "1") === wiz.shapeOutline),
+  );
+  $("#shape-mode").hidden = wiz.shape === "line";
+  $("#blur-styles").hidden = tool !== "blur";
+  $$("#blur-styles [data-blur]").forEach((b) => b.classList.toggle("on", b.dataset.blur === wiz.blur));
+  $("#btn-clone-source").hidden = !stampReady;
+  // filled shapes need no size: only lines and outlines have a thickness
+  const sized = SIZE_TOOLS.includes(tool) && !(tool === "shape" && wiz.shape !== "line" && !wiz.shapeOutline);
+  $("#brush-size").closest(".field").hidden = !sized;
+  $("#strength").closest(".field").hidden = tool !== "blur";
+  $("#feather").closest(".field").hidden = tool !== "clone" && tool !== "blur";
   $("#tol").closest(".field").hidden = !TOL_TOOLS.includes(tool);
-  $("#paint-options").hidden = ![...COLOR_TOOLS, ...SIZE_TOOLS].includes(tool);
+  $("#paint-options").hidden = ![...COLOR_TOOLS, ...SIZE_TOOLS, "clone"].includes(tool);
   $("#btn-edit-reset").hidden = tool === "crop";
   drawCrop();
 }
@@ -1090,46 +1460,67 @@ function drawEditorOverlay(x, g) {
     drawShape(x, { ...op, radius: op.radius * g.scale }, p);
     x.restore();
   }
-  if (wiz.tool === "clone" && wiz.clone) {
-    // where the clone copies from right now
-    const at =
-      wiz.clone.off && lastPoint
-        ? [lastPoint[0] + wiz.clone.shift[0], lastPoint[1] + wiz.clone.shift[1]]
-        : sourceToPhoto(...wiz.clone.source);
-    const [sx, sy] = toScreen(at);
-    const rr = Math.max(6, wiz.brushSize / 2);
-    x.lineWidth = 2;
-    for (const [color, w] of [
-      ["#000a", 4],
-      ["#fff", 2],
-    ]) {
-      x.strokeStyle = color;
-      x.lineWidth = w;
-      x.beginPath();
-      x.arc(sx, sy, rr, 0, 7);
-      x.moveTo(sx - rr - 6, sy);
-      x.lineTo(sx + rr + 6, sy);
-      x.moveTo(sx, sy - rr - 6);
-      x.lineTo(sx, sy + rr + 6);
-      x.stroke();
+  if (wiz.tool === "clone") {
+    // the lasso being drawn or the outline of what the stamp copies, and the copy under the finger
+    const lasso = lassoDraft ? lassoDraft.flat() : wiz.stamp ? opPoints(wiz.stamp) : null;
+    if (stampPlace && stampPreview) {
+      const [ax, ay] = toScreen([stampPreview.x + stampPlace.dx, stampPreview.y + stampPlace.dy]);
+      x.drawImage(
+        stampPreview.canvas,
+        ax,
+        ay,
+        stampPreview.canvas.width * g.scale,
+        stampPreview.canvas.height * g.scale,
+      );
+    }
+    if (lasso && lasso.length >= 4) {
+      x.save();
+      x.setLineDash([6, 5]);
+      for (const [color, width, offset] of [
+        ["#000a", 3, 0],
+        ["#fff", 1.5, 5.5],
+      ]) {
+        x.strokeStyle = color;
+        x.lineWidth = width;
+        x.lineDashOffset = offset;
+        x.beginPath();
+        const [sx, sy] = toScreen([lasso[0], lasso[1]]);
+        x.moveTo(sx, sy);
+        for (let i = 2; i < lasso.length; i += 2) x.lineTo(...toScreen([lasso[i], lasso[i + 1]]));
+        if (!lassoDraft) x.closePath();
+        x.stroke();
+      }
+      x.restore();
     }
   }
 }
 
-/** A shape edit from two photo points (rect/oval: axis-aligned on screen; line: the two points). */
+/**
+ * A shape edit from two photo points (a box upright on screen; a line: the two points). An arrow points the way
+ * the finger moved (right, left, up or down): its corners are listed turned that way.
+ */
 function shapeEdit(a, b) {
-  const corners =
-    wiz.shape === "line"
-      ? [a, b]
-      : [
-          [Math.min(a[0], b[0]), Math.min(a[1], b[1])],
-          [Math.max(a[0], b[0]), Math.min(a[1], b[1])],
-          [Math.max(a[0], b[0]), Math.max(a[1], b[1])],
-          [Math.min(a[0], b[0]), Math.max(a[1], b[1])],
-        ];
+  const x0 = Math.min(a[0], b[0]);
+  const x1 = Math.max(a[0], b[0]);
+  const y0 = Math.min(a[1], b[1]);
+  const y1 = Math.max(a[1], b[1]);
+  let corners = [
+    [x0, y0],
+    [x1, y0],
+    [x1, y1],
+    [x0, y1],
+  ];
+  if (wiz.shape === "line") corners = [a, b];
+  else if (wiz.shape === "arrow") {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const turn = Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 0 : 2) : dy >= 0 ? 1 : 3; // right, down, left, up
+    corners = [0, 1, 2, 3].map((i) => corners[[i, (i + 1) % 4, (i + 2) % 4, (i + 3) % 4][turn]]);
+  }
   return {
     kind: "shape",
     shape: wiz.shape,
+    outline: wiz.shape !== "line" && wiz.shapeOutline,
     color: wiz.color,
     radius: wiz.brushSize / 2 / cropGeometry().scale / tiltMatrix()[2],
     points: corners.flatMap((q) => photoToSource(q[0], q[1])),
@@ -1143,6 +1534,9 @@ let strokeSource = null; // picture the clone/blur stroke copies from (the photo
 let lastPoint = null;
 let editPinch = 0;
 let editDraft = null; // { start, end } of a shape being dragged
+let lassoDraft = null; // stamp: [[x, y], ...] the lasso being drawn (photo coordinates)
+let stampPlace = null; // stamp: { dx, dy } shift of the copy being placed, in photo pixels
+let stampPreview = null; // stamp: the piece shown under the finger ({ canvas, x, y }, see stampPiece)
 let tapStart = null; // [x, y] screen position of a touch that may turn out to be a tap
 
 /** One piece of the stroke being drawn, from photo point a to b. */
@@ -1155,8 +1549,7 @@ function strokeSegment(op, a, b) {
     ctx.fillStyle = ctx.strokeStyle = op.color;
     tracePath(ctx, p, r);
   } else if (kind === "restore") drawFrom(wiz.base, 0, 0, p, r);
-  else if (kind === "blur") drawFrom(strokeSource, 0, 0, p, r, blurPx(r));
-  else if (kind === "clone") drawFrom(strokeSource, wiz.clone.shift[0], wiz.clone.shift[1], p, r);
+  else if (kind === "blur") blurSegment(op, strokeSource, a, b, r);
 }
 
 // These run in the capture phase, before the crop handlers, and stop them unless the crop tool is active.
@@ -1178,7 +1571,7 @@ cropCanvas.addEventListener(
         photoChanged();
         $("#wiz-undo").disabled = !history.length;
       }
-      activeStroke = editDraft = tapStart = null;
+      activeStroke = editDraft = tapStart = lassoDraft = stampPlace = null;
       editPinch = 0;
       return drawCrop();
     }
@@ -1189,22 +1582,37 @@ cropCanvas.addEventListener(
       editDraft = { start: p, end: null };
       return;
     }
+    if (tool === "clone") {
+      if (!wiz.stamp)
+        lassoDraft = [p]; // first: draw the lasso around what to copy
+      else {
+        // then: the copy appears centered under the finger and moves with it
+        const lasso = opPoints(wiz.stamp);
+        stampPreview = stampPiece(photo, lasso, stampFeather(lasso));
+        const c = lassoCenter(lasso);
+        stampPlace = { dx: p[0] - c[0], dy: p[1] - c[1] };
+      }
+      return drawCrop();
+    }
     const radius = wiz.brushSize / 2 / cropGeometry().scale / tiltMatrix()[2];
     let op = null;
     if (tool === "brush") op = { color: wiz.color, radius, points: photoToSource(...p) };
     else if (tool === "rest") op = { restore: true, radius, points: photoToSource(...p) };
-    else if (tool === "blur") op = { kind: "blur", radius, points: photoToSource(...p) };
-    else if (tool === "clone" && wiz.clone) {
-      const start = photoToSource(...p);
-      if (!wiz.clone.off) wiz.clone.off = [wiz.clone.source[0] - start[0], wiz.clone.source[1] - start[1]];
-      op = { kind: "clone", radius, points: start, off: [...wiz.clone.off] };
-      wiz.clone.shift = cloneShift(op);
-    }
+    else if (tool === "blur")
+      op = {
+        kind: "blur",
+        style: wiz.blur,
+        strength: wiz.strength,
+        soft: wiz.feather,
+        radius,
+        points: photoToSource(...p),
+      };
     if (!op) return;
     ensureOwnPhoto();
-    if (tool === "blur" || tool === "clone") {
+    if (tool === "blur") {
       strokeSource = createCanvas(photo.width, photo.height);
       strokeSource.getContext("2d").drawImage(photo, 0, 0);
+      beginBlurMask();
     }
     wiz.strokes.push(op);
     pushHistory({ stroke: true });
@@ -1236,7 +1644,19 @@ cropCanvas.addEventListener(
       wiz.panY += (now[1] - old[1]) / 2;
       return drawCrop();
     }
-    if (tool === "pan" || ((tool === "fill" || tool === "recolor" || (tool === "clone" && !wiz.clone)) && !tapStart)) {
+    if (tool === "clone") {
+      const q = pointerToPhoto(e);
+      if (lassoDraft) {
+        const last = lassoDraft[lassoDraft.length - 1];
+        if (Math.hypot(q[0] - last[0], q[1] - last[1]) * cropGeometry().scale > 3) lassoDraft.push(q);
+      } else if (stampPlace) {
+        const c = lassoCenter(opPoints(wiz.stamp));
+        stampPlace.dx = q[0] - c[0];
+        stampPlace.dy = q[1] - c[1];
+      }
+      return drawCrop();
+    }
+    if (tool === "pan" || ((tool === "fill" || tool === "recolor") && !tapStart)) {
       // tap tools: a drag moves the picture instead
       wiz.panX += now[0] - old[0];
       wiz.panY += now[1] - old[1];
@@ -1264,7 +1684,7 @@ const editPointerUp = (e) => {
   editPointers.delete(e.pointerId);
   if (single) finishEdit(e);
   if (!editPointers.size) {
-    activeStroke = editDraft = tapStart = strokeSource = null;
+    activeStroke = editDraft = tapStart = strokeSource = lassoDraft = stampPlace = stampPreview = null;
     editPinch = 0;
     drawCrop();
   }
@@ -1294,13 +1714,9 @@ async function finishEdit(e) {
     editDraft = null;
     return commitEdit(op);
   }
+  if (tool === "clone") return finishStamp();
   if (!tapped) return;
   const p = pointerToPhoto(e);
-  if (tool === "clone" && !wiz.clone) {
-    if (!insidePhoto(p)) return;
-    wiz.clone = { source: photoToSource(...p), off: null, shift: [0, 0] };
-    return updateEditorUi();
-  }
   if ((tool === "fill" || tool === "recolor") && insidePhoto(p)) {
     const color = photoPixel(p);
     const op =
@@ -1312,6 +1728,59 @@ async function finishEdit(e) {
     commitEdit(op);
     setBusy(false);
   }
+}
+
+/** Stamp, finger lifted: a finished lasso becomes the source; a placed copy becomes an edit. */
+function finishStamp() {
+  if (lassoDraft) {
+    const lasso = lassoDraft.flat();
+    lassoDraft = null;
+    // a scribble with almost no area inside is no selection
+    let area = 0;
+    for (let i = 0; i < lasso.length; i += 2) {
+      const j = (i + 2) % lasso.length;
+      area += lasso[i] * lasso[j + 1] - lasso[j] * lasso[i + 1];
+    }
+    const g = cropGeometry();
+    if (Math.abs(area / 2) * g.scale * g.scale < 100) return drawCrop();
+    wiz.stamp = { points: toSourcePoints(lasso) };
+    return updateEditorUi();
+  }
+  if (stampPlace && wiz.stamp) {
+    const lasso = opPoints(wiz.stamp);
+    const c = lassoCenter(lasso);
+    const from = photoToSource(c[0], c[1]);
+    const to = photoToSource(c[0] + stampPlace.dx, c[1] + stampPlace.dy);
+    stampPlace = stampPreview = null;
+    commitEdit({
+      kind: "stamp",
+      points: wiz.stamp.points.slice(),
+      off: [to[0] - from[0], to[1] - from[1]],
+      feather: stampFeather(lasso) / tiltMatrix()[2],
+    });
+  }
+}
+
+/** Photo points [x, y, x, y, ...] in original-photo coordinates. */
+function toSourcePoints(p) {
+  const out = [];
+  for (let i = 0; i < p.length; i += 2) out.push(...photoToSource(p[i], p[i + 1]));
+  return out;
+}
+
+/** Middle of a lasso's bounding box (photo coordinates). */
+function lassoCenter(p) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < p.length; i += 2) {
+    minX = Math.min(minX, p[i]);
+    maxX = Math.max(maxX, p[i]);
+    minY = Math.min(minY, p[i + 1]);
+    maxY = Math.max(maxY, p[i + 1]);
+  }
+  return [(minX + maxX) / 2, (minY + maxY) / 2];
 }
 
 function commitEdit(op) {
@@ -1345,6 +1814,16 @@ $("#panel-crop").addEventListener("click", (e) => {
     wiz.shape = shapeBtn.dataset.shape;
     updateEditorUi();
   }
+  const outlineBtn = e.target.closest("[data-outline]");
+  if (outlineBtn) {
+    wiz.shapeOutline = outlineBtn.dataset.outline === "1";
+    updateEditorUi();
+  }
+  const blurBtn = e.target.closest("[data-blur]");
+  if (blurBtn) {
+    wiz.blur = blurBtn.dataset.blur;
+    updateEditorUi();
+  }
   if (zoomBtn) {
     const g = cropGeometry();
     if (zoomBtn.dataset.zoom === "0") {
@@ -1355,7 +1834,7 @@ $("#panel-crop").addEventListener("click", (e) => {
   }
 });
 $("#btn-clone-source").onclick = () => {
-  wiz.clone = null;
+  wiz.stamp = null;
   updateEditorUi();
 };
 $("#panel-crop").addEventListener("input", (e) => {
@@ -1366,6 +1845,14 @@ $("#panel-crop").addEventListener("input", (e) => {
   if (e.target.id === "tol") {
     e.target.previousElementSibling.textContent = e.target.value;
     wiz.tol = +e.target.value;
+  }
+  if (e.target.id === "strength") {
+    e.target.previousElementSibling.textContent = e.target.value;
+    wiz.strength = +e.target.value;
+  }
+  if (e.target.id === "feather") {
+    e.target.previousElementSibling.textContent = e.target.value;
+    wiz.feather = +e.target.value;
   }
 });
 $("#btn-edit-reset").onclick = () => {
@@ -1711,37 +2198,110 @@ $("#adjust-fit").onclick = () => {
   scheduleAdjust();
 };
 
-/** Auto enhance: stretch levels so 1% of pixels are black / white, slight contrast + saturation boost. */
+/**
+ * Auto enhance. Changes only what the picture clearly lacks, and only part of the way, so a picture that is fine
+ * stays as it is (drawn art with pure black lines and a white background is usually fine):
+ *   - levels: only if the darkest / lightest 0.5% are far from black / white;
+ *   - contrast: only for a flat, washed-out picture; brightness: only for a dark one;
+ *   - saturation: only for dull colors (not for a gray picture);
+ *   - "enhance" (clean-up of compression noise): only if there is such noise at the size the canvas will be.
+ * Every slider starts from neutral; a message says what was changed.
+ */
+function autoAdjustments() {
+  const src = sourcePixels();
+  const k = Math.min(1, 256 / Math.max(src.width, src.height));
+  const w = Math.max(1, Math.round(src.width * k));
+  const h = Math.max(1, Math.round(src.height * k));
+  const img = boxScale(src, w, h);
+  const n = w * h;
+  const hist = new Uint32Array(256);
+  let sum = 0;
+  let sum2 = 0;
+  let chroma = 0;
+  let colored = 0;
+  for (let i = 0; i < img.length; i += 4) {
+    const r = img[i];
+    const g = img[i + 1];
+    const b = img[i + 2];
+    const y = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
+    hist[y]++;
+    sum += y;
+    sum2 += y * y;
+    const hi = Math.max(r, g, b);
+    if (hi > 30) {
+      chroma += hi - Math.min(r, g, b);
+      colored++;
+    }
+  }
+  const percentile = (f) => {
+    let acc = 0;
+    for (let v = 0; v < 256; v++) if ((acc += hist[v]) >= f * n) return v;
+    return 255;
+  };
+  const mean = sum / n;
+  const spread = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+  const lo = percentile(0.005);
+  const hiLevel = percentile(0.995);
+  const a = { ...NO_ADJUST };
+  if (lo > 14) a.blk = Math.round(Math.min(20, (lo - 6) * 0.5) / 2.55);
+  if (hiLevel < 238) a.wht = Math.round(Math.max(200, 255 - (255 - hiLevel - 4) * 0.5));
+  if (spread < 45) a.con = Math.round(100 + Math.min(12, (45 - spread) * 0.6));
+  if (mean < 90) a.bri = Math.round(100 + Math.min(12, (90 - mean) * 0.25));
+  const meanChroma = colored ? chroma / colored : 0;
+  if (meanChroma > 8 && meanChroma < 45) a.sat = Math.round(100 + Math.min(15, (45 - meanChroma) * 0.5));
+  // compression noise, measured where the picture is smooth, at the size of a default canvas
+  const noise = noiseLevel(src) / Math.max(1, src.width / (Math.sqrt(DEFAULT_PIXELS * (src.width / src.height)) * 4));
+  if (noise > 3) a.enh = Math.min(4, Math.max(1, Math.round((noise - 2) * 1.2)));
+  return a;
+}
+
+/**
+ * Noise of the picture in gray levels (sigma), from a 384 px piece of its middle: the mean response of a
+ * Laplacian-like kernel where there is no edge (Immerkaer's estimate, edges left out).
+ */
+function noiseLevel(src) {
+  const size = Math.min(384, src.width - 2, src.height - 2);
+  if (size < 16) return 0;
+  const x0 = (src.width - size) >> 1;
+  const y0 = (src.height - size) >> 1;
+  const Y = (x, y) => {
+    const p = ((y0 + y) * src.width + x0 + x) * 4;
+    return 0.3 * src.data[p] + 0.59 * src.data[p + 1] + 0.11 * src.data[p + 2];
+  };
+  let total = 0;
+  let count = 0;
+  for (let y = 1; y < size - 1; y++)
+    for (let x = 1; x < size - 1; x++) {
+      const gx = Y(x + 1, y) - Y(x - 1, y);
+      const gy = Y(x, y + 1) - Y(x, y - 1);
+      if (Math.abs(gx) + Math.abs(gy) > 24) continue; // an edge, not noise
+      const lap =
+        Y(x - 1, y - 1) +
+        Y(x + 1, y - 1) +
+        Y(x - 1, y + 1) +
+        Y(x + 1, y + 1) -
+        2 * (Y(x, y - 1) + Y(x - 1, y) + Y(x + 1, y) + Y(x, y + 1)) +
+        4 * Y(x, y);
+      total += Math.abs(lap);
+      count++;
+    }
+  return count ? (Math.sqrt(Math.PI / 2) / 6) * (total / count) : 0;
+}
+
 $("#btn-auto-enhance").onclick = () => {
   snapshot();
-  const img = boxScale(sourcePixels(), 160, 160);
-  const histogram = new Uint32Array(256);
-  for (let i = 0; i < img.length; i += 4) histogram[Math.round(0.3 * img[i] + 0.59 * img[i + 1] + 0.11 * img[i + 2])]++;
-  const cut = 160 * 160 * 0.01;
-  let sum = 0;
-  let lo = 0;
-  let hi = 255;
-  for (let i = 0; i < 256; i++)
-    if ((sum += histogram[i]) > cut) {
-      lo = i;
-      break;
-    }
-  sum = 0;
-  for (let i = 255; i >= 0; i--)
-    if ((sum += histogram[i]) > cut) {
-      hi = i;
-      break;
-    }
-  Object.assign(wiz.adjust, {
-    blk: Math.min(40, Math.round(lo / 2.55)),
-    wht: Math.max(200, hi),
-    con: 108,
-    sat: 112,
-    enh: 4,
-  });
+  const before = { ...wiz.adjust };
+  wiz.adjust = autoAdjustments();
   ADJUSTMENTS.forEach(([key]) => setSlider("adj-" + key, wiz.adjust[key]));
   wiz.result = null;
   drawAdjustPreview();
+  const changed = ADJUSTMENTS.filter(([key]) => wiz.adjust[key] !== NO_ADJUST[key]).map(([key]) => {
+    const d = wiz.adjust[key] - NO_ADJUST[key];
+    return t(key).split(" (")[0].toLowerCase() + " " + (d > 0 ? "+" : "") + d;
+  });
+  toast(changed.length ? t("auto") + ": " + changed.join(", ") : t("auto_ok"));
+  if (ADJUSTMENTS.every(([key]) => before[key] === wiz.adjust[key])) history.pop(); // nothing to undo
+  $("#wiz-undo").disabled = !history.length;
 };
 
 /* ---------- step 3: pixelize ---------- */
