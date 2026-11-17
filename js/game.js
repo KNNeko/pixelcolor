@@ -16,7 +16,7 @@ import {
 import { t } from "./i18n.js";
 import { settings, saveSettings, canvasTheme, hexToPixel } from "./settings.js";
 import { saveCanvas } from "./storage.js";
-import { paletteOrder } from "./colorsort.js";
+import { paletteOrder, colorFamilies } from "./colorsort.js";
 import { renderThumbnails } from "./render.js";
 import { openPngExport } from "./export-png.js";
 import { refreshLibrary } from "./library.js";
@@ -446,10 +446,18 @@ function openAllColors() {
       .map((m) => `<button class="chip ${settings.ps === m ? "on" : ""}" data-sort="${m}">${t("s_" + m)}</button>`)
       .join("") +
     '</div><div class="all-colors">';
-  for (const k of paletteDisplayOrder()) {
-    if (game.part >= 0 && !game.partColorCount[k]) continue;
-    const [r, g, b] = [pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]];
-    html += `<button class="swatch ${remainingOf(k) ? "" : "done"}" data-color="${k + 1}" style="background:rgb(${r},${g},${b});color:${textColorFor(r, g, b)}">${k + 1}<i>${remainingOf(k) || "✓"}</i></button>`;
+  // sorted by color, every family (reds, oranges, ... grays) starts on a new line and runs dark -> light
+  const groups = settings.ps === "col" ? colorFamilies(pal) : [paletteDisplayOrder()];
+  let first = true;
+  for (const group of groups) {
+    const shown = group.filter((k) => game.part < 0 || game.partColorCount[k]);
+    if (!shown.length) continue;
+    if (!first) html += '<i class="family-gap"></i>';
+    first = false;
+    for (const k of shown) {
+      const [r, g, b] = [pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]];
+      html += `<button class="swatch ${remainingOf(k) ? "" : "done"}" data-color="${k + 1}" style="background:rgb(${r},${g},${b});color:${textColorFor(r, g, b)}">${k + 1}<i>${remainingOf(k) || "✓"}</i></button>`;
+    }
   }
   const sheet = openSheet(html + "</div>");
   sheet.onclick = (e) => {

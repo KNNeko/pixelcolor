@@ -820,6 +820,11 @@ header b {
 .all-colors .swatch {
   width: 100%;
 }
+/* break between color families: the next family starts on a new line */
+.all-colors .family-gap {
+  grid-column: 1 / -1;
+  height: 4px;
+}
 /* palette swatch with a progress ring around it */
 .swatch.with-progress {
   background: none;

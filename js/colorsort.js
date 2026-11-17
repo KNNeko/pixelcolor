@@ -1,25 +1,30 @@
 // Palette ordering for the color picker. Pure functions (tested in tests/colorsort.test.js).
 //
-// "By color" = one continuous strip through the color families in rainbow order:
-//   dark red -> light red -> (darkening) -> dark orange... -> light yellow -> ... and so on around the circle.
-// 1. Every color gets a hue angle in OKLCH (a hue scale where equal steps look equally different);
-//    the angle decides the family (red, orange/brown, yellow, green, teal, blue, purple, magenta, then pure grays).
-//    Grayish colors keep their slight tint, so a beige gray stays with the browns.
-// 2. Each family is split by saturation into rows (vivid / medium / muted), so peach and beige-gray don't alternate.
-// 3. Inside a row the order is the shortest path from its darkest to its lightest color (OKLab distance),
-//    so neighbouring colors are as similar as possible.
-// 4. Rows alternate direction (snake): up in lightness, then down, then up..., so each row starts
-//    where the previous one ended (light next to light, dark next to dark).
+// "By color" = one continuous strip through the color families in rainbow order, built so that neighbours
+// differ as little as possible:
+//   dark red -> light red -> light orange -> dark orange -> dark yellow -> ... and so on, grays last.
+// 1. Every color gets a hue angle in OKLCH (a hue scale where equal steps look equally different); the angle
+//    decides the family (red, orange/brown, yellow, green, teal, blue, purple, magenta). Colors with no usable
+//    hue (grays, near-black, near-white) form their own family.
+// 2. The borders between families are not fixed: each one slides (within limits) to where the palette has the
+//    fewest colors, so a tight group of similar colors is never cut in two.
+// 3. A family with only a couple of colors joins the family that holds its nearest color: a lone color between
+//    two big families would be a jump on both sides.
+// 4. Inside a family the order is the shortest path from its darkest to its lightest color (OKLab distance):
+//    vivid and muted shades of one hue come as separate runs instead of alternating.
+// 5. Families are chained as a snake (dark -> light, then light -> dark, ...); which way each one runs is
+//    chosen so that the jumps between families are as small as possible.
 
-/** OKLCH chroma below which a color counts as pure gray (no usable hue). */
-const GRAY_CHROMA = 0.015;
-/**
- * Each family is split by saturation (chroma / lightness) into rows: vivid >= 0.18, medium >= 0.06, muted below.
- * This keeps e.g. peach skin tones and beige-grays in separate rows instead of alternating.
- */
-export const SATURATION_TIERS = [0.18, 0.06];
-/** A row with fewer colors than this is merged into the neighbouring row of the same family. */
-const MIN_ROW = 4;
+/** OKLCH chroma below which a color counts as gray (no usable hue). */
+const GRAY_CHROMA = 0.02;
+/** Near-black and near-white colors have an unreliable hue at higher chroma too. */
+const isNeutral = (c) => c.C < GRAY_CHROMA || (c.L < 0.25 && c.C < 0.045) || (c.L > 0.94 && c.C < 0.03);
+/** A family with fewer colors than this (or than 2.5% of the palette) is merged into the family of its nearest color. */
+const MIN_FAMILY = 4;
+/** ...but only if every one of its colors has a color this close (OKLab distance) in another family. */
+const MERGE_REACH = 0.1;
+/** How far (degrees) a family border may slide from its nominal hue. */
+const BORDER_SLACK = 14;
 
 /** Color families in rainbow order: [name, hue from, hue to) in OKLCH degrees. */
 export const FAMILIES = [
@@ -55,19 +60,28 @@ export function toOklch(r, g, b) {
   return { L, C: Math.hypot(A, B), h: ((Math.atan2(B, A) * 180) / Math.PI + 360) % 360 };
 }
 
-function familyOf(c) {
-  if (c.C < GRAY_CHROMA) return FAMILIES.length; // gray family, last
-  const h = c.h < 10 ? c.h + 360 : c.h;
-  return FAMILIES.findIndex(([, from, to]) => h >= from && h < to);
-}
-
 /** Distance between two OKLab colors. */
 const labDistance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
 /**
- * Orders one row as the shortest path from its darkest color to its lightest one:
- * greedy nearest-neighbour path, then 2-opt (reverse a stretch when that shortens the path).
- * The ends stay fixed, so the row still reads dark -> light.
+ * Family borders for this palette: each nominal border moves to the emptiest hue within BORDER_SLACK degrees
+ * (colors counted in a +-6 degree window; on a tie the hue closest to the nominal border wins).
+ */
+function familyBorders(colors) {
+  const density = new Float32Array(360);
+  for (const c of colors) for (let d = -6; d <= 6; d++) density[(Math.round(c.h) + d + 720) % 360] += 1;
+  return FAMILIES.map(([, from]) => {
+    let best = from;
+    for (let d = 1; d <= BORDER_SLACK; d++)
+      for (const h of [from - d, from + d]) if (density[(h + 360) % 360] < density[(best + 360) % 360] - 1e-6) best = h;
+    return (best + 360) % 360;
+  });
+}
+
+/**
+ * Orders one family as the shortest path from its darkest color to its lightest one: greedy nearest-neighbour
+ * path, then improved by reversing stretches (2-opt) and moving single colors (or-opt) while that shortens it.
+ * The ends stay fixed, so the family still reads dark -> light.
  */
 function smoothRow(row) {
   const n = row.length;
@@ -93,6 +107,7 @@ function smoothRow(row) {
   path.push(end);
   for (let round = 0; round < 40; round++) {
     let improved = false;
+    // 2-opt: reverse path[i..j]
     for (let i = 1; i < n - 2; i++)
       for (let j = i + 1; j < n - 1; j++) {
         const before = d(path[i - 1], path[i]) + d(path[j], path[j + 1]);
@@ -102,42 +117,132 @@ function smoothRow(row) {
           improved = true;
         }
       }
+    // or-opt: take path[i] out and put it between path[j] and path[j + 1]
+    for (let i = 1; i < n - 1; i++) {
+      const saved = d(path[i - 1], path[i]) + d(path[i], path[i + 1]) - d(path[i - 1], path[i + 1]);
+      let bestGain = 1e-9;
+      let bestAt = -1;
+      for (let j = 0; j < n - 1; j++) {
+        if (j === i || j === i - 1) continue;
+        const added = d(path[j], path[i]) + d(path[i], path[j + 1]) - d(path[j], path[j + 1]);
+        if (saved - added > bestGain) {
+          bestGain = saved - added;
+          bestAt = j;
+        }
+      }
+      if (bestAt < 0) continue;
+      const [moved] = path.splice(i, 1);
+      path.splice(bestAt < i ? bestAt + 1 : bestAt, 0, moved);
+      improved = true;
+    }
     if (!improved) break;
   }
   return path.map((i) => row[i]);
 }
 
 /**
- * Colors grouped into families (rainbow order), each family split into saturation rows
- * (vivid, medium, muted); every row runs from its darkest to its lightest color. Returns arrays of palette indices.
+ * Colors grouped into families in rainbow order (grays last); every family runs from its darkest to its
+ * lightest color along the smoothest path. Returns arrays of palette indices.
  */
 export function colorFamilies(pal) {
   const K = pal.length / 3;
-  const tiers = SATURATION_TIERS.length + 1;
-  const families = Array.from({ length: FAMILIES.length + 1 }, () => Array.from({ length: tiers }, () => []));
+  const colors = [];
   for (let k = 0; k < K; k++) {
-    const c = { k, lab: toOklab(pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]) };
-    Object.assign(c, { L: c.lab[0], C: Math.hypot(c.lab[1], c.lab[2]) });
-    c.h = ((Math.atan2(c.lab[2], c.lab[1]) * 180) / Math.PI + 360) % 360;
-    const saturation = c.C / Math.max(c.L, 0.05);
-    let tier = SATURATION_TIERS.findIndex((min) => saturation >= min);
-    if (tier < 0) tier = tiers - 1;
-    families[familyOf(c)][tier].push(c);
+    const lab = toOklab(pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]);
+    const c = { k, lab, L: lab[0], C: Math.hypot(lab[1], lab[2]) };
+    c.h = ((Math.atan2(lab[2], lab[1]) * 180) / Math.PI + 360) % 360;
+    colors.push(c);
   }
-  const rows = [];
-  for (const family of families) {
-    // merge tiny rows into the neighbouring row (towards the middle tier)
-    for (let t = 0; t < tiers; t++) {
-      const row = family[t];
-      if (!row.length || row.length >= MIN_ROW) continue;
-      const target = [t + 1, t - 1, t + 2, t - 2].find((n) => n >= 0 && n < tiers && family[n].length);
-      if (target === undefined) continue;
-      family[target].push(...row);
-      family[t] = [];
+  const chromatic = colors.filter((c) => !isNeutral(c));
+  const borders = familyBorders(chromatic);
+  const families = Array.from({ length: FAMILIES.length + 1 }, () => []);
+  for (const c of colors) {
+    if (isNeutral(c)) {
+      families[FAMILIES.length].push(c);
+      continue;
     }
-    for (const row of family) if (row.length) rows.push(smoothRow(row).map((c) => c.k));
+    // the family whose border is the last one at or before this hue, going around the circle from the first border
+    const turn = (c.h - borders[0] + 360) % 360;
+    let f = 0;
+    for (let i = 1; i < borders.length; i++) if (turn >= (borders[i] - borders[0] + 360) % 360) f = i;
+    families[f].push(c);
   }
-  return rows;
+  // A tiny family joins the family that holds its nearest color, if that color is close: a few muted shades
+  // whose hue happens to fall in another family then sit among the colors they resemble. A small family of
+  // colors unlike anything else (the only green in the picture) stays where the rainbow puts it.
+  const minFamily = Math.max(MIN_FAMILY, Math.round(K * 0.025));
+  const nearestOutside = (c, own) => {
+    let best = -1;
+    let bestD = Infinity;
+    for (let f = 0; f < families.length; f++) {
+      if (f === own) continue;
+      for (const other of families[f]) {
+        const dd = labDistance(c.lab, other.lab);
+        if (dd < bestD) {
+          bestD = dd;
+          best = f;
+        }
+      }
+    }
+    return [best, bestD];
+  };
+  const settled = new Set(); // tiny families that stay
+  for (;;) {
+    let tiny = -1;
+    for (let f = 0; f < families.length; f++) {
+      const size = families[f].length;
+      if (size && size < minFamily && !settled.has(f) && (tiny < 0 || size < families[tiny].length)) tiny = f;
+    }
+    if (tiny < 0) break;
+    const moves = families[tiny].map((c) => nearestOutside(c, tiny));
+    if (moves.some(([f, d]) => f < 0 || d > MERGE_REACH)) {
+      settled.add(tiny);
+      continue;
+    }
+    families[tiny].forEach((c, n) => families[moves[n][0]].push(c));
+    families[tiny] = [];
+  }
+  return families.filter((f) => f.length).map((f) => smoothRow(f).map((c) => c.k));
+}
+
+/**
+ * Chains the families into one strip: every family runs either dark -> light or light -> dark, and the
+ * directions are chosen (exactly, by dynamic programming) so that the jumps between families add up to the least.
+ */
+function chainFamilies(pal, rows) {
+  if (rows.length < 2) return rows.flat();
+  const lab = (k) => toOklab(pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]);
+  // ends[r] = [first color, last color] of row r as stored (dark, light)
+  const ends = rows.map((row) => [lab(row[0]), lab(row[row.length - 1])]);
+  // cost[r][o]: least total jump up to row r when it runs forward (o = 0) or reversed (o = 1)
+  const cost = [[0, 0]];
+  const from = [[0, 0]];
+  for (let r = 1; r < rows.length; r++) {
+    cost.push([0, 0]);
+    from.push([0, 0]);
+    for (let o = 0; o < 2; o++) {
+      const head = ends[r][o]; // the color this row starts with
+      let best = Infinity;
+      for (let prev = 0; prev < 2; prev++) {
+        const tail = ends[r - 1][1 - prev]; // the color the previous row ends with
+        const v = cost[r - 1][prev] + labDistance(tail, head);
+        if (v < best) {
+          best = v;
+          from[r][o] = prev;
+        }
+      }
+      cost[r][o] = best;
+    }
+  }
+  const last = rows.length - 1;
+  // on a tie prefer the strip that starts dark -> light
+  let o = cost[last][1] < cost[last][0] - 1e-9 ? 1 : 0;
+  const reversed = new Array(rows.length);
+  for (let r = last; r >= 0; r--) {
+    reversed[r] = o;
+    o = from[r][o];
+  }
+  return rows.flatMap((row, r) => (reversed[r] ? [...row].reverse() : row));
 }
 
 /**
@@ -148,8 +253,6 @@ export function paletteOrder(pal, mode, counts) {
   const K = pal.length / 3;
   const order = [...Array(K).keys()];
   if (mode === "cnt") return order.sort((i, j) => counts[j] - counts[i] || i - j);
-  // snake: odd rows are reversed, so the strip goes dark -> light, light -> dark, dark -> light...
-  // and every row meets the next one at the same lightness (no jump)
-  if (mode === "col") return colorFamilies(pal).flatMap((row, i) => (i % 2 ? [...row].reverse() : row));
+  if (mode === "col") return chainFamilies(pal, colorFamilies(pal));
   return order;
 }

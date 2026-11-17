@@ -79,7 +79,7 @@ test("grayish colors stay next to their family, pure grays go last", () => {
   assert.deepEqual(colorFamilies(pal), [[1, 2], [4], [3, 0]]);
 });
 
-test("peach skin tones and beige-grays get separate rows", () => {
+test("vivid and muted shades of one hue come in runs instead of alternating", () => {
   const peach = [
     [200, 125, 75],
     [215, 145, 95],
@@ -93,11 +93,16 @@ test("peach skin tones and beige-grays get separate rows", () => {
     [225, 215, 200],
   ];
   const pal = makePalette(shuffle([...peach, ...beige]));
-  const rows = colorFamilies(pal).map((row) => row.map((k) => rgb(pal, k)));
-  assert.deepEqual(rows, [peach.map((c) => c.join()), beige.map((c) => c.join())]);
+  const isPeach = (k) => peach.some((c) => c.join() === rgb(pal, k));
+  const order = paletteOrder(pal, "col", []);
+  const byLightness = [...order].sort(
+    (a, b) => toOklab(...rgb(pal, a).split(",").map(Number))[0] - toOklab(...rgb(pal, b).split(",").map(Number))[0],
+  );
+  const switches = (seq) => seq.slice(1).filter((k, i) => isPeach(k) !== isPeach(seq[i])).length;
+  assert.ok(switches(order) < switches(byLightness), `${switches(order)} vs ${switches(byLightness)}`);
 });
 
-test("by color is a snake: rows alternate dark->light and light->dark", () => {
+test("by color is a snake: neighbouring families meet at the same end (dark with dark or light with light)", () => {
   const reds = [
     [100, 0, 20],
     [150, 20, 40],
@@ -112,7 +117,41 @@ test("by color is a snake: rows alternate dark->light and light->dark", () => {
   ];
   const pal = makePalette(shuffle([...reds, ...blues]));
   const out = paletteOrder(pal, "col", []).map((k) => rgb(pal, k));
-  assert.deepEqual(out, [...reds.map((c) => c.join()), ...[...blues].reverse().map((c) => c.join())]);
+  const text = (list) => list.map((c) => c.join());
+  const meetLight = [...text(reds), ...text(blues).reverse()];
+  const meetDark = [...text(reds).reverse(), ...text(blues)];
+  assert.ok([meetLight.join(";"), meetDark.join(";")].includes(out.join(";")), out.join(";"));
+});
+
+test("families are turned so that the jumps between them are as small as possible", () => {
+  // dark reds only, then light blues only: whichever way the reds run, the blues must start at the nearer end
+  const pal = makePalette([
+    [90, 0, 10],
+    [120, 10, 20],
+    [150, 20, 30],
+    [170, 30, 40],
+    [150, 180, 250],
+    [170, 200, 252],
+    [190, 215, 253],
+    [210, 230, 255],
+  ]);
+  const order = paletteOrder(pal, "col", []);
+  const L = order.map((k) => toOklab(pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2])[0]);
+  assert.deepEqual(
+    L,
+    [...L].sort((x, y) => x - y),
+  ); // dark red ... light red, then the darkest blue first
+});
+
+test("a small family of muted colors joins the family of its nearest colors; a lone distinct color stays", () => {
+  const browns = Array.from({ length: 60 }, (_, i) => [70 + i * 3, 45 + i * 2.6, 30 + i * 2.2]);
+  const nearlyBrown = [[150, 140, 100]]; // yellowish by hue, but it looks like the browns
+  const green = [[20, 200, 60]];
+  const pal = makePalette([...browns, ...nearlyBrown, ...green]);
+  const rows = colorFamilies(pal);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[1], [61]); // the green alone
+  assert.ok(rows[0].includes(60));
 });
 
 test("paletteOrder modes", () => {
