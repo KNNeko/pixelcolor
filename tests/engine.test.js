@@ -192,7 +192,8 @@ test("pickCellColors keeps a thin dark line as an unbroken one-cell line", () =>
   const out = pickCellColors(src.data, 6, 6, 4);
   for (let y = 0; y < 6; y++) {
     const dark = [];
-    for (let x = 0; x < 6; x++) if (out[(y * 6 + x) * 4] < 60) dark.push(x);
+    // (half a cell wide: drawn lighter than its ink, see the next test, but clearly a line)
+    for (let x = 0; x < 6; x++) if (out[(y * 6 + x) * 4] < 160) dark.push(x);
     assert.equal(dark.length, 1, `row ${y}: ${dark}`);
     assert.ok(dark[0] === 2 || dark[0] === 3);
   }
@@ -204,15 +205,25 @@ test("pickCellColors averages a soft gradient instead of picking a side", () => 
   for (let x = 0; x < 4; x++) assert.ok(Math.abs(out[x * 4] - (x * 4 + 1.5) * 16) <= 4, `cell ${x}: ${out[x * 4]}`);
 });
 
-test("pickCellColors: a thin line gets its ink color, not a blend with the paper", () => {
-  // 4 sub-samples per cell side; a dark red line one sample wide plus a half-tone rim on each side
-  const src = image(40, 40, (x) =>
+test("pickCellColors: a thin line is drawn lighter than its ink, by how little of its cells it covers", () => {
+  // 4 sub-samples per cell side; a dark red line one sample wide plus a half-tone rim on each side: it darkens
+  // its cells about half way. Drawn as a full cell of ink it looked far heavier than in the picture.
+  const line = image(40, 40, (x) =>
     x === 18 ? [60, 20, 20] : x === 17 || x === 19 ? [150, 120, 110] : [240, 220, 200],
   );
-  const out = pickCellColors(src.data, 10, 10, 4);
+  const out = pickCellColors(line.data, 10, 10, 4);
   for (let y = 2; y < 8; y++) {
     const i = (y * 10 + 4) * 4;
-    assert.ok(out[i] < 85 && out[i + 1] < 45, `cell 4,${y}: ${out[i]},${out[i + 1]},${out[i + 2]}`);
+    const [r, g, b] = [out[i], out[i + 1], out[i + 2]];
+    assert.ok(r > 85 && r < 160, `cell 4,${y}: ${r},${g},${b} (between ink and paper)`);
+    assert.ok(r - g > 25 && r - b > 25, `cell 4,${y}: ${r},${g},${b} (still red)`);
+  }
+  // a line as wide as a cell keeps its full ink
+  const wide = image(40, 40, (x) => (x >= 16 && x < 20 ? [60, 20, 20] : [240, 220, 200]));
+  const full = pickCellColors(wide.data, 10, 10, 4);
+  for (let y = 2; y < 8; y++) {
+    const i = (y * 10 + 4) * 4;
+    assert.ok(full[i] < 85 && full[i + 1] < 45, `wide line, cell 4,${y}: ${full[i]},${full[i + 1]}`);
   }
 });
 
@@ -358,7 +369,8 @@ test("pickCellColors: a thin slanted anti-aliased line becomes one unbroken one-
     return [v(250, 30), v(225, 20), v(210, 25)];
   });
   const out = pickCellColors(src.data, W, H, k);
-  const dark = (x, y) => out[(y * W + x) * 4] < 120;
+  // (1.5 samples of 4 wide: drawn lighter than its ink, but well apart from the skin)
+  const dark = (x, y) => out[(y * W + x) * 4] < 170;
   for (let y = 1; y < H - 1; y++) {
     const row = [];
     for (let x = 0; x < W; x++) if (dark(x, y)) row.push(x);
@@ -373,12 +385,12 @@ test("pickCellColors: a thin slanted anti-aliased line becomes one unbroken one-
   }
   // the line keeps one color along its length (no paler cells where it only grazes a cell)
   const reds = [];
-  for (let i = 0; i < W * H; i++) if (out[i * 4] < 120) reds.push(out[i * 4]);
+  for (let i = 0; i < W * H; i++) if (out[i * 4] < 170) reds.push(out[i * 4]);
   assert.ok(Math.max(...reds) - Math.min(...reds) <= 25, `line colors ${Math.min(...reds)}..${Math.max(...reds)}`);
   // cells beside the line keep the skin color: no half-line shades
   for (let i = 0; i < W * H; i++) {
     const r = out[i * 4];
-    assert.ok(r < 120 || r > 235, `cell ${i % W},${(i / W) | 0}: ${r}`);
+    assert.ok(r < 170 || r > 235, `cell ${i % W},${(i / W) | 0}: ${r}`);
   }
 });
 
@@ -536,4 +548,26 @@ test("removeSpecks: a lone cell merges a little more readily than a bigger speck
   idx[4 * W + 4] = idx[4 * W + 5] = 1;
   removeSpecks(idx, W, H, 2, pal, 5.4, null, 5.4 * 1.8);
   assert.equal(idx[4 * W + 4], 1);
+});
+
+test("black-and-white pictures: exact grays, and enough of them for smooth shading", async () => {
+  // soft gray shading with faint JPEG-like tints
+  const src = image(150, 150, (x, y) => {
+    const v = Math.round(30 + x * 1.3 + y * 0.2);
+    return [v + (x % 3) - 1, v, v + ((x + y) % 3) - 1];
+  });
+  const params = { width: 150, height: 150, colors: 32, style: "art", clean: 3 };
+  const r = await generate(src, params, NO_ADJUST);
+  for (let k = 0; k < r.pal.length / 3; k++) {
+    const [red, green, blue] = r.pal.slice(k * 3, k * 3 + 3);
+    assert.ok(red === green && green === blue, `color ${k}: ${red},${green},${blue}`);
+  }
+  // the same shading in color needs fewer: on one line of grays, bands show sooner
+  const auto = await suggestColorCount(src, params, NO_ADJUST);
+  const tinted = image(150, 150, (x, y) => {
+    const v = Math.round(30 + x * 1.3 + y * 0.2);
+    return [Math.min(255, v + 40), v, Math.max(0, v - 30)];
+  });
+  const autoColor = await suggestColorCount(tinted, params, NO_ADJUST);
+  assert.ok(auto >= 40 && auto > autoColor, `gray: ${auto}, warm: ${autoColor}`);
 });

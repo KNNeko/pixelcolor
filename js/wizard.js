@@ -273,9 +273,11 @@ function applyState(st) {
   setSlider("colors", p.colors);
   $("#colors-exact").value = p.colors;
   wiz.colorsSet = true; // a canvas made again keeps its number of colors
+  wiz.autoColors = false;
   setSlider("clean", p.clean);
   wiz.style = p.style;
   wiz.sized = true;
+  wiz.sizedRatio = cropRatio();
 }
 
 /** The (rotated-before) photo as a JPEG of at most 12 MP, and the factor it was scaled by. */
@@ -328,21 +330,48 @@ function goToStep(n) {
       $("#px-width").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS * r)));
       $("#px-height").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS / r)));
       wiz.sized = true;
+      wiz.sizedRatio = r;
+    } else if (Math.abs(cropRatio() / wiz.sizedRatio - 1) > 1e-3) {
+      // the frame's proportions changed since (a square instead of the photo's own ones): with "keep
+      // proportions" on, the same number of cells in the new ones, not the picture squeezed into the old ones
+      const r = cropRatio();
+      wiz.sizedRatio = r;
+      const n = clampSize($("#px-width").value) * clampSize($("#px-height").value);
+      const W = clampSize(Math.sqrt(n * r));
+      const H = clampSize(n / W);
+      if (
+        $("#keep-ratio").checked &&
+        (Math.abs(W - $("#px-width").value) > 1 || Math.abs(H - $("#px-height").value) > 1)
+      ) {
+        $("#px-width").value = W;
+        $("#px-height").value = H;
+      }
     }
     syncPixelCount();
     applyPreviewZoom();
     renderStyleList();
-    if (wiz.colorsSet) runPreview();
-    else {
-      // a new picture: "Auto colors" runs by itself the first time (after a rough draft to look at on a big
-      // canvas); from then on the number is the user's, the button recounts it
+    if (!wiz.colorsSet) {
+      // a new picture: the number of colors is "Auto colors" (see autoKey) until the user sets one
       wiz.colorsSet = true;
+      wiz.autoColors = true;
+    }
+    if (wiz.autoColors && autoKey(pixelParams()) !== wiz.autoKey) {
+      // first time here, or the picture changed since the count (the crop, an edit, an adjustment): count it
+      // again, after a rough draft to look at on a big canvas
       const p = pixelParams();
       if (p.width * p.height >= DRAFT_FROM) runDraft(() => autoColors(true));
       else autoColors(true);
-    }
+    } else runPreview();
   }
 }
+
+/*
+ * "Auto colors" follows the picture: while the number of colors is its count (wiz.autoColors: from a new
+ * picture's first visit to this step, or the button, until the user moves the colors slider or types a
+ * number), a change of size, style or cleanliness, or of the picture itself, counts it again. autoKey: what
+ * the count depends on; wiz.autoKey: what it was counted for.
+ */
+const autoKey = (p) => JSON.stringify([exceptColors(p), wiz.rect, wiz.editVersion, wiz.adjust]);
 
 $("#wiz-back").onclick = () => {
   if (wiz.step > 1) return goToStep(wiz.step - 1);
@@ -2783,6 +2812,7 @@ $("#panel-pixel").addEventListener("input", (e) => {
     setPixelCount(+el.value);
     return schedulePreview();
   }
+  if (el.id === "colors-exact" || el.id === "colors") wiz.autoColors = false; // the user's own number now
   if (el.id === "colors-exact") {
     const n = Math.round(+el.value);
     if (n >= 2) setSlider("colors", Math.min(1000, n));
@@ -2809,23 +2839,28 @@ const DRAFT_CELLS = 20000;
 const DRAFT_COLORS = 48; // enough for a rough look, and a small palette is quick to find
 let draftTimer = 0;
 let draftAt = 0;
+let previewSeq = 0; // counts schedulePreview calls: a draft started before the last one leaves the rest to it
 let shownParams = null; // params of the last full preview
 const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean]);
 
 function schedulePreview() {
+  previewSeq++;
   clearTimeout(previewTimer);
   clearTimeout(draftTimer);
   const p = pixelParams();
   const onlyColors = shownParams && exceptColors(p) === exceptColors(shownParams);
+  // the colors follow "Auto colors" (see autoKey): the real preview comes after counting them again
+  const next = wiz.autoColors && autoKey(p) !== wiz.autoKey ? () => autoColors(true) : runPreview;
   if (!onlyColors && p.width * p.height >= DRAFT_FROM) {
-    draftTimer = setTimeout(() => runDraft(), Math.max(0, 250 - (performance.now() - draftAt)));
+    draftTimer = setTimeout(() => runDraft(next), Math.max(0, 250 - (performance.now() - draftAt)));
     return;
   }
-  previewTimer = setTimeout(runPreview, p.width * p.height > 1e6 ? 900 : 450);
+  previewTimer = setTimeout(next, p.width * p.height > 1e6 ? 900 : 450);
 }
 
 async function runDraft(next = runPreview) {
   if (wiz.step !== 3 || wiz.creating) return;
+  const seq = previewSeq;
   draftAt = performance.now();
   const p = pixelParams();
   const f = Math.sqrt(DRAFT_CELLS / (p.width * p.height));
@@ -2841,8 +2876,8 @@ async function runDraft(next = runPreview) {
   }
   if (!result) return; // a newer draft or preview took over
   drawCells(result);
-  // the real one right after it (a slider moving again cancels it)
-  previewTimer = setTimeout(next, 30);
+  // the real one right after it, unless something changed meanwhile (then what that planned comes instead)
+  if (seq === previewSeq) previewTimer = setTimeout(next, 30);
 }
 
 /* ---------- worker client ---------- */
@@ -3014,14 +3049,19 @@ $("#btn-auto-colors").onclick = () => autoColors(false);
  * the user changes meanwhile simply takes over (its preview replaces this job in the worker).
  */
 async function autoColors(quiet) {
+  if (quiet && !wiz.autoColors) return; // the user set a number of their own since this was planned
+  wiz.autoColors = true; // (the button: follow the size again from now on)
   const label = t("autoc");
   const status = (text) => (quiet ? ($("#preview-info").textContent = text) : setBusyText(text));
   if (quiet) status(label + "…");
   else setBusy(true, label);
+  const p = pixelParams();
   try {
-    const best = await runJob("suggest", pixelParams(), (mid) => status(label + " · " + mid));
+    const best = await runJob("suggest", p, (mid) => status(label + " · " + mid));
     if (!quiet) setBusy(false);
-    if (best == null) return; // replaced by a newer job
+    // replaced by a newer job, or the user set a number of their own meanwhile
+    if (best == null || !wiz.autoColors) return;
+    wiz.autoKey = autoKey(p);
     setSlider("colors", best);
     if (!quiet) toast(label + ": " + best);
     runPreview();

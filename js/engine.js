@@ -369,6 +369,12 @@ const LINE_CORE = 0.5;
 const LONE_DOT_CONTRAST = 60;
 /** A line's color comes from its samples that stand out at least this share of its strongest one. */
 const LINE_INK = 0.7;
+/**
+ * How a thin dark line's weight follows how much of its cells it covers (see rasterizeThinLines): its color is
+ * background + (ink - background) * coverage^LINE_WEIGHT. 1 would copy the plain average (a thin line all but
+ * disappears), 0 the full ink (what was done before: thin lines looked far heavier than in the picture).
+ */
+const LINE_WEIGHT = 0.6;
 /** Lines of at most this many cells (dots, short dashes: a pupil, a highlight) never give way to another line. */
 const SHORT_LINE = 3;
 
@@ -958,7 +964,110 @@ function rasterizeThinLines(rgba, W, H, k) {
     color[c * 3 + 1] = gg / wt;
     color[c * 3 + 2] = b / wt;
   }
+  lightenThinLines(rgba, W, H, k, kind, color, near, lineOf[1]);
   return { kind, color, texture, type, near };
+}
+
+/**
+ * Thin dark lines drawn as full one-cell lines of their ink look much heavier than in the picture, where a line
+ * a third of a cell wide darkens its cells only a little ("contours stand out too much on arts with thin
+ * lines"). So a dark line cell's color moves from the ink towards the background around it, the more the
+ * thinner the line: by coverage^LINE_WEIGHT of the way, where coverage is how far the cell's plain average
+ * got from that background towards the ink, averaged along the line (one line, one weight: no flicker).
+ * Lines a cell wide or more stay ink; so do short dark marks (a pupil, a mole: lines of at most SHORT_LINE
+ * cells) and light lines (highlights).
+ */
+function lightenThinLines(rgba, W, H, k, kind, color, near, lineOf) {
+  const w = W * k;
+  const cells = W * H;
+  // per cell: the plain average of its samples, and the average of its samples away from any line
+  const all = new Float32Array(cells * 3);
+  const bg = new Float32Array(cells * 4);
+  // only dark line cells and the cells around them are needed
+  const needed = new Uint8Array(cells);
+  for (let c = 0; c < cells; c++) {
+    if (kind[c] !== 1) continue;
+    const x = c % W;
+    const y = (c - x) / W;
+    for (let yy = Math.max(0, y - 1); yy <= Math.min(H - 1, y + 1); yy++)
+      for (let xx = Math.max(0, x - 1); xx <= Math.min(W - 1, x + 1); xx++) needed[yy * W + xx] = 1;
+  }
+  for (let y = 0; y < H * k; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const c = ((y / k) | 0) * W + ((x / k) | 0);
+      if (!needed[c]) continue;
+      for (let j = 0; j < 3; j++) all[c * 3 + j] += rgba[i * 4 + j];
+      if (near[i]) continue;
+      for (let j = 0; j < 3; j++) bg[c * 4 + j] += rgba[i * 4 + j];
+      bg[c * 4 + 3]++;
+    }
+  const n = k * k;
+  // the lines' sizes (short marks keep their ink)
+  const size = new Map();
+  for (let c = 0; c < cells; c++)
+    if (kind[c] === 1 && lineOf[c] >= 0) size.set(lineOf[c], (size.get(lineOf[c]) || 0) + 1);
+  const coverage = new Float32Array(cells).fill(-1);
+  const back = new Float32Array(cells * 3);
+  for (let c = 0; c < cells; c++) {
+    if (kind[c] !== 1) continue;
+    const x = c % W;
+    const y = (c - x) / W;
+    // background: the cell's own samples away from the line, else those of the cells around
+    let br = 0;
+    let bgg = 0;
+    let bb = 0;
+    let bn = bg[c * 4 + 3];
+    if (bn) {
+      br = bg[c * 4];
+      bgg = bg[c * 4 + 1];
+      bb = bg[c * 4 + 2];
+    } else
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const j = yy * W + xx;
+          if (kind[j] === 1) continue;
+          br += bg[j * 4];
+          bgg += bg[j * 4 + 1];
+          bb += bg[j * 4 + 2];
+          bn += bg[j * 4 + 3];
+        }
+    if (!bn) continue; // a dense tangle of lines: keep the ink
+    back[c * 3] = br / bn;
+    back[c * 3 + 1] = bgg / bn;
+    back[c * 3 + 2] = bb / bn;
+    const dr = back[c * 3] - color[c * 3];
+    const dg = back[c * 3 + 1] - color[c * 3 + 1];
+    const db = back[c * 3 + 2] - color[c * 3 + 2];
+    const span = dr * dr + dg * dg + db * db;
+    if (span < 1) continue;
+    const ar = back[c * 3] - all[c * 3] / n;
+    const ag = back[c * 3 + 1] - all[c * 3 + 1] / n;
+    const ab = back[c * 3 + 2] - all[c * 3 + 2] / n;
+    coverage[c] = Math.max(0, Math.min(1, (ar * dr + ag * dg + ab * db) / span));
+  }
+  for (let c = 0; c < cells; c++) {
+    if (coverage[c] < 0 || !(size.get(lineOf[c]) > SHORT_LINE)) continue;
+    const x = c % W;
+    const y = (c - x) / W;
+    let sum = 0;
+    let m = 0;
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx;
+        const yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const j = yy * W + xx;
+        if (coverage[j] < 0 || lineOf[j] !== lineOf[c]) continue;
+        sum += coverage[j];
+        m++;
+      }
+    const weight = Math.pow(sum / m, LINE_WEIGHT);
+    for (let j = 0; j < 3; j++) color[c * 3 + j] = back[c * 3 + j] + (color[c * 3 + j] - back[c * 3 + j]) * weight;
+  }
 }
 
 /**
@@ -1378,10 +1487,10 @@ function keptCells(lines, focus, N) {
  * sample.weight is optional (all 1 without it).
  * Returns { palette: RGB Float32Array (averaged in RGB so colors don't drift), error: mean Lab distance }.
  */
-export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
+export async function kmeansFit(sample, K, iterations, hooks = noHooks, seed = 7) {
   const { lab: pts, rgb, count: S } = sample;
   const weight = sample.weight || new Float32Array(S).fill(1);
-  const random = makeRandom(7);
+  const random = makeRandom(seed);
   const centers = new Float32Array(K * 3);
   const nearestDist = new Float32Array(S).fill(1e12);
   const seedIndex = new Int32Array(K);
@@ -1987,9 +2096,11 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const K = Math.max(1, Math.min(p.colors, W * H));
   const pal = await kmeansPalette(rgba, W * H, K, hooks, rgba.focus);
   if (!pal) return null;
+  const gray = isGrayPicture(rgba, W * H);
+  if (gray) grayPalette(pal, K);
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
-  if (!dither) rescueRareColors(rgba, W * H, pal, K, idx, rgba.focus);
+  if (!dither && rescueRareColors(rgba, W * H, pal, K, idx, rgba.focus) && gray) grayPalette(pal, K);
   if (rgba.ink) unifyLines(idx, rgba, W, H, pal, K, rgba.ink, rgba.focus);
   if (!dither && clean > 0) {
     settle(idx, rgba, W, H, pal, K, clean, lines, smooth);
@@ -2003,6 +2114,43 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0, rgba.focus);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
+}
+
+/*
+ * Black-and-white pictures. Their shades lie on one line (dark to light), and there a palette of K grays has
+ * steps of about 100/K in lightness: at the error "Auto colors" accepts for color pictures that is ~3 ΔE a
+ * step, plain bands on a face. So a picture whose cells are nearly all gray (GRAY_SHARE of them within
+ * GRAY_SPREAD levels between their channels) gets AUTO_LOW_GRAY as its lower limit instead of AUTO_LOW (and
+ * half of AUTO_EXACT), and its gray palette colors are made exactly gray (JPEG leaves faint tints: two
+ * numbers that look the same).
+ * Colored bits in it (a red stamp) keep their color.
+ */
+const GRAY_SPREAD = 8;
+const GRAY_SHARE = 0.98;
+const AUTO_LOW_GRAY = 0.35;
+
+/** True if nearly every cell of the w x h cell image is gray (see above). */
+export function isGrayPicture(rgba, N) {
+  let gray = 0;
+  for (let i = 0; i < N; i++) {
+    const r = rgba[i * 4];
+    const g = rgba[i * 4 + 1];
+    const b = rgba[i * 4 + 2];
+    if (Math.max(r, g, b) - Math.min(r, g, b) <= GRAY_SPREAD) gray++;
+  }
+  return gray >= GRAY_SHARE * N;
+}
+
+/** Makes the gray-ish colors of a palette exactly gray (black-and-white pictures, see above). */
+function grayPalette(pal, K) {
+  for (let k = 0; k < K; k++) {
+    const r = pal[k * 3];
+    const g = pal[k * 3 + 1];
+    const b = pal[k * 3 + 2];
+    if (Math.max(r, g, b) - Math.min(r, g, b) > GRAY_SPREAD + 2) continue;
+    const v = Math.round((r + g + b) / 3);
+    pal[k * 3] = pal[k * 3 + 1] = pal[k * 3 + 2] = v;
+  }
 }
 
 /*
@@ -2264,13 +2412,16 @@ export function rescueRareColors(rgba, N, pal, K, idx, focus = null) {
  * gets about 150-280 colors, a sketch or flat art 70-200, a photo 200-450): a picture whose error drops fast
  * with more colors stops early, a rich one goes on, up to AUTO_MAX. A picture that is already exact with a few
  * colors (AUTO_EXACT) takes just those.
+ * "What 16 colors leave" is the best of AUTO_REF_FITS palettes (from different starts, more iterations): one
+ * quick fit lands better or worse by chance, by up to 10 %, and the count moved with it by a quarter, so that
+ * the counts for two nearly equal canvas sizes could differ by 60 colors.
  * And no visible color may go missing: at most AUTO_LOST of the (visibility-weighted) cells may end up farther
  * than AUTO_LOST_DE from every palette color. That keeps small areas of their own color (skin in a picture
  * that is mostly white background, eyes, a red badge) that the average would hardly notice.
  */
 const AUTO_SEEN = 3;
 const AUTO_FLAT = 0.7;
-const AUTO_SHARE = 0.3;
+const AUTO_SHARE = 0.32;
 const AUTO_LOW = 0.7;
 const AUTO_HIGH = 1.5;
 const AUTO_EXACT = 0.4;
@@ -2278,6 +2429,7 @@ const AUTO_LOST_DE = 8;
 const AUTO_LOST = 0.004;
 const AUTO_MAX = 600;
 const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240, 300, 400, 500, 600];
+const AUTO_REF_FITS = 5;
 
 /**
  * How much each sampled cell's color error shows. seen: 1 in a smooth area, towards 0 in texture and on edges;
@@ -2372,6 +2524,7 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
   const count = Math.min(N, 10000);
   const sample = paletteSample(rgba, N, count, 1);
   const { seen, bands } = visibility(rgba, W, H, sample.cells);
+  const gray = isGrayPicture(rgba, N); // black and white: stricter (see AUTO_LOW_GRAY)
   const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
   let target = 0;
   let prevK = 0;
@@ -2386,11 +2539,20 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     if (!fit) throw new Error("cancelled");
     const { error, lost } = visibleError(sample, fit.palette, K, seen, bands);
     if (lost <= AUTO_LOST && !complete) complete = K;
-    if (error <= AUTO_EXACT && complete) {
+    if (error <= (gray ? AUTO_EXACT / 2 : AUTO_EXACT) && complete) {
       found = K; // a picture of a few flat colors
       break;
     }
-    if (K === 16) target = Math.max(AUTO_LOW, Math.min(AUTO_HIGH, AUTO_SHARE * error));
+    if (K === 16) {
+      // what 16 colors leave: the best of a few fits (see AUTO_REF_FITS)
+      let best = error;
+      for (let r = 1; r <= AUTO_REF_FITS; r++) {
+        const more = await kmeansFit(sample, K, 8, hooks, 7 + 101 * r);
+        if (!more) throw new Error("cancelled");
+        best = Math.min(best, visibleError(sample, more.palette, K, seen, bands).error);
+      }
+      target = Math.max(gray ? AUTO_LOW_GRAY : AUTO_LOW, Math.min(AUTO_HIGH, AUTO_SHARE * best));
+    }
     if (target && error <= target && !enough) {
       // between the last two steps, where the error (on log scales) crosses the target
       const t = prevError > error ? Math.log(prevError / target) / Math.log(prevError / error) : 1;
