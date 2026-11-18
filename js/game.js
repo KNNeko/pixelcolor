@@ -508,14 +508,17 @@ function scrollPaletteTo(btn, behavior = "smooth") {
   strip.scrollTo({ left: btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2, behavior });
 }
 
-/** Selects color number n (1-based, 0 = none). With highlighting on, only the two affected colors are redrawn. */
-export function selectColor(n) {
+/**
+ * Selects color number n (1-based, 0 = none). With highlighting on, only the two affected colors are redrawn.
+ * scroll: how the palette strip moves to it ("instant" for a color picked on the picture: no lag to watch).
+ */
+export function selectColor(n, scroll = "smooth") {
   const previous = game.selected;
   game.selected = n;
   if (previous) updateSwatch(previous - 1);
   if (n) {
     updateSwatch(n - 1);
-    scrollPaletteTo(swatches[n - 1]);
+    scrollPaletteTo(swatches[n - 1], scroll);
   }
   if (settings.hl && previous !== n) {
     if (game.useGl)
@@ -567,12 +570,15 @@ function openAllColors() {
   };
 }
 
-/** Selects the next unfinished color in display order. */
+/**
+ * Selects the next unfinished color by number (after the finished one, then from 1 again), in the part being
+ * colored if any. By number whatever the strip's sorting: by color or by count it looked random.
+ */
 function selectNextColor() {
-  const order = paletteDisplayOrder();
-  const from = Math.max(0, order.indexOf(game.selected - 1));
-  for (let step = 1; step <= order.length; step++) {
-    const k = order[(from + step) % order.length];
+  const K = colorCount();
+  const from = Math.max(0, game.selected - 1);
+  for (let step = 1; step <= K; step++) {
+    const k = (from + step) % K;
     if (remainingOf(k) > 0 && (game.part < 0 || game.partColorCount[k])) return selectColor(k + 1);
   }
 }
@@ -619,11 +625,15 @@ function putCell(i, v) {
   game.buffer.set(i, cellPixel(i));
 }
 
+/** A new paint action: the cells, their new values, and what they had before (to take a tap back). */
+const newStroke = () => ({ cells: [], values: [], old: [] });
+
 /** Paints a cell as part of the current action (recorded for saving and the time-lapse). */
 function paintCell(i, v) {
   if (!inCurrentPart(i) || game.paint[i] === v) return;
   game.stroke.cells.push(i);
   game.stroke.values.push(v);
+  game.stroke.old.push(game.paint[i]);
   putCell(i, v);
 }
 
@@ -631,7 +641,9 @@ function paintCell(i, v) {
 export function commitStroke() {
   const s = game.stroke;
   if (s && s.cells.length) {
-    game.events.push({ cells: Int32Array.from(s.cells), values: Uint16Array.from(s.values) });
+    const event = { cells: Int32Array.from(s.cells), values: Uint16Array.from(s.values) };
+    game.events.push(event);
+    game.lastStroke = { event, old: Uint16Array.from(s.old) };
     game.unsaved = game.thumbsStale = true;
     countPaintingDay();
   }
@@ -794,7 +806,7 @@ function wandFill(i) {
 function tapCell([x, y]) {
   const W = game.canvas.width;
   const i = y * W + x;
-  game.stroke = { cells: [], values: [] };
+  game.stroke = newStroke();
   if (game.tool === "bucket") bucketFill(i);
   else if (game.tool === "wand") wandFill(i);
   // Record the fill nearest-first, so the time-lapse shows it spreading in a circle from the tap.
@@ -811,13 +823,16 @@ function tapCell([x, y]) {
     keys.sort();
     const cells = new Array(count);
     const values = new Array(count);
+    const old = new Array(count);
     for (let m = 0; m < count; m++) {
       const k = keys[m] % 16777216;
       cells[m] = s.cells[k];
       values[m] = s.values[k];
+      old[m] = s.old[k];
     }
     s.cells = cells;
     s.values = values;
+    s.old = old;
   }
   commitStroke();
 }
@@ -1382,6 +1397,7 @@ const input = {
   lastTapTime: -1e9, // first tap of a possible double tap: event time, place, cell
   lastTapAt: [0, 0],
   lastTapCell: -1,
+  lastTapEvent: null, // the paint action of that tap, if it painted something
   doubleTap: false, // this touch is the second tap of a double tap
 };
 /**
@@ -1511,10 +1527,13 @@ playCanvas.addEventListener("pointerdown", (e) => {
   const start = brushActive() ? strokeCell(e.offsetX, e.offsetY) : null;
   if (!input.panning && brushActive() && !brushCanStartAt(start)) input.panning = true;
   if (!input.panning && brushActive()) {
-    if (!game.stroke) game.stroke = { cells: [], values: [] }; // after a double tap: one action with its cell
-    input.lastCell = start;
-    stampBrush(start);
-    drawNow();
+    if (!game.stroke) game.stroke = newStroke(); // after a double tap: one action with its cell
+    // after a double tap only its own cell is painted: the finger paints on once it really moves (pointermove)
+    input.lastCell = input.doubleTap ? null : start;
+    if (!input.doubleTap) {
+      stampBrush(start);
+      drawNow();
+    }
   } else if (input.doubleTap && !(brushActive() && !settings.slide)) commitStroke();
   // (brush without sliding: the double tap's cell joins the stamp this tap makes when the finger lifts)
 });
@@ -1522,7 +1541,10 @@ playCanvas.addEventListener("pointerdown", (e) => {
 /**
  * Double tap: picks the number of the first tap's cell and paints that cell (brush, bucket, wand; not the hand
  * or the eraser). It acts as soon as the second tap touches, like Android's own double tap, so it feels
- * instant; the finger may then keep going (brush: paints on with the new color). Leaves game.stroke open.
+ * instant; the finger may then keep going (brush: paints on with the new color once it moves past TAP_SLOP).
+ * Only that one cell is painted: what the first tap painted somewhere else (aim assist puts a tap on a cell
+ * of the selected color next to the finger) is taken back. A cell that is already done, or outside the part
+ * being colored, picks nothing. Leaves game.stroke open.
  */
 function doubleTapDown(e) {
   if (!settings.dbl || !DOUBLE_TAP_TOOLS.includes(game.tool)) return false;
@@ -1536,11 +1558,35 @@ function doubleTapDown(e) {
   // the cell of the first tap: at small zoom the two taps often hit neighbouring cells
   const i = input.lastTapCell;
   const number = game.canvas.target[i] + 1;
-  selectColor(number);
-  game.stroke = { cells: [], values: [] };
+  if (game.paint[i] === number || !inCurrentPart(i)) return false;
+  const first = input.lastTapEvent;
+  if (first && !first.cells.includes(i)) takeBack(first);
+  selectColor(number, "instant");
+  game.stroke = newStroke();
   paintCell(i, number);
   drawNow();
   return true;
+}
+
+/** Undoes a paint action that is still the newest one (the first tap of a double tap, see doubleTapDown). */
+function takeBack(event) {
+  const last = game.lastStroke;
+  if (!last || last.event !== event || game.events[game.events.length - 1] !== event) return;
+  const { cells, values } = event;
+  for (let j = cells.length - 1; j >= 0; j--) {
+    const i = cells[j];
+    const right = game.canvas.target[i] + 1;
+    if (values[j] === right && game.paint[i] === right && last.old[j] !== right) {
+      game.canvas.stats.cells--; // that cell was counted as painted
+      if (settings.tot) settings.tot.cells--;
+    }
+    putCell(i, last.old[j]);
+  }
+  // not saved yet (almost always, a tap ago): it simply goes; otherwise a new entry puts the cells back
+  if (game.events.length > game.savedEvents) game.events.pop();
+  else game.events.push({ cells: Int32Array.from(cells).reverse(), values: Uint16Array.from(last.old).reverse() });
+  game.lastStroke = null;
+  game.unsaved = game.thumbsStale = true;
 }
 
 playCanvas.addEventListener("pointermove", (e) => {
@@ -1578,6 +1624,7 @@ playCanvas.addEventListener("pointermove", (e) => {
     } else return;
     requestDraw();
   } else if (game.stroke && brushActive()) {
+    if (input.doubleTap && input.moved <= TAP_SLOP) return; // a double tap's finger paints only once it moves
     // walk along the finger's path in steps of about half a cell, so aim assist sees every spot it passed
     const dx = now[0] - old[0];
     const dy = now[1] - old[1];
@@ -1596,12 +1643,13 @@ function pointerUp(e) {
   if (!pointers.delete(e.pointerId) || pointers.size) return;
   if (game.splitting && splitPointerUp()) return;
   const c = cellAt(e);
+  const eventsBefore = game.events.length;
   // a touch the system took away (pointercancel) is no tap
   const isTap = e.type === "pointerup" && input.moved <= TAP_SLOP && !input.multiTouch && c;
   if (input.panning) {
-    // brush without "sliding": a tap paints one stamp
-    if (isTap && brushActive() && !settings.slide && (game.selected || game.tool === "eraser")) {
-      if (!game.stroke) game.stroke = { cells: [], values: [] };
+    // brush without "sliding": a tap paints one stamp (a double tap has painted its cell already)
+    if (isTap && !input.doubleTap && brushActive() && !settings.slide && (game.selected || game.tool === "eraser")) {
+      if (!game.stroke) game.stroke = newStroke();
       stampBrush(strokeCell(e.offsetX, e.offsetY) || c);
     }
     if (game.stroke) {
@@ -1616,6 +1664,8 @@ function pointerUp(e) {
     input.lastTapTime = e.timeStamp;
     input.lastTapAt = [e.offsetX, e.offsetY];
     input.lastTapCell = c[1] * game.canvas.width + c[0];
+    // what this tap painted, taken back if a second tap makes it a double tap on another cell
+    input.lastTapEvent = game.events.length > eventsBefore ? game.events[game.events.length - 1] : null;
   }
   input.doubleTap = false;
   input.panning = false;

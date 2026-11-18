@@ -75,6 +75,8 @@ export const STRINGS = {
   et_recolor: "Recolor|Замена",
   et_blur: "Blur|Размытие",
   et_clone: "Clone|Штамп",
+  et_flat: "Simplify|Упростить",
+  et_mark: "Important|Важное",
   et_rest: "Restore|Вернуть",
   et_pick: "Picker|Пипетка",
   e_fit: "Show whole picture|Показать целиком",
@@ -86,6 +88,12 @@ export const STRINGS = {
     "Paint on the picture with the chosen color. Strokes become part of the image.|Рисуйте выбранным цветом по картинке — мазки станут частью изображения.",
   h_rest:
     "Paint to bring back the original picture under your strokes.|Закрашивайте, чтобы вернуть оригинал картинки под мазками.",
+  h_flat:
+    "Paint over a busy background: it turns into a few large even patches, so the coloring has fewer stray cells. Strength: how coarse.|Проведите по пёстрому фону — он станет несколькими крупными ровными пятнами, и в раскраске будет меньше одиночных клеток. Сила — насколько крупно.",
+  h_mark:
+    "Paint over small details that matter (eyes, fingers, highlights): they get more colors and the clean-up leaves them alone. The marks only show here.|Закрасьте мелкие важные детали (глаза, пальцы, блики): им достанется больше цветов, и чистка их не тронет. Отметки видны только здесь.",
+  mk_on: "Mark|Отметить",
+  mk_off: "Erase|Стереть",
   h_pick: "Tap the picture to copy a color into the brush.|Коснитесь картинки, чтобы взять цвет для кисти.",
   srch: "Search|Поиск",
   o_rec: "Recent|Недавние",

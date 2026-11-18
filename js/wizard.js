@@ -55,6 +55,12 @@ const RATIOS = [
   [9 / 16, "9:16"],
 ];
 const MAX_SOURCE_PIXELS = 12e6;
+/**
+ * Bigger photos are worked on at this size. A canvas uses up to 4 x 4 photo pixels a cell (3.2 MP for the
+ * default 200 000 cells, 5.8 MP for 800 x 800 at 3 x 3); beyond that the photo only cost memory: every
+ * full-size copy of a 48 MP photo took about 190 MB, and the editor keeps several.
+ */
+const WORK_PIXELS = 6e6;
 const clampSize = (v) => Math.max(1, Math.min(4000, Math.round(v) || 1));
 
 /* ---------- state ---------- */
@@ -87,7 +93,9 @@ const EDIT_TOOLS = [
   ["fill", "bucket"],
   ["recolor", "swap"],
   ["blur", "drop"],
+  ["flat", "flat"],
   ["clone", "stamp"],
+  ["mark", "focus"],
   ["rest", "reset"],
   ["pick", "pipette"],
 ];
@@ -101,6 +109,7 @@ $("#panel-crop").innerHTML =
   `<div id="shape-options"><div class="shape-grid" id="shape-kinds">${SHAPES.map((k) => `<button class="tool-tile" data-shape="${k}" aria-label="${k}">${icon("sh_" + k)}</button>`).join("")}</div>` +
   `<div class="chips segmented" id="shape-mode"><button class="chip" data-outline="0" data-i="sh_fill"></button><button class="chip" data-outline="1" data-i="sh_outline"></button></div></div>` +
   `<div class="chips" id="blur-styles">${BLUR_STYLES.map((k) => `<button class="chip" data-blur="${k}" data-i="bl_${k}"></button>`).join("")}</div>` +
+  `<div class="chips segmented" id="mark-mode"><button class="chip" data-erase="0" data-i="mk_on"></button><button class="chip" data-erase="1" data-i="mk_off"></button></div>` +
   `<div class="option-row" id="paint-options">${colorButtonHtml("brush-color", "#ffffff")}<button class="chip" id="btn-clone-source" data-i="cl_src"></button>` +
   `<div class="option-sliders">${sliderHtml("brush-size", "e_size", 2, 160, 28)}${sliderHtml("strength", "e_str", 1, 100, 50)}${sliderHtml("feather", "e_feather", 0, 100, 35)}${sliderHtml("tol", "tol", 2, 120, 24)}</div></div>` +
   `<div class="option-row view-row"><div class="chips segmented" id="crop-zoom"><button class="chip" data-zoom="-1">${icon("minus")}</button><button class="chip" data-zoom="1">${icon("plus")}</button><button class="chip" data-zoom="0">${icon("fit")}</button></div>` +
@@ -148,8 +157,27 @@ export async function startWizard(file, restore = null) {
       return;
     }
   }
+  let loadScale = 1; // the photo as worked on / as stored in the file
+  if (image.width * image.height > WORK_PIXELS) {
+    const f = Math.sqrt(WORK_PIXELS / (image.width * image.height));
+    const w = Math.max(1, Math.round(image.width * f));
+    const h = Math.max(1, Math.round(image.height * f));
+    let small;
+    try {
+      small = await createImageBitmap(image, { resizeWidth: w, resizeHeight: h, resizeQuality: "high" });
+    } catch {
+      small = createCanvas(w, h);
+      const x = small.getContext("2d");
+      x.imageSmoothingQuality = "high";
+      x.drawImage(image, 0, 0, w, h);
+    }
+    loadScale = w / image.width;
+    if (image.close) image.close();
+    image = small;
+  }
   wiz = {
     image,
+    loadScale,
     rotation: 0, // quarter turns
     mirrored: false,
     angle: 0, // fine tilt in degrees (-45..45), after the quarter turns
@@ -163,6 +191,7 @@ export async function startWizard(file, restore = null) {
     blur: "soft", // blur brush style: soft | smart | motion | mosaic | smudge
     strength: 50, // blur brush strength, 1..100
     feather: 35, // stamp and blur brush: soft edge, 0..100
+    markErase: false, // "important" tool: removes marks instead of adding them
     prevTool: null, // tool to return to after the eyedropper
     editVersion: 0, // bumps on every change to the photo pixels
     step: 1,
@@ -224,14 +253,16 @@ const scaleEdit = (s, k) => ({
 });
 
 function applyState(st) {
+  // the stored photo may have been bigger than the size it is worked on now (see WORK_PIXELS)
+  const k = wiz.loadScale;
   wiz.rotation = st.rotation;
   wiz.mirrored = st.mirrored;
   wiz.angle = st.angle || 0;
   wiz.pad = st.pad ? { ...st.pad } : { on: false, color: null };
-  wiz.strokes = st.strokes.map((s) => scaleEdit(s, 1));
+  wiz.strokes = st.strokes.map((s) => scaleEdit(s, k));
   syncTiltSlider();
   buildPhoto();
-  wiz.rect = { ...st.rect };
+  wiz.rect = { x: st.rect.x * k, y: st.rect.y * k, w: st.rect.w * k, h: st.rect.h * k };
   wiz.ratio = st.ratio;
   highlightRatio();
   wiz.adjust = { ...NO_ADJUST, ...st.adjust };
@@ -272,6 +303,7 @@ export function translateWizard() {
 
 function goToStep(n) {
   wiz.step = n;
+  if (n !== 1) freeEditorCanvases(); // the next steps (and the worker) want the memory
   cropCanvas.hidden = n !== 1;
   adjustWrap.hidden = n !== 2;
   previewWrap.hidden = n !== 3;
@@ -344,8 +376,8 @@ function undo() {
   const e = history.pop();
   if (!e) return;
   if (e.stroke) {
-    wiz.strokes.pop();
-    replayEdits();
+    if (wiz.strokes.pop().kind === "mark") rebuildMarks();
+    else replayEdits();
   } else if (e.strokesBefore) {
     wiz.strokes = e.strokesBefore;
     replayEdits();
@@ -403,6 +435,7 @@ function buildPhoto() {
   x.drawImage(im, -im.width / 2, -im.height / 2);
   wiz.base = photo = c;
   if (wiz.strokes.length) replayEdits();
+  else rebuildMarks();
   photoChanged();
 }
 
@@ -673,6 +706,11 @@ function drawCrop() {
     x.fillRect(X, Y, RW, RH);
   }
   x.drawImage(photo, g.ox, g.oy, PW, PH);
+  if (wiz.tool === "mark" && marksOn) {
+    x.globalAlpha = 0.45;
+    x.drawImage(markMask, g.ox, g.oy, PW, PH);
+    x.globalAlpha = 1;
+  }
   // darken the photo outside the crop
   x.save();
   x.beginPath();
@@ -889,6 +927,59 @@ function tracePath(ctx, p, r, dx = 0, dy = 0) {
   ctx.stroke();
 }
 
+/* ---------- "Important" marks ----------
+   Marked parts of the picture get more palette colors and are left alone by the clean-up (small eyes,
+   fingers, a highlight). The marks are strokes like the others (saved with the canvas, undone, turned with
+   the photo), but they are drawn into markMask, a reduced copy of the photo's shape, never into the photo. */
+const MARK_SIDE = 1024;
+const MARK_COLOR = "#ff2e88";
+const markMask = createCanvas(1, 1);
+let marksOn = false; // something is marked: the marks go to the engine with the picture
+
+function markMaskSize() {
+  const s = Math.min(1, MARK_SIDE / Math.max(photo.width, photo.height));
+  return [Math.max(1, Math.round(photo.width * s)), Math.max(1, Math.round(photo.height * s))];
+}
+
+/** Draws all mark strokes afresh (after undo, a turn of the photo, a restored canvas). */
+function rebuildMarks() {
+  marksOn = false;
+  markMask.width = markMask.height = 1;
+  for (const op of wiz.strokes) if (op.kind === "mark") drawMark(op, opPoints(op), op.radius * tiltMatrix()[2]);
+}
+
+/** One mark stroke (or a piece of it) in photo coordinates. */
+function drawMark(op, p, r) {
+  const [w, h] = markMaskSize();
+  if (markMask.width !== w || markMask.height !== h) {
+    markMask.width = w;
+    markMask.height = h;
+  }
+  const ctx = markMask.getContext("2d");
+  ctx.save();
+  ctx.scale(w / photo.width, h / photo.height);
+  ctx.globalCompositeOperation = op.erase ? "destination-out" : "source-over";
+  ctx.fillStyle = ctx.strokeStyle = MARK_COLOR;
+  tracePath(ctx, p, r);
+  ctx.restore();
+  if (!op.erase) marksOn = true;
+}
+
+/** The marks under the crop frame R (photo coordinates) as w x h strengths 0..255, or null without marks. */
+function sourceMask(R, w, h) {
+  if (!marksOn) return null;
+  const s = Math.min(1, MARK_SIDE / Math.max(w, h)); // the engine needs about one value per cell
+  const mw = Math.max(1, Math.round(w * s));
+  const mh = Math.max(1, Math.round(h * s));
+  const c = createCanvas(mw, mh).getContext("2d");
+  c.drawImage(markMask, (-R.x * mw) / R.w, (-R.y * mh) / R.h, (photo.width * mw) / R.w, (photo.height * mh) / R.h);
+  const d = c.getImageData(0, 0, mw, mh).data;
+  const data = new Uint8Array(mw * mh);
+  let any = false;
+  for (let i = 0; i < data.length; i++) if ((data[i] = d[i * 4 + 3])) any = true;
+  return any ? { data, width: mw, height: mh } : null;
+}
+
 const scratch = createCanvas(1, 1);
 // The smoothing style reads it back every time: kept in memory from the start. (Chrome would otherwise move it
 // there by itself after some reads, and the same stroke could come out a little different on undo / redo.)
@@ -1001,6 +1092,9 @@ function blurSegment(op, src, a, b, r) {
   else if (style === "smart") {
     const { radius, eps } = surfaceParams(strength);
     areaSegment(src, p, r, soft, 0, (c, w, h, x, y, d) => smoothSurface(c, w, h, radius / d, eps), radius * 2);
+  } else if (style === "flat") {
+    const { radius, eps, step } = flatParams(strength);
+    areaSegment(src, p, r, soft, 0, (c, w, h, x, y, d) => flatten(c, w, h, radius / d, eps, step), radius * 2 + 2);
   } else if (style === "mosaic") {
     // squares of whole work pixels: the size is a multiple of the work scale the brush uses
     const raw = Math.max(2, Math.round(2 + (strength / 100) * r * 0.8));
@@ -1110,6 +1204,12 @@ function beginBlurMask() {
   workCopy = null;
 }
 
+/** The editor's full-size helper canvases are made again when needed. */
+function freeEditorCanvases() {
+  workCopy = null;
+  for (const c of [blurMask, photoCopyCanvas, scratch, maskScratch, edgeScratch]) c.width = c.height = 1;
+}
+
 /** The reduced copies for picture src at scale d, made once per stroke. */
 function workCopyFor(src, d) {
   if (workCopy && workCopy.src === src && workCopy.d === d) return workCopy;
@@ -1209,6 +1309,68 @@ function surfaceParams(strength) {
   const cell = Math.max(1, Math.sqrt((wiz.base.width * wiz.base.height) / DEFAULT_PIXELS));
   const level = 4 + 36 * s; // spread of brightness (0..255) still smoothed away
   return { radius: Math.max(1, cell * (0.6 + 1.9 * s)), eps: level * level };
+}
+
+/**
+ * "Simplify" (its own tool): a much stronger smoothing, then the brightness rounded to a few levels, so a busy
+ * background turns into a few large even patches (fewer stray cells in the coloring). Grows with strength.
+ */
+function flatParams(strength) {
+  const s = strength / 100;
+  const cell = Math.max(1, Math.sqrt((wiz.base.width * wiz.base.height) / DEFAULT_PIXELS));
+  const level = 12 + 48 * s;
+  return { radius: Math.max(1, cell * (1.5 + 4.5 * s)), eps: level * level, step: 10 + 22 * s };
+}
+
+/** "Simplify" on the w x h piece in c: smooth (as smoothSurface), round the brightness, tidy the patch borders. */
+function flatten(c, w, h, radius, eps, step) {
+  smoothSurface(c, w, h, radius, eps);
+  smoothSurface(c, w, h, radius, eps);
+  const img = c.getImageData(0, 0, w, h);
+  const d = img.data;
+  const n = w * h;
+  // only the brightness is rounded (to the same grid everywhere, so pieces of a stroke agree); rounding the
+  // channels on their own tinted grey backgrounds pink and green
+  const level = new Int32Array(n);
+  const cb = new Float32Array(n);
+  const cr = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const y = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    level[i] = Math.round(y / step);
+    cb[i] = d[i * 4 + 2] - y;
+    cr[i] = d[i * 4] - y;
+  }
+  // each pixel takes the most common level around it: no single-pixel specks along the patch borders
+  const out = new Int32Array(level);
+  const seen = new Int32Array(9);
+  const count = new Int32Array(9);
+  for (let y = 1; y < h - 1; y++)
+    for (let x = 1; x < w - 1; x++) {
+      let m = 0;
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const v = level[(y + dy) * w + x + dx];
+          let j = 0;
+          while (j < m && seen[j] !== v) j++;
+          if (j === m) {
+            seen[m] = v;
+            count[m++] = 0;
+          }
+          count[j]++;
+        }
+      let best = 0;
+      for (let j = 1; j < m; j++) if (count[j] > count[best]) best = j;
+      out[y * w + x] = seen[best];
+    }
+  for (let i = 0; i < n; i++) {
+    const y = out[i] * step;
+    const r = y + cr[i];
+    const b = y + cb[i];
+    d[i * 4] = r; // (clamped by the array)
+    d[i * 4 + 1] = (y - 0.299 * r - 0.114 * b) / 0.587;
+    d[i * 4 + 2] = b;
+  }
+  c.putImageData(img, 0, 0);
 }
 
 /**
@@ -1471,7 +1633,7 @@ function applyEdit(op) {
     const [dx, dy] = cloneShift(op);
     drawStamp(ctx, photo, p, dx, dy, op.feather * tiltMatrix()[2]);
   } else if (kind === "shape") drawShape(ctx, op, p);
-  else applyPixelEdit(op);
+  else if (kind !== "mark") applyPixelEdit(op); // marks live in markMask, not in the photo
 }
 
 /** A blur stroke replayed the way it was drawn: a dot, then piece by piece (motion and smudge need that). */
@@ -1480,7 +1642,7 @@ function replayBlur(op, p, r) {
   // the styles that copy from the photo as it was when the stroke started work from a snapshot of it
   const src = style === "smudge" ? photo : photoCopy();
   beginBlurMask();
-  if (style === "soft" || style === "smart" || style === "mosaic") {
+  if (style === "soft" || style === "smart" || style === "mosaic" || style === "flat") {
     const first = [p[0], p[1]];
     blurSegment(op, src, first, first, r); // a dot, as the stroke began (the same object twice: see blurSegment)
     for (let i = 2; i < p.length; i += 2) blurSegment(op, src, [p[i - 2], p[i - 1]], [p[i], p[i + 1]], r);
@@ -1500,6 +1662,7 @@ function cloneShift(op) {
 function replayEdits() {
   if (!wiz.strokes.length) {
     photo = wiz.base;
+    rebuildMarks();
     return;
   }
   if (photo === wiz.base || photo.width !== wiz.base.width || photo.height !== wiz.base.height)
@@ -1509,6 +1672,7 @@ function replayEdits() {
   g.drawImage(wiz.base, 0, 0);
   g.globalCompositeOperation = "source-over";
   for (const op of wiz.strokes) applyEdit(op);
+  rebuildMarks();
 }
 
 /**
@@ -1537,7 +1701,7 @@ function ensureOwnPhoto() {
 
 /* tools that need a color, a size, a tolerance, a shape kind or a clone source */
 const COLOR_TOOLS = ["brush", "shape", "fill", "recolor", "pick"];
-const SIZE_TOOLS = ["brush", "shape", "blur", "rest"];
+const SIZE_TOOLS = ["brush", "shape", "blur", "flat", "mark", "rest"];
 const TOL_TOOLS = ["fill", "recolor"];
 
 function updateEditorUi() {
@@ -1555,17 +1719,30 @@ function updateEditorUi() {
   );
   $("#shape-mode").hidden = wiz.shape === "line";
   $("#blur-styles").hidden = tool !== "blur";
+  $("#mark-mode").hidden = tool !== "mark";
+  $$("#mark-mode [data-erase]").forEach((b) => b.classList.toggle("on", (b.dataset.erase === "1") === wiz.markErase));
   $$("#blur-styles [data-blur]").forEach((b) => b.classList.toggle("on", b.dataset.blur === wiz.blur));
   $("#btn-clone-source").hidden = !stampReady;
   // filled shapes need no size: only lines and outlines have a thickness
   const sized = SIZE_TOOLS.includes(tool) && !(tool === "shape" && wiz.shape !== "line" && !wiz.shapeOutline);
   $("#brush-size").closest(".field").hidden = !sized;
-  $("#strength").closest(".field").hidden = tool !== "blur";
-  $("#feather").closest(".field").hidden = tool !== "clone" && tool !== "blur";
+  $("#strength").closest(".field").hidden = tool !== "blur" && tool !== "flat";
+  $("#feather").closest(".field").hidden = tool !== "clone" && tool !== "blur" && tool !== "flat";
   $("#tol").closest(".field").hidden = !TOL_TOOLS.includes(tool);
   $("#paint-options").hidden = ![...COLOR_TOOLS, ...SIZE_TOOLS, "clone"].includes(tool);
   $("#btn-edit-reset").hidden = tool === "crop";
+  fitToolLabels();
   drawCrop();
+}
+
+/** Tool names too long for their tile ("Упростить") get a slightly smaller font instead of an ellipsis. */
+function fitToolLabels() {
+  for (const s of $$("#editor-tools .tool-tile span")) {
+    if (s.dataset.fit === s.textContent) continue; // measured already
+    s.style.fontSize = "";
+    for (let f = 10.5; f >= 9 && s.scrollWidth > s.clientWidth; f -= 0.5) s.style.fontSize = f + "px";
+    if (s.clientWidth) s.dataset.fit = s.textContent;
+  }
 }
 
 /** Zoom the crop view by factor s around screen point (mx, my). */
@@ -1742,6 +1919,7 @@ function strokeSegment(op, a, b) {
     tracePath(ctx, p, r);
   } else if (kind === "restore") drawFrom(wiz.base, 0, 0, p, r);
   else if (kind === "blur") blurSegment(op, strokeSource, a, b, r);
+  else if (kind === "mark") drawMark(op, p, r);
 }
 
 // These run in the capture phase, before the crop handlers, and stop them unless the crop tool is active.
@@ -1767,8 +1945,9 @@ cropCanvas.addEventListener(
         g.globalCompositeOperation = "copy";
         g.drawImage(strokeSource, 0, 0);
         g.globalCompositeOperation = "source-over";
-        wiz.strokes.pop();
+        const popped = wiz.strokes.pop();
         history.pop();
+        if (popped.kind === "mark") rebuildMarks();
         photoChanged();
         $("#wiz-undo").disabled = !history.length;
       }
@@ -1799,15 +1978,16 @@ cropCanvas.addEventListener(
     let op = null;
     if (tool === "brush") op = { color: wiz.color, radius, points: photoToSource(...p) };
     else if (tool === "rest") op = { restore: true, radius, points: photoToSource(...p) };
-    else if (tool === "blur")
+    else if (tool === "blur" || tool === "flat")
       op = {
         kind: "blur",
-        style: wiz.blur,
+        style: tool === "flat" ? "flat" : wiz.blur,
         strength: wiz.strength,
         soft: wiz.feather,
         radius,
         points: photoToSource(...p),
       };
+    else if (tool === "mark") op = { kind: "mark", erase: wiz.markErase, radius, points: photoToSource(...p) };
     if (!op) return;
     pendingStroke = { op, points: [p], t: e.timeStamp, at: [e.offsetX, e.offsetY] };
   },
@@ -2042,6 +2222,11 @@ $("#panel-crop").addEventListener("click", (e) => {
     wiz.blur = blurBtn.dataset.blur;
     updateEditorUi();
   }
+  const markBtn = e.target.closest("[data-erase]");
+  if (markBtn) {
+    wiz.markErase = markBtn.dataset.erase === "1";
+    updateEditorUi();
+  }
   if (zoomBtn) {
     const g = cropGeometry();
     if (zoomBtn.dataset.zoom === "0") {
@@ -2101,6 +2286,7 @@ function sourcePixels() {
     c.imageSmoothingQuality = "high";
     c.drawImage(photo, Math.round(-R.x * s), Math.round(-R.y * s), photo.width * s, photo.height * s);
     const source = { data: c.getImageData(0, 0, w, h).data, width: w, height: h, key };
+    source.mask = sourceMask(R, w, h);
     return (wiz.source = source);
   }
   const sx = Math.min(photo.width - 1, Math.round(R.x));
@@ -2120,6 +2306,7 @@ function sourcePixels() {
     source = { data: c.getImageData(0, 0, w, h).data, width: w, height: h };
   }
   source.key = key;
+  source.mask = sourceMask(R, source.width, source.height);
   return (wiz.source = source);
 }
 
@@ -2603,10 +2790,50 @@ $("#panel-pixel").addEventListener("input", (e) => {
 $("#colors-exact").addEventListener("change", (e) => (e.target.value = $("#colors").value));
 
 let previewTimer = 0;
+/*
+ * Draft: when anything but the number of colors changes on a canvas of DRAFT_FROM cells or more, a rough
+ * version at about DRAFT_CELLS cells comes first (a few times a second while a slider moves), then the real
+ * one. Changing only the colors needs no draft: the worker keeps the prepared cells, that is quick.
+ */
+const DRAFT_FROM = 80000;
+const DRAFT_CELLS = 20000;
+const DRAFT_COLORS = 48; // enough for a rough look, and a small palette is quick to find
+let draftTimer = 0;
+let draftAt = 0;
+let shownParams = null; // params of the last full preview
+const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean]);
+
 function schedulePreview() {
   clearTimeout(previewTimer);
+  clearTimeout(draftTimer);
   const p = pixelParams();
+  const onlyColors = shownParams && exceptColors(p) === exceptColors(shownParams);
+  if (!onlyColors && p.width * p.height >= DRAFT_FROM) {
+    draftTimer = setTimeout(runDraft, Math.max(0, 250 - (performance.now() - draftAt)));
+    return;
+  }
   previewTimer = setTimeout(runPreview, p.width * p.height > 1e6 ? 900 : 450);
+}
+
+async function runDraft() {
+  if (wiz.step !== 3 || wiz.creating) return;
+  draftAt = performance.now();
+  const p = pixelParams();
+  const f = Math.sqrt(DRAFT_CELLS / (p.width * p.height));
+  const W = Math.max(1, Math.round(p.width * f));
+  const H = Math.max(1, Math.round(p.height * f));
+  const d = { ...p, width: W, height: H, colors: Math.max(2, Math.min(p.colors, DRAFT_COLORS)) };
+  $("#preview-info").textContent = "…";
+  let result;
+  try {
+    result = await runJob("generate", d);
+  } catch {
+    result = null;
+  }
+  if (!result) return; // a newer draft or preview took over
+  drawCells(result);
+  // the real one right after it (a slider moving again cancels it)
+  previewTimer = setTimeout(runPreview, 30);
 }
 
 /* ---------- worker client ---------- */
@@ -2638,8 +2865,10 @@ function runJob(type, params, onProgress) {
       data: source.data,
       width: source.width,
       height: source.height,
+      mask: source.mask,
     });
     sentSourceKey = source.key;
+    shownParams = null; // another picture: the first preview gets a draft again
   }
   const id = ++lastJob;
   for (const [oldId, job] of jobs) {
@@ -2670,14 +2899,35 @@ async function runPreview() {
   if (big) setBusy(false);
   if (!result) return; // replaced by a newer preview
   wiz.result = { key: resultKey(p), result };
+  shownParams = p;
   showPreview();
+}
+
+/** Puts a result's cells on the preview canvas (no palette strip: also used for drafts). */
+function drawCells({ width: W, height: H, idx, pal }) {
+  const K = pal.length / 3;
+  const colors = new Uint32Array(K);
+  for (let k = 0; k < K; k++) {
+    let r = pal[k * 3];
+    let g = pal[k * 3 + 1];
+    let b = pal[k * 3 + 2];
+    if (wiz.gray) r = g = b = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
+    colors[k] = 0xff000000 | (b << 16) | (g << 8) | r;
+  }
+  previewCanvas.width = W;
+  previewCanvas.height = H;
+  const ctx = previewCanvas.getContext("2d");
+  const img = ctx.createImageData(W, H);
+  const px = new Uint32Array(img.data.buffer);
+  for (let i = 0; i < W * H; i++) px[i] = colors[idx[i]];
+  ctx.putImageData(img, 0, 0);
+  drawOriginal(W, H);
+  applyPreviewZoom();
 }
 
 function showPreview() {
   const { width: W, height: H, idx, pal } = wiz.result.result;
-  const ctx = previewCanvas.getContext("2d");
   const K = pal.length / 3;
-  const colors = [];
   const counts = new Uint32Array(K);
   for (let i = 0; i < idx.length; i++) counts[idx[i]]++;
   let strip = "";
@@ -2686,20 +2936,12 @@ function showPreview() {
     let g = pal[k * 3 + 1];
     let b = pal[k * 3 + 2];
     if (wiz.gray) r = g = b = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
-    colors.push(0xff000000 | (b << 16) | (g << 8) | r);
     strip += `<span style="background:rgb(${r},${g},${b});color:${0.3 * r + 0.59 * g + 0.11 * b > 140 ? "#000" : "#fff"}">${k + 1}<i>${counts[k]}</i></span>`;
   }
-  previewCanvas.width = W;
-  previewCanvas.height = H;
-  const img = ctx.createImageData(W, H);
-  const px = new Uint32Array(img.data.buffer);
-  for (let i = 0; i < W * H; i++) px[i] = colors[idx[i]];
-  ctx.putImageData(img, 0, 0);
+  drawCells(wiz.result.result);
   $("#palette-strip").innerHTML = strip;
   $("#preview-info").textContent = `${K} ${t("ncol")} · ${W}×${H}`;
   $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
-  drawOriginal(W, H);
-  applyPreviewZoom();
 }
 
 /* ---------- step 3: before/after divider ----------
@@ -2774,6 +3016,7 @@ $("#btn-auto-colors").onclick = async () => {
 async function createCanvasFromResult() {
   // a preview scheduled by the last edit must not start (it would cancel this job)
   clearTimeout(previewTimer);
+  clearTimeout(draftTimer);
   wiz.creating = true;
   setBusy(true);
   await yieldToBrowser();

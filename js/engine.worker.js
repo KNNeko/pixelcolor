@@ -1,7 +1,8 @@
 // Web Worker: runs the pixelization off the main thread so the interface never freezes.
 //
 // Messages in:
-//   { type: "source", key, data, width, height }      cropped photo pixels (sent once per crop)
+//   { type: "source", key, data, width, height, mask } cropped photo pixels (sent once per crop);
+//                                                      mask: "important" marks { data, width, height } or null
 //   { type: "generate", id, params, adjust }           build a canvas
 //   { type: "suggest", id, params, adjust }            find a good number of colors
 // Messages out:
@@ -19,7 +20,7 @@ const pauseFor = (id) => () => new Promise((resolve) => setTimeout(() => resolve
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "source") {
-    source = { key: msg.key, data: msg.data, width: msg.width, height: msg.height };
+    source = { key: msg.key, data: msg.data, width: msg.width, height: msg.height, mask: msg.mask || null };
     return;
   }
   const id = msg.id;

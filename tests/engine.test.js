@@ -412,3 +412,52 @@ test("smoothGradients flattens noise inside a soft gradient but leaves a border 
   assert.equal(out[(2 * W + 12) * 4], 230);
   assert.ok(out[(2 * W + 9) * 4] < 130);
 });
+
+/** "Important" marks for a W x H source: 255 where fn(x, y) is true. */
+function marks(width, height, fn) {
+  const data = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) data[y * width + x] = fn(x, y) ? 255 : 0;
+  return { data, width, height };
+}
+
+test("marked cells keep a small highlight that the clean-up would smooth away", async () => {
+  const W = 60;
+  const H = 60;
+  for (const style of ["photo", "art"])
+    for (const d of [4, 14, 24]) {
+      // a soft skin-like gradient with a 2-cell highlight a little lighter; the marks are coarser than the cells
+      const src = image(W, H, (x, y) =>
+        (x === 30 || x === 31) && y === 30 ? [200 + d, 160 + d, 140 + d] : [170 + x * 0.5, 130 + y * 0.5, 110],
+      );
+      src.mask = marks(30, 30, (x, y) => Math.abs(x - 15) < 3 && Math.abs(y - 15) < 3);
+      const r = await generate(src, { width: W, height: H, colors: 24, style, clean: 3 }, NO_ADJUST);
+      const c = r.idx[30 * W + 30];
+      const around = [r.idx[30 * W + 28], r.idx[30 * W + 33], r.idx[28 * W + 30], r.idx[32 * W + 30]];
+      assert.ok(!around.includes(c), `${style}, +${d}: the highlight took the color around it`);
+    }
+});
+
+test("marked cells get more of the palette; Auto colors never drops because of marks", async () => {
+  const W = 60;
+  const H = 60;
+  const inside = (x, y) => x >= 40 && x < 48 && y >= 10 && y < 18;
+  // a big two-way gradient and a small detail with a gradient of its own
+  const src = image(W, H, (x, y) =>
+    inside(x, y)
+      ? [200, 120 + (x - 40) * 6, 160 + (y - 10) * 6]
+      : [Math.round(40 + x * 3), Math.round(60 + y * 2.5), 90],
+  );
+  const marked = { ...src, mask: marks(W, H, inside) };
+  const params = { width: W, height: H, colors: 16, style: "photo", clean: 3 };
+  const used = (r) => {
+    const set = new Set();
+    for (let y = 10; y < 18; y++) for (let x = 40; x < 48; x++) set.add(r.idx[y * W + x]);
+    return set.size;
+  };
+  const plain = used(await generate(src, params, NO_ADJUST));
+  const focused = used(await generate(marked, params, NO_ADJUST));
+  assert.ok(focused > plain, `detail colors: ${plain} without marks, ${focused} with`);
+  const auto = await suggestColorCount(src, params, NO_ADJUST);
+  const autoMarked = await suggestColorCount(marked, params, NO_ADJUST);
+  assert.ok(autoMarked >= auto, `auto: ${auto} without marks, ${autoMarked} with`);
+});

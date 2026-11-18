@@ -1238,20 +1238,33 @@ function paletteToLab(pal, K) {
  */
 const L_WEIGHT = 2;
 
+/** `count` evenly spaced cell numbers out of pixelCount. */
+function evenCells(pixelCount, count) {
+  const step = pixelCount / count;
+  const cells = new Uint32Array(count);
+  for (let i = 0; i < count; i++) cells[i] = (i * step) | 0;
+  return cells;
+}
+
 /** Evenly spaced sample of `count` pixels, in Lab (lightness scaled by lightWeight) and RGB. */
 export function samplePixels(rgba, pixelCount, count, lightWeight = L_WEIGHT) {
-  const step = pixelCount / count;
+  return sampleCells(rgba, evenCells(pixelCount, count), lightWeight);
+}
+
+/** The colors of the given cells, in Lab (lightness scaled by lightWeight) and RGB. */
+function sampleCells(rgba, cells, lightWeight) {
+  const count = cells.length;
   const lab = new Float32Array(count * 3);
   const rgb = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
-    const p = ((i * step) | 0) * 4;
+    const p = cells[i] * 4;
     rgb[i * 3] = rgba[p];
     rgb[i * 3 + 1] = rgba[p + 1];
     rgb[i * 3 + 2] = rgba[p + 2];
     srgbToLab(rgba[p] | 0, rgba[p + 1] | 0, rgba[p + 2] | 0, lab, i * 3);
     lab[i * 3] *= lightWeight;
   }
-  return { lab, rgb, count };
+  return { lab, rgb, count, cells };
 }
 
 /* ---------- k-means palette ---------- */
@@ -1263,19 +1276,101 @@ export function samplePixels(rgba, pixelCount, count, lightWeight = L_WEIGHT) {
  */
 const RARE_BOOST = 0.05;
 
-/** Evenly spaced sample of the cell image for the palette search, with rarity weights. */
-export function paletteSample(rgba, pixelCount, count, lightWeight = L_WEIGHT) {
-  const sample = samplePixels(rgba, pixelCount, count, lightWeight);
+/*
+ * "Important" marks (the editor's tool): per cell 0..255 (`focus`). A marked cell counts FOCUS_WEIGHT times as
+ * much in the palette search and in "Auto colors" (more colors go to it), and from FOCUS_KEEP on the clean-up
+ * steps leave it alone, like a thin line: small eyes, fingers, highlights keep their few cells.
+ */
+const FOCUS_WEIGHT = 10;
+const FOCUS_KEEP = 128;
+/** "Auto colors" adds colors until the visible error of the marked cells (Lab ΔE, as AUTO_*) is down to this, */
+const FOCUS_ERROR = 1.5;
+/** ... but at most this many times the count it gives without marks. */
+const FOCUS_MORE = 1.5;
+
+/**
+ * Evenly spaced sample of the cell image for the palette search, with rarity weights.
+ * With focus, the marked cells are added (all of them, or an even share of at most count / 2), each weighing
+ * what the marked cells it stands for weigh extra, so that a small marked detail is not missed by the spacing.
+ * sample.share: that weight per sample cell (1 for the evenly spaced ones), or null.
+ */
+export function paletteSample(rgba, pixelCount, count, lightWeight = L_WEIGHT, focus = null) {
+  let cells = evenCells(pixelCount, count);
+  let share = null;
+  if (focus) [cells, share] = withFocusCells(cells, pixelCount, focus);
+  const sample = sampleCells(rgba, cells, lightWeight);
   const { rgb } = sample;
+  const n = sample.count;
   const bins = new Uint32Array(32768); // 5 bits per channel
-  const keys = new Uint16Array(count);
-  for (let i = 0; i < count; i++) {
+  const keys = new Uint16Array(n);
+  for (let i = 0; i < n; i++) {
     keys[i] = ((rgb[i * 3] >> 3) << 10) | ((rgb[i * 3 + 1] >> 3) << 5) | (rgb[i * 3 + 2] >> 3);
     bins[keys[i]]++;
   }
-  sample.weight = new Float32Array(count);
-  for (let i = 0; i < count; i++) sample.weight[i] = Math.pow(bins[keys[i]], -RARE_BOOST);
+  sample.weight = new Float32Array(n);
+  for (let i = 0; i < n; i++) sample.weight[i] = Math.pow(bins[keys[i]], -RARE_BOOST) * (share ? share[i] : 1);
+  sample.share = share;
   return sample;
+}
+
+/** The evenly spaced cells plus the marked ones (see paletteSample): [cells, share]. */
+function withFocusCells(even, pixelCount, focus) {
+  const count = even.length;
+  let total = 0;
+  for (let i = 0; i < pixelCount; i++) if (focus[i]) total++;
+  const extra = Math.min(total, count >> 1);
+  const cells = new Uint32Array(count + extra);
+  const share = new Float32Array(count + extra).fill(1);
+  cells.set(even);
+  // an evenly spaced cell stands for pixelCount / count cells, an extra one for `stride` marked cells
+  const stride = total / Math.max(1, extra);
+  const scale = (((stride * count) / pixelCount) * (FOCUS_WEIGHT - 1)) / 255;
+  for (let i = 0, seen = 0, j = 0; i < pixelCount && j < extra; i++) {
+    if (!focus[i]) continue;
+    if (seen >= j * stride) {
+      cells[count + j] = i;
+      share[count + j] = scale * focus[i];
+      j++;
+    }
+    seen++;
+  }
+  return [cells, share];
+}
+
+/** The marks (a mask that came with the source, any size) as one strength 0..255 per cell, or null. */
+export function focusCells(mask, W, H) {
+  if (!mask) return null;
+  const { data, width: mw, height: mh } = mask;
+  const out = new Uint8Array(W * H);
+  let any = false;
+  if (mw >= W && mh >= H) {
+    // finer than the cells: the average over each cell
+    const sum = new Uint32Array(W * H);
+    const cnt = new Uint32Array(W * H);
+    for (let y = 0; y < mh; y++) {
+      const row = Math.min(H - 1, Math.floor(((y + 0.5) * H) / mh)) * W;
+      for (let x = 0; x < mw; x++) {
+        const i = row + Math.min(W - 1, Math.floor(((x + 0.5) * W) / mw));
+        sum[i] += data[y * mw + x];
+        cnt[i]++;
+      }
+    }
+    for (let i = 0; i < W * H; i++) if ((out[i] = cnt[i] ? Math.round(sum[i] / cnt[i]) : 0)) any = true;
+  } else
+    for (let y = 0; y < H; y++) {
+      const row = Math.min(mh - 1, Math.floor(((y + 0.5) * mh) / H)) * mw;
+      for (let x = 0; x < W; x++)
+        if ((out[y * W + x] = data[row + Math.min(mw - 1, Math.floor(((x + 0.5) * mw) / W))])) any = true;
+    }
+  return any ? out : null;
+}
+
+/** The cells the clean-up leaves alone: thin lines (or null) plus strongly marked cells. */
+function keptCells(lines, focus, N) {
+  if (!focus) return lines;
+  const out = lines ? Uint8Array.from(lines) : new Uint8Array(N);
+  for (let i = 0; i < N; i++) if (focus[i] >= FOCUS_KEEP) out[i] = 1;
+  return out;
 }
 
 /**
@@ -1367,8 +1462,8 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks) {
   return { palette, error: error / S };
 }
 
-export async function kmeansPalette(rgba, pixelCount, K, hooks) {
-  const sample = paletteSample(rgba, pixelCount, Math.min(pixelCount, K > 300 ? 16000 : 30000));
+export async function kmeansPalette(rgba, pixelCount, K, hooks, focus = null) {
+  const sample = paletteSample(rgba, pixelCount, Math.min(pixelCount, K > 300 ? 16000 : 30000), L_WEIGHT, focus);
   const fit = await kmeansFit(sample, K, 8, hooks);
   return fit && fit.palette;
 }
@@ -1738,12 +1833,16 @@ const TINY_COLOR_REACH = 10;
 /**
  * Palette clean-up for playing: nobody wants two numbers that look the same, or a number with 2 cells.
  *   1. colors closer than SAME_COLOR are merged (closest pairs first; the merged color is their weighted mean);
- *   2. colors used by at most tinyCells cells join the nearest other color, unless they really stand out.
+ *   2. colors used by at most tinyCells cells join the nearest other color, unless they really stand out
+ *      or are used in a marked ("important") cell (focus, see FOCUS_KEEP).
  * Rewrites idx and pal in place; colors that end up unused are dropped later by finalizePalette.
  */
-export function cleanPalette(idx, pal, K, tinyCells = 0) {
+export function cleanPalette(idx, pal, K, tinyCells = 0, focus = null) {
   const counts = new Float64Array(K);
   for (let i = 0; i < idx.length; i++) counts[idx[i]]++;
+  // colors in marked cells are never "tiny": a highlight of two cells in a marked eye stays
+  const marked = new Uint8Array(K);
+  if (focus) for (let i = 0; i < idx.length; i++) if (focus[i] >= FOCUS_KEEP) marked[idx[i]] = 1;
   const into = Int32Array.from({ length: K }, (_, k) => k);
   let lab = paletteToLab(pal, K);
   const labDist = (a, b) =>
@@ -1779,7 +1878,7 @@ export function cleanPalette(idx, pal, K, tinyCells = 0) {
 
   if (tinyCells > 0)
     for (let a = 0; a < K; a++) {
-      if (!counts[a] || counts[a] > tinyCells) continue;
+      if (!counts[a] || counts[a] > tinyCells || marked[a]) continue;
       let best = -1;
       let bestD = TINY_COLOR_REACH;
       for (let b = 0; b < K; b++) {
@@ -1840,13 +1939,29 @@ export function prepareImage(source, params, userAdjust) {
   if (k > 1)
     rgba =
       style === "art" ? pickCellColors(rgba, W, H, k) : boxScale({ data: rgba, width: W * k, height: H * k }, W, H);
-  const lines = rgba.lines || null;
+  const focus = focusCells(source.mask, W, H);
+  const lines = keptCells(rgba.lines || null, focus, W * H);
   if (style === "art") rgba = smoothGradients(rgba, W, H, clean > 0 ? 24 + 4 * clean : 0, lines);
   const smooth = rgba.smooth || null;
   const out = smoothFlat(rgba, W, H, clean, lines);
-  out.lines = lines; // thin-line cells (art mode): the clean-up steps leave them alone
+  out.lines = lines; // thin-line cells (art mode) and marked ones: the clean-up steps leave them alone
   out.smooth = smooth; // cells inside soft gradients and flat areas (art mode)
+  out.focus = focus; // "important" marks per cell, or null
   return out;
+}
+
+/*
+ * The prepared cells of the last job, kept: when only the number of colors changes (or "Auto colors" runs on
+ * the same settings), the heavy part (sampling, line search in art mode, smoothing) is not done again.
+ * Only for sources that carry a key (the worker's cropped photo).
+ */
+let prepared = { key: "", value: null };
+function preparedImage(source, params, userAdjust) {
+  if (source.key == null) return prepareImage(source, params, userAdjust);
+  const p = normalizeParams(params);
+  const key = JSON.stringify([source.key, p.width, p.height, p.style, p.clean, userAdjust]);
+  if (prepared.key !== key) prepared = { key, value: prepareImage(source, p, userAdjust) };
+  return prepared.value;
 }
 
 /**
@@ -1859,11 +1974,11 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const p = normalizeParams(params);
   const { width: W, height: H, clean } = p;
   const dither = p.style === "dither";
-  const rgba = prepareImage(source, p, userAdjust);
+  const rgba = preparedImage(source, p, userAdjust); // read only: kept for the next job
   const lines = rgba.lines; // art mode: thin-line cells, left alone by the clean-up
   const smooth = rgba.smooth; // art mode: cells inside soft gradients
   const K = Math.max(1, Math.min(p.colors, W * H));
-  const pal = await kmeansPalette(rgba, W * H, K, hooks);
+  const pal = await kmeansPalette(rgba, W * H, K, hooks, rgba.focus);
   if (!pal) return null;
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
@@ -1875,7 +1990,7 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
   // (not in art mode: drawn pictures have clean color bands, a checker seam along every band reads as noise)
   if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
-  cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0);
+  cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0, rgba.focus);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }
 
@@ -1903,13 +2018,12 @@ const AUTO_MAX = 240;
 const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240];
 
 /** How much each sampled cell's color error shows: 1 in a smooth area, towards 0 in texture and on edges. */
-function visibility(rgba, W, H, count) {
-  const N = W * H;
-  const step = N / count;
+function visibility(rgba, W, H, cells) {
+  const count = cells.length;
   const seen = new Float32Array(count);
   const lab = new Float32Array(27);
   for (let s = 0; s < count; s++) {
-    const i = (s * step) | 0;
+    const i = cells[s];
     const x = i % W;
     const y = (i - x) / W;
     let n = 0;
@@ -1973,17 +2087,21 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
   const W = params.width;
   const H = params.height;
   const N = W * H;
-  const rgba = prepareImage(source, params, userAdjust);
+  const prepared = preparedImage(source, params, userAdjust);
+  // with marks, the rule below sees the picture prepared as if nothing were marked (the marked cells skip
+  // some smoothing), so that it gives the same count as without them; focusColorCount then may add colors
+  const rgba = prepared.focus ? prepareImage({ ...source, mask: null }, params, userAdjust) : prepared;
   // plain Lab here: the limits are perceived differences
   const count = Math.min(N, 10000);
   const sample = paletteSample(rgba, N, count, 1);
-  const seen = visibility(rgba, W, H, count);
+  const seen = visibility(rgba, W, H, sample.cells);
   const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
   let target = 0;
   let prevK = 0;
   let prevError = 0;
   let enough = 0; // color count at which the average error is low enough (x1.15 headroom)
   let complete = 0; // first count with no visible color missing
+  let found = maxK;
   for (const K of AUTO_STEPS) {
     if (K > maxK) break;
     hooks.progress(K);
@@ -1991,16 +2109,42 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     if (!fit) throw new Error("cancelled");
     const { error, lost } = visibleError(sample, fit.palette, K, seen);
     if (lost <= AUTO_LOST && !complete) complete = K;
-    if (error <= AUTO_EXACT && complete) return K; // a picture of a few flat colors
+    if (error <= AUTO_EXACT && complete) {
+      found = K; // a picture of a few flat colors
+      break;
+    }
     if (K === 16) target = AUTO_SHARE * error;
     if (target && error <= target && !enough) {
       // between the last two steps, where the error (on log scales) crosses the target
       const t = prevError > error ? Math.log(prevError / target) / Math.log(prevError / error) : 1;
       enough = Math.exp(Math.log(prevK) + t * (Math.log(K) - Math.log(prevK))) * 1.15;
     }
-    if (enough && complete) return Math.min(maxK, Math.round(Math.max(enough, complete)));
+    if (enough && complete) {
+      found = Math.min(maxK, Math.round(Math.max(enough, complete)));
+      break;
+    }
     prevK = K;
     prevError = error;
   }
-  return maxK;
+  return prepared.focus ? focusColorCount(prepared, W, H, count, found, maxK, hooks) : found;
+}
+
+/**
+ * "Auto colors" with marks: the count the rule above gave, or more if the marked cells need it. From `found`
+ * on, the first count whose palette (picked as generate picks it, marked cells weighing more) brings their
+ * visible error down to FOCUS_ERROR; at most FOCUS_MORE times `found`. Marking never lowers the count.
+ */
+async function focusColorCount(rgba, W, H, count, found, maxK, hooks) {
+  const sample = paletteSample(rgba, W * H, count, 1, rgba.focus);
+  const seen = visibility(rgba, W, H, sample.cells);
+  for (let i = 0; i < seen.length; i++) seen[i] = i < count ? 0 : seen[i] * sample.share[i]; // marked ones only
+  const limit = Math.max(found, Math.min(maxK, Math.round(found * FOCUS_MORE)));
+  for (const K of [found, ...AUTO_STEPS.filter((k) => k > found && k < limit), limit]) {
+    hooks.progress(K);
+    const fit = await kmeansFit(sample, K, 4, hooks);
+    if (!fit) throw new Error("cancelled");
+    const { error } = visibleError(sample, fit.palette, K, seen);
+    if (error <= FOCUS_ERROR) return K;
+  }
+  return limit;
 }

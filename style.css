@@ -1003,7 +1003,7 @@ header b {
   justify-content: center;
   line-height: 1.05;
   font-size: 14px;
-  transition: all 0.15s;
+  /* no transition: the picked color must show at once (a double tap on the picture) */
 }
 .swatch.with-progress.on {
   box-shadow: none;
