@@ -75,7 +75,7 @@ const previewWrap = $("#preview-wrap");
 
 const SHAPES = ["rect", "oval", "line", "tri", "diamond", "hex", "star", "heart", "arrow"];
 const BLUR_STYLES = ["soft", "smart", "motion", "mosaic", "smudge"];
-const DEFAULT_PIXELS = 160000; // a new canvas: about 400 x 400 cells
+const DEFAULT_PIXELS = 200000; // a new canvas: about 450 x 450 cells
 const DEFAULT_COLORS = 128;
 
 // [tool, icon]; under the grid only the active tool's options are shown
@@ -340,6 +340,7 @@ const snapshot = () =>
   });
 
 function undo() {
+  if (activeStroke || pendingStroke) return; // (another finger on the button while drawing)
   const e = history.pop();
   if (!e) return;
   if (e.stroke) {
@@ -1477,8 +1478,7 @@ function applyEdit(op) {
 function replayBlur(op, p, r) {
   const style = op.style;
   // the styles that copy from the photo as it was when the stroke started work from a snapshot of it
-  const src = style === "smudge" ? photo : createCanvas(photo.width, photo.height);
-  if (src !== photo) src.getContext("2d").drawImage(photo, 0, 0);
+  const src = style === "smudge" ? photo : photoCopy();
   beginBlurMask();
   if (style === "soft" || style === "smart" || style === "mosaic") {
     const first = [p[0], p[1]];
@@ -1496,15 +1496,36 @@ function cloneShift(op) {
   return [b[0] - a[0], b[1] - a[1]];
 }
 
-/** photo = base + all edits. */
+/** photo = base + all edits. The photo's own canvas is reused: a new one each time cost 4 bytes a pixel. */
 function replayEdits() {
   if (!wiz.strokes.length) {
     photo = wiz.base;
     return;
   }
-  photo = createCanvas(wiz.base.width, wiz.base.height);
-  photo.getContext("2d").drawImage(wiz.base, 0, 0);
+  if (photo === wiz.base || photo.width !== wiz.base.width || photo.height !== wiz.base.height)
+    photo = createCanvas(wiz.base.width, wiz.base.height);
+  const g = photo.getContext("2d");
+  g.globalCompositeOperation = "copy";
+  g.drawImage(wiz.base, 0, 0);
+  g.globalCompositeOperation = "source-over";
   for (const op of wiz.strokes) applyEdit(op);
+}
+
+/**
+ * The photo as it is now, in one canvas kept for this (a big photo takes tens of MB; a new copy for every
+ * stroke and every replayed blur stroke filled the phone's memory). Valid until the next call.
+ */
+const photoCopyCanvas = createCanvas(1, 1);
+function photoCopy() {
+  if (photoCopyCanvas.width !== photo.width || photoCopyCanvas.height !== photo.height) {
+    photoCopyCanvas.width = photo.width;
+    photoCopyCanvas.height = photo.height;
+  }
+  const g = photoCopyCanvas.getContext("2d");
+  g.globalCompositeOperation = "copy";
+  g.drawImage(photo, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  return photoCopyCanvas;
 }
 
 /** Before the first edit photo is the base itself; edits must not change the base. */
@@ -1702,6 +1723,13 @@ let lassoDraft = null; // stamp: [[x, y], ...] the lasso being drawn (photo coor
 let stampPlace = null; // stamp: { dx, dy } shift of the copy being placed, in photo pixels
 let stampPreview = null; // stamp: the piece shown under the finger ({ canvas, x, y }, see stampPiece)
 let tapStart = null; // [x, y] screen position of a touch that may turn out to be a tap
+// A brush / restore / blur stroke begins only once the finger has moved a little and a moment has passed: when a
+// second finger lands first (a pinch), nothing was drawn and nothing has to be taken back.
+let pendingStroke = null; // { op, points: [[x, y], ...] photo points so far, t: time, at: [x, y] screen }
+let strokeStarted = 0; // time the active stroke began
+let strokeAt = null; // [x, y] screen point where its finger came down
+const STROKE_SLOP = 8; // screen px
+const STROKE_DELAY = 80; // ms
 
 /** One piece of the stroke being drawn, from photo point a to b. */
 function strokeSegment(op, a, b) {
@@ -1726,16 +1754,25 @@ cropCanvas.addEventListener(
     cropCanvas.setPointerCapture(e.pointerId);
     editPointers.set(e.pointerId, [e.offsetX, e.offsetY]);
     if (editPointers.size > 1) {
-      // second finger: this is a pinch, drop the dot the first finger just painted
+      // Second finger: this is a pinch. A stroke that has not begun is dropped; one that began a moment ago is
+      // taken back from the copy of the photo made when it began (replaying all the edits instead could take
+      // seconds and a lot of memory with big blur strokes).
       const top = history[history.length - 1];
-      if (activeStroke && activeStroke.points.length <= 4 && top && top.stroke) {
+      const first = [...editPointers.values()][0];
+      const young =
+        e.timeStamp - strokeStarted < 300 ||
+        (strokeAt && Math.hypot(first[0] - strokeAt[0], first[1] - strokeAt[1]) < 40);
+      if (activeStroke && strokeSource && young && top && top.stroke) {
+        const g = photo.getContext("2d");
+        g.globalCompositeOperation = "copy";
+        g.drawImage(strokeSource, 0, 0);
+        g.globalCompositeOperation = "source-over";
         wiz.strokes.pop();
         history.pop();
-        replayEdits();
         photoChanged();
         $("#wiz-undo").disabled = !history.length;
       }
-      activeStroke = editDraft = tapStart = lassoDraft = stampPlace = null;
+      pendingStroke = activeStroke = strokeSource = editDraft = tapStart = lassoDraft = stampPlace = null;
       editPinch = 0;
       return drawCrop();
     }
@@ -1772,22 +1809,34 @@ cropCanvas.addEventListener(
         points: photoToSource(...p),
       };
     if (!op) return;
-    ensureOwnPhoto();
-    if (tool === "blur") {
-      strokeSource = createCanvas(photo.width, photo.height);
-      strokeSource.getContext("2d").drawImage(photo, 0, 0);
-      beginBlurMask();
-    }
-    wiz.strokes.push(op);
-    pushHistory({ stroke: true });
-    activeStroke = op;
-    lastPoint = p;
-    strokeSegment(op, p, p);
-    photoChanged();
-    drawCrop();
+    pendingStroke = { op, points: [p], t: e.timeStamp, at: [e.offsetX, e.offsetY] };
   },
   true,
 );
+
+/** The pending stroke begins: drawn up to where the finger is now. */
+function beginStroke(t) {
+  const { op, points, at } = pendingStroke;
+  pendingStroke = null;
+  strokeAt = at;
+  ensureOwnPhoto();
+  strokeSource = photoCopy(); // blur strokes copy from it; a pinch right after takes the stroke back with it
+  if (op.kind === "blur") beginBlurMask();
+  wiz.strokes.push(op);
+  pushHistory({ stroke: true });
+  activeStroke = op;
+  strokeStarted = t;
+  let last = points[0];
+  strokeSegment(op, last, last);
+  for (let i = 1; i < points.length; i++) {
+    strokeSegment(op, last, points[i]);
+    op.points.push(...photoToSource(points[i][0], points[i][1]));
+    last = points[i];
+  }
+  lastPoint = last;
+  photoChanged();
+  drawCrop();
+}
 
 cropCanvas.addEventListener(
   "pointermove",
@@ -1829,6 +1878,10 @@ cropCanvas.addEventListener(
     else if (tool === "shape" && editDraft) {
       editDraft.end = pointerToPhoto(e);
       drawCrop();
+    } else if (pendingStroke) {
+      pendingStroke.points.push(pointerToPhoto(e));
+      const moved = Math.hypot(now[0] - pendingStroke.at[0], now[1] - pendingStroke.at[1]);
+      if (moved >= STROKE_SLOP && e.timeStamp - pendingStroke.t >= STROKE_DELAY) beginStroke(e.timeStamp);
     } else if (activeStroke) {
       const q = pointerToPhoto(e);
       strokeSegment(activeStroke, lastPoint, q);
@@ -1846,9 +1899,10 @@ const editPointerUp = (e) => {
   e.stopImmediatePropagation();
   const single = editPointers.size === 1 && editPointers.has(e.pointerId);
   editPointers.delete(e.pointerId);
+  if (single && pendingStroke) beginStroke(e.timeStamp); // a tap: one dot
   if (single) finishEdit(e);
   if (!editPointers.size) {
-    activeStroke = editDraft = tapStart = strokeSource = lassoDraft = stampPlace = stampPreview = null;
+    pendingStroke = activeStroke = editDraft = tapStart = strokeSource = lassoDraft = stampPlace = stampPreview = null;
     editPinch = 0;
     drawCrop();
   }
@@ -1857,7 +1911,7 @@ cropCanvas.addEventListener("pointerup", editPointerUp, true);
 cropCanvas.addEventListener(
   "pointercancel",
   (e) => {
-    tapStart = editDraft = null;
+    tapStart = editDraft = pendingStroke = null;
     editPointerUp(e);
   },
   true,

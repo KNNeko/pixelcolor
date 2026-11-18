@@ -1879,39 +1879,128 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }
 
-/**
- * How close the palette must get to the picture for "Auto colors": the mean color difference
- * (Lab ΔE) between a cell and its palette color. ΔE ≈ 2.3 is the smallest difference people notice.
- * Lower = more colors.
+/*
+ * "Auto colors". The old rule (the fewest colors whose average error stays under a fixed limit) asked for
+ * hundreds of colors, up to the maximum, as soon as a picture had texture or JPEG noise: the error that noise
+ * leaves can only be pushed down with ever more colors, though nobody sees it.
+ *
+ * Now: an error only counts as far as it shows. A cell in a smooth area (a gradient, skin, sky) counts fully,
+ * one in busy texture or on an edge hardly (AUTO_SEEN: spread of colors around a cell, Lab ΔE, at which it
+ * counts half). The palette then grows until that error is down to AUTO_SHARE of what 16 colors leave: a
+ * picture whose error drops fast with more colors (flat areas, clean drawing) stops early, a rich one
+ * (gradients, a painted picture, a photo) goes on, up to AUTO_MAX. A picture that is already exact with
+ * a few colors (AUTO_EXACT) takes just those.
+ * And no visible color may go missing: at most AUTO_LOST of the (visibility-weighted) cells may end up farther
+ * than AUTO_LOST_DE from every palette color. That keeps small areas of their own color (skin in a picture
+ * that is mostly white background, eyes, a red badge) that the average would hardly notice.
  */
-export const AUTO_COLOR_TARGET = 1.22;
+const AUTO_SEEN = 3;
+const AUTO_SHARE = 0.4;
+const AUTO_EXACT = 0.4;
+const AUTO_LOST_DE = 8;
+const AUTO_LOST = 0.004;
+const AUTO_MAX = 240;
+const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240];
+
+/** How much each sampled cell's color error shows: 1 in a smooth area, towards 0 in texture and on edges. */
+function visibility(rgba, W, H, count) {
+  const N = W * H;
+  const step = N / count;
+  const seen = new Float32Array(count);
+  const lab = new Float32Array(27);
+  for (let s = 0; s < count; s++) {
+    const i = (s * step) | 0;
+    const x = i % W;
+    const y = (i - x) / W;
+    let n = 0;
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx;
+        const yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const p = (yy * W + xx) * 4;
+        srgbToLab(rgba[p], rgba[p + 1], rgba[p + 2], lab, n * 3);
+        n++;
+      }
+    let m0 = 0;
+    let m1 = 0;
+    let m2 = 0;
+    for (let j = 0; j < n; j++) {
+      m0 += lab[j * 3];
+      m1 += lab[j * 3 + 1];
+      m2 += lab[j * 3 + 2];
+    }
+    m0 /= n;
+    m1 /= n;
+    m2 /= n;
+    let v = 0;
+    for (let j = 0; j < n; j++) v += (lab[j * 3] - m0) ** 2 + (lab[j * 3 + 1] - m1) ** 2 + (lab[j * 3 + 2] - m2) ** 2;
+    seen[s] = 1 / (1 + v / n / (AUTO_SEEN * AUTO_SEEN));
+  }
+  return seen;
+}
 
 /**
- * Smallest color count whose average error is at most AUTO_COLOR_TARGET, x1.5 headroom (more shades for
- * gradients than the average error alone asks for).
- * Binary search over quick k-means runs on a sample (error goes down steadily as colors go up).
+ * Visible error of a palette over the sample: { error: mean Lab distance to the nearest color, lost: share of
+ * cells farther than AUTO_LOST_DE }, both weighted by `seen`.
  */
-export async function suggestColorCount(source, params, userAdjust, hooks = noHooks) {
-  const N = params.width * params.height;
-  const rgba = prepareImage(source, params, userAdjust);
-  // plain Lab here: the target below is a perceived difference
-  const sample = paletteSample(rgba, N, Math.min(N, 12000), 1);
-  const maxK = Math.max(2, Math.min(1000, Math.floor(N / 12)));
-  const fitError = async (k) => {
-    const fit = await kmeansFit(sample, k, 4, hooks);
-    if (!fit) throw new Error("cancelled");
-    return fit.error;
-  };
-  let lo = 2;
-  let hi = maxK;
-  let best = maxK; // if even maxK is not enough, use maxK
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    hooks.progress(mid);
-    if ((await fitError(mid)) <= AUTO_COLOR_TARGET) {
-      best = mid;
-      hi = mid - 1;
-    } else lo = mid + 1;
+function visibleError(sample, palette, K, seen) {
+  const pal = new Float32Array(K * 3);
+  for (let k = 0; k < K; k++) srgbToLab(palette[k * 3], palette[k * 3 + 1], palette[k * 3 + 2], pal, k * 3);
+  const pts = sample.lab;
+  let total = 0;
+  let weight = 0;
+  let lost = 0;
+  for (let i = 0; i < sample.count; i++) {
+    let best = 1e12;
+    for (let k = 0; k < K; k++) {
+      const a = pts[i * 3] - pal[k * 3];
+      const b = pts[i * 3 + 1] - pal[k * 3 + 1];
+      const c = pts[i * 3 + 2] - pal[k * 3 + 2];
+      const d = a * a + b * b + c * c;
+      if (d < best) best = d;
+    }
+    total += Math.sqrt(best) * seen[i];
+    weight += seen[i];
+    if (best > AUTO_LOST_DE * AUTO_LOST_DE) lost += seen[i];
   }
-  return Math.min(maxK, Math.max(Math.min(maxK, 16), Math.round(best * 1.5)));
+  weight = Math.max(1e-9, weight);
+  return { error: total / weight, lost: lost / weight };
+}
+
+/** Color count for "Auto colors" (see above). */
+export async function suggestColorCount(source, params, userAdjust, hooks = noHooks) {
+  const W = params.width;
+  const H = params.height;
+  const N = W * H;
+  const rgba = prepareImage(source, params, userAdjust);
+  // plain Lab here: the limits are perceived differences
+  const count = Math.min(N, 10000);
+  const sample = paletteSample(rgba, N, count, 1);
+  const seen = visibility(rgba, W, H, count);
+  const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
+  let target = 0;
+  let prevK = 0;
+  let prevError = 0;
+  let enough = 0; // color count at which the average error is low enough (x1.15 headroom)
+  let complete = 0; // first count with no visible color missing
+  for (const K of AUTO_STEPS) {
+    if (K > maxK) break;
+    hooks.progress(K);
+    const fit = await kmeansFit(sample, K, 4, hooks);
+    if (!fit) throw new Error("cancelled");
+    const { error, lost } = visibleError(sample, fit.palette, K, seen);
+    if (lost <= AUTO_LOST && !complete) complete = K;
+    if (error <= AUTO_EXACT && complete) return K; // a picture of a few flat colors
+    if (K === 16) target = AUTO_SHARE * error;
+    if (target && error <= target && !enough) {
+      // between the last two steps, where the error (on log scales) crosses the target
+      const t = prevError > error ? Math.log(prevError / target) / Math.log(prevError / error) : 1;
+      enough = Math.exp(Math.log(prevK) + t * (Math.log(K) - Math.log(prevK))) * 1.15;
+    }
+    if (enough && complete) return Math.min(maxK, Math.round(Math.max(enough, complete)));
+    prevK = K;
+    prevError = error;
+  }
+  return maxK;
 }

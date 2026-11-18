@@ -330,6 +330,20 @@ test("suggestColorCount: few colors for a flat image, more for a detailed one, n
   assert.ok(c > b, `detailed: ${c}`);
 });
 
+test("suggestColorCount: texture noise does not run the count up to the maximum", async () => {
+  // two areas with strong pixel noise (a scan, a JPEG of skin): the noise is not worth colors of its own
+  const params = { width: 60, height: 60, style: "photo", clean: 0 };
+  const maxK = Math.floor((60 * 60) / 12);
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5) * 2;
+  const noisy = image(60, 60, (x) => {
+    const n = rnd() * 14;
+    return x < 30 ? [200 + n, 120 + n, 100 + n] : [60 + n, 90 + n, 160 + n];
+  });
+  const k = await suggestColorCount(noisy, params, NO_ADJUST);
+  assert.ok(k <= maxK / 2, `noisy: ${k} (max ${maxK})`);
+});
+
 test("pickCellColors: a thin slanted anti-aliased line becomes one unbroken one-cell line of one color", () => {
   // 4 samples per cell; a dark line 1.5 samples wide, slanted, anti-aliased, on light skin
   const k = 4;
