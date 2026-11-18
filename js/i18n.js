@@ -153,7 +153,6 @@ export const STRINGS = {
   upd: "Update preview|Обновить просмотр",
   gray: "Gray|Ч/б",
   color: "Color|Цвет",
-  ncol: "colors|цветов",
   cont: "Continue|Продолжить",
   tlapse: "Time-lapse|Таймлапс",
   split: "Split|Разделить",
@@ -260,6 +259,24 @@ export const STRINGS = {
   u_h: "h|ч",
   u_cpm: "cells/min|кл/мин",
 };
+
+/** Nouns that follow a number: English one|other, Russian one|few|many (1 цвет, 3 цвета, 5 цветов, 21 цвет). */
+const PLURALS = {
+  ncol: [
+    ["color", "colors"],
+    ["цвет", "цвета", "цветов"],
+  ],
+};
+
+/** A whole number with its noun in the right form for the current language: plural(193, "ncol") = "193 цвета". */
+export function plural(n, key) {
+  const [en, ru] = PLURALS[key];
+  if (settings.lang !== "ru") return `${n} ${n === 1 ? en[0] : en[1]}`;
+  const last = n % 10;
+  const lastTwo = n % 100;
+  const form = last === 1 && lastTwo !== 11 ? 0 : last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14) ? 1 : 2;
+  return `${n} ${ru[form]}`;
+}
 
 export function t(key) {
   const s = STRINGS[key];

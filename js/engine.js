@@ -999,7 +999,7 @@ export function pickCellColors(rgba, W, H, k) {
       const q = i * 4;
       out[q + 3] = 255;
       if (thin && thin.kind[i]) {
-        lines[i] = 1;
+        lines[i] = thin.kind[i]; // 1: dark line, 2: light line or highlight
         for (let j = 0; j < 3; j++) out[q + j] = avg[i * 3 + j] = thin.color[i * 3 + j];
         range2[i] = 0;
         continue;
@@ -1683,11 +1683,11 @@ export function settle(idx, rgba, W, H, pal, K, clean, lines = null, smooth = nu
 
 /**
  * Removes connected same-color regions smaller than minSize cells: each one takes the neighbouring color
- * closest to its own (in Lab), but only if that color is within maxDelta, so a small island that clearly
- * stands out (an eye highlight) is left alone.
+ * closest to its own (in Lab), but only if that color is within maxDelta (a lone cell: singleDelta), so a small
+ * island that clearly stands out (an eye highlight) is left alone.
  * Cells touching by a corner count as connected: a thin diagonal line is one region, not a row of specks.
  */
-export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity, lines = null) {
+export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity, lines = null, singleDelta = maxDelta) {
   if (minSize < 2) return;
   const N = W * H;
   const palLab = paletteToLab(pal, pal.length / 3);
@@ -1754,11 +1754,16 @@ export function removeSpecks(idx, W, H, minSize, pal, maxDelta = Infinity, lines
     }
   }
   const limit = maxDelta * maxDelta;
+  const singleLimit = Math.max(limit, singleDelta * singleDelta);
   for (let i = 0; i < N; i++) {
     const L = region[i];
-    if (regionSize[L] < minSize && bestColor[L] >= 0 && bestDist[L] <= limit) idx[i] = bestColor[L];
+    if (regionSize[L] >= minSize || bestColor[L] < 0) continue;
+    if (bestDist[L] <= (regionSize[L] === 1 ? singleLimit : limit)) idx[i] = bestColor[L];
   }
 }
+
+/** A lone cell (no same-color cell around, corners included) merges up to this many times further. */
+const LONE_CELL = 1.8;
 
 /** Band borders are softened only between palette colors at most this far apart (Lab distance). */
 const RAMP_REACH = 7;
@@ -1940,13 +1945,15 @@ export function prepareImage(source, params, userAdjust) {
     rgba =
       style === "art" ? pickCellColors(rgba, W, H, k) : boxScale({ data: rgba, width: W * k, height: H * k }, W, H);
   const focus = focusCells(source.mask, W, H);
-  const lines = keptCells(rgba.lines || null, focus, W * H);
+  const ink = rgba.lines || null;
+  const lines = keptCells(ink, focus, W * H);
   if (style === "art") rgba = smoothGradients(rgba, W, H, clean > 0 ? 24 + 4 * clean : 0, lines);
   const smooth = rgba.smooth || null;
   const out = smoothFlat(rgba, W, H, clean, lines);
   out.lines = lines; // thin-line cells (art mode) and marked ones: the clean-up steps leave them alone
   out.smooth = smooth; // cells inside soft gradients and flat areas (art mode)
   out.focus = focus; // "important" marks per cell, or null
+  out.ink = ink; // the thin-line cells alone (art mode): 1 dark line, 2 light line or highlight
   return out;
 }
 
@@ -1983,16 +1990,99 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
   if (!dither) rescueRareColors(rgba, W * H, pal, K, idx, rgba.focus);
+  if (rgba.ink) unifyLines(idx, rgba, W, H, pal, K, rgba.ink);
   if (!dither && clean > 0) {
     settle(idx, rgba, W, H, pal, K, clean, lines, smooth);
-    // only specks that hardly differ from their surroundings: small details that stand out stay
-    removeSpecks(idx, W, H, 2 + (clean >> 2), pal, 3 + clean * 0.8, lines);
+    // only specks that hardly differ from their surroundings: small details that stand out stay; a lone cell
+    // a little more readily (each one is a separate color to pick while painting)
+    const speck = 3 + clean * 0.8;
+    removeSpecks(idx, W, H, 2 + (clean >> 2), pal, speck, lines, speck * LONE_CELL);
   }
   // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
   // (not in art mode: drawn pictures have clean color bands, a checker seam along every band reads as noise)
   if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0, rgba.focus);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
+}
+
+/*
+ * Thin lines in one color. Each line cell is matched to the palette on its own, and with a few hundred colors
+ * the close shades of one outline become a patchwork of numbers (on drawn pictures a third to a half of the
+ * neighbouring line cells differed): painting one line meant switching colors all along it.
+ * So, for each line (line cells of one kind touching, corners included): its most used color takes every cell
+ * of the line whose own color is within LINE_REACH (Lab ΔE; LINE_REACH_LIGHT for light lines and highlights,
+ * whose shade shows more) of it; among the cells left, their most used color does the same, and so on.
+ * A line of clearly different colors (red lips meeting a black outline, a darker shadow line) keeps them.
+ */
+const LINE_REACH = 8;
+const LINE_REACH_LIGHT = 5;
+
+/** See above: changes idx of line cells (ink: 1 dark line, 2 light line, 0 none). */
+export function unifyLines(idx, rgba, W, H, pal, K, ink) {
+  const N = W * H;
+  const palLab = paletteToLab(pal, K);
+  const seen = new Uint8Array(N);
+  const queue = new Int32Array(N);
+  const lab = new Float32Array(3);
+  const count = new Int32Array(K);
+  for (let start = 0; start < N; start++) {
+    const kind = ink[start];
+    if (!kind || seen[start]) continue;
+    // the line: line cells of the same kind, 8-connected
+    let n = 0;
+    queue[n++] = start;
+    seen[start] = 1;
+    for (let q = 0; q < n; q++) {
+      const i = queue[q];
+      const x = i % W;
+      const y = (i - x) / W;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= W) continue;
+          const j = yy * W + xx;
+          if (seen[j] || ink[j] !== kind) continue;
+          seen[j] = 1;
+          queue[n++] = j;
+        }
+      }
+    }
+    if (n < 2) continue;
+    const reach2 = (kind === 2 ? LINE_REACH_LIGHT : LINE_REACH) ** 2;
+    // own colors of the line's cells
+    const own = new Float32Array(n * 3);
+    for (let q = 0; q < n; q++) {
+      const i = queue[q];
+      srgbToLab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], lab, 0);
+      own.set(lab, q * 3);
+    }
+    const done = new Uint8Array(n);
+    let left = n;
+    while (left > 0) {
+      // the most used color among the cells left
+      let top = -1;
+      for (let q = 0; q < n; q++) if (!done[q]) count[idx[queue[q]]]++;
+      for (let q = 0; q < n; q++) {
+        const c = idx[queue[q]];
+        if (!done[q] && (top < 0 || count[c] > count[top])) top = c;
+      }
+      for (let q = 0; q < n; q++) count[idx[queue[q]]] = 0;
+      let took = 0;
+      for (let q = 0; q < n; q++) {
+        if (done[q]) continue;
+        const a = own[q * 3] - palLab[top * 3];
+        const b = own[q * 3 + 1] - palLab[top * 3 + 1];
+        const c = own[q * 3 + 2] - palLab[top * 3 + 2];
+        if (idx[queue[q]] !== top && a * a + b * b + c * c > reach2) continue;
+        idx[queue[q]] = top;
+        done[q] = 1;
+        took++;
+      }
+      left -= took;
+    }
+  }
 }
 
 /*

@@ -15,7 +15,7 @@ import {
   initRangeSlider,
   translatePage,
 } from "./ui.js";
-import { t } from "./i18n.js";
+import { t, plural } from "./i18n.js";
 import {
   boxScale,
   applyAdjustments,
@@ -272,6 +272,7 @@ function applyState(st) {
   $("#px-height").value = p.height;
   setSlider("colors", p.colors);
   $("#colors-exact").value = p.colors;
+  wiz.colorsSet = true; // a canvas made again keeps its number of colors
   setSlider("clean", p.clean);
   wiz.style = p.style;
   wiz.sized = true;
@@ -331,7 +332,15 @@ function goToStep(n) {
     syncPixelCount();
     applyPreviewZoom();
     renderStyleList();
-    runPreview();
+    if (wiz.colorsSet) runPreview();
+    else {
+      // a new picture: "Auto colors" runs by itself the first time (after a rough draft to look at on a big
+      // canvas); from then on the number is the user's, the button recounts it
+      wiz.colorsSet = true;
+      const p = pixelParams();
+      if (p.width * p.height >= DRAFT_FROM) runDraft(() => autoColors(true));
+      else autoColors(true);
+    }
   }
 }
 
@@ -2809,13 +2818,13 @@ function schedulePreview() {
   const p = pixelParams();
   const onlyColors = shownParams && exceptColors(p) === exceptColors(shownParams);
   if (!onlyColors && p.width * p.height >= DRAFT_FROM) {
-    draftTimer = setTimeout(runDraft, Math.max(0, 250 - (performance.now() - draftAt)));
+    draftTimer = setTimeout(() => runDraft(), Math.max(0, 250 - (performance.now() - draftAt)));
     return;
   }
   previewTimer = setTimeout(runPreview, p.width * p.height > 1e6 ? 900 : 450);
 }
 
-async function runDraft() {
+async function runDraft(next = runPreview) {
   if (wiz.step !== 3 || wiz.creating) return;
   draftAt = performance.now();
   const p = pixelParams();
@@ -2833,7 +2842,7 @@ async function runDraft() {
   if (!result) return; // a newer draft or preview took over
   drawCells(result);
   // the real one right after it (a slider moving again cancels it)
-  previewTimer = setTimeout(runPreview, 30);
+  previewTimer = setTimeout(next, 30);
 }
 
 /* ---------- worker client ---------- */
@@ -2940,7 +2949,7 @@ function showPreview() {
   }
   drawCells(wiz.result.result);
   $("#palette-strip").innerHTML = strip;
-  $("#preview-info").textContent = `${K} ${t("ncol")} · ${W}×${H}`;
+  $("#preview-info").textContent = `${plural(K, "ncol")} · ${W}×${H}`;
   $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
 }
 
@@ -2997,20 +3006,30 @@ $("#preview-gray").onclick = () => {
   else $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
 };
 
-$("#btn-auto-colors").onclick = async () => {
-  setBusy(true, t("autoc"));
+$("#btn-auto-colors").onclick = () => autoColors(false);
+
+/**
+ * "Auto colors": picks the number of colors, then shows the preview with it. quiet: the automatic run when a
+ * new picture first reaches this step: no busy screen, the progress shows under the preview, and anything
+ * the user changes meanwhile simply takes over (its preview replaces this job in the worker).
+ */
+async function autoColors(quiet) {
+  const label = t("autoc");
+  const status = (text) => (quiet ? ($("#preview-info").textContent = text) : setBusyText(text));
+  if (quiet) status(label + "…");
+  else setBusy(true, label);
   try {
-    const best = await runJob("suggest", pixelParams(), (mid) => setBusyText(t("autoc") + " · " + mid));
-    setBusy(false);
-    if (best == null) return;
+    const best = await runJob("suggest", pixelParams(), (mid) => status(label + " · " + mid));
+    if (!quiet) setBusy(false);
+    if (best == null) return; // replaced by a newer job
     setSlider("colors", best);
-    toast(t("autoc") + ": " + best);
+    if (!quiet) toast(label + ": " + best);
     runPreview();
   } catch (e) {
-    setBusy(false);
+    if (!quiet) setBusy(false);
     toast(String(e));
   }
-};
+}
 
 /** Builds the final canvas (reusing the preview if nothing changed) and opens it for coloring. */
 async function createCanvasFromResult() {

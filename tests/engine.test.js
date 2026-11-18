@@ -21,6 +21,7 @@ import {
   ditherRamps,
   smoothGradients,
   srgbToLab,
+  unifyLines,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -480,4 +481,52 @@ test("a small detail in a color of its own keeps it (rescueRareColors): a blue i
     assert.ok(d < 10, `${style}: the blue cells got rgb(${r.pal.slice(k * 3, k * 3 + 3)}), ΔE ${d.toFixed(1)}`);
     assert.ok(r.pal.length / 3 <= 64, `${style}: ${r.pal.length / 3} colors`);
   }
+});
+
+test("unifyLines: one outline gets one number, a line of another color keeps its own", () => {
+  const W = 40;
+  const H = 3;
+  const rgba = new Uint8ClampedArray(W * H * 4).fill(235); // light background
+  const ink = new Uint8Array(W * H);
+  // the middle row is a line: 30 cells of two close dark shades, mixed, then 10 cells of red
+  const shade = (x) => (x % 3 ? [40, 34, 38] : [52, 44, 50]);
+  for (let x = 0; x < W; x++) {
+    const i = W + x;
+    const c = x < 30 ? shade(x) : [190, 30, 40];
+    rgba.set([...c, 255], i * 4);
+    ink[i] = 1;
+  }
+  const pal = [235, 235, 235, 40, 34, 38, 52, 44, 50, 190, 30, 40];
+  const idx = new Uint16Array(W * H);
+  for (let x = 0; x < W; x++) idx[W + x] = x < 30 ? (x % 3 ? 1 : 2) : 3;
+  unifyLines(idx, rgba, W, H, pal, 4, ink);
+  const dark = new Set(Array.from(idx.slice(W, W + 30)));
+  assert.equal(dark.size, 1, `the dark part has ${dark.size} numbers`);
+  assert.ok(
+    Array.from(idx.slice(W + 30, W + 40)).every((k) => k === 3),
+    "the red part stays red",
+  );
+  assert.ok(
+    Array.from(idx.slice(0, W)).every((k) => k === 0),
+    "the background is not touched",
+  );
+});
+
+test("removeSpecks: a lone cell merges a little more readily than a bigger speck, a clearly different one stays", () => {
+  const W = 9;
+  const H = 9;
+  const pal = [128, 128, 128, 148, 148, 148, 200, 200, 200]; // gray; ~7.6 ΔE lighter; ~27 ΔE lighter
+  const make = () => new Uint16Array(W * H);
+  // a lone cell ~7.6 ΔE off: over the speck limit (5.4 at clean 3), under the lone-cell one
+  let idx = make();
+  idx[4 * W + 4] = 1;
+  idx[1 * W + 1] = 2;
+  removeSpecks(idx, W, H, 2, pal, 5.4, null, 5.4 * 1.8);
+  assert.equal(idx[4 * W + 4], 0, "the lone light-gray cell joins the gray around it");
+  assert.equal(idx[1 * W + 1], 2, "the much lighter cell (a highlight) stays");
+  // two touching cells of that color are not a lone cell: they stay
+  idx = make();
+  idx[4 * W + 4] = idx[4 * W + 5] = 1;
+  removeSpecks(idx, W, H, 2, pal, 5.4, null, 5.4 * 1.8);
+  assert.equal(idx[4 * W + 4], 1);
 });
