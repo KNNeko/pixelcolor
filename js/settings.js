@@ -32,6 +32,7 @@ export const DEFAULTS = {
   pm: "art", // pixelization mode used last (art | photo | dither)
   pcl: 3, // pixelization "cleanliness" used last, 0..10
   tot: null, // lifetime painting statistics (stats.js); null until first counted
+  mq: 0, // resolution step while the picture moves (game.js MOTION_SCALES), learned from frame times
 };
 
 export const settings = { ...DEFAULTS };

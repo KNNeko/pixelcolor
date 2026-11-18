@@ -33,7 +33,7 @@ import {
 } from "./parts.js";
 import { openTimelapse } from "./timelapse.js";
 import { launchConfetti } from "./confetti.js";
-import { createGlView } from "./glview.js";
+import { createGlView, CELL } from "./glview.js";
 import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
 import { emptyStats, IDLE_LIMIT, dayKey, canvasStatsHtml } from "./stats.js";
 
@@ -113,7 +113,7 @@ export const game = {
   canvasChanged: false, // the big pixel record (parts/mode/done) must be rewritten
   thumbsStale: false,
   buffer: null,
-  flags: null, // Uint8Array per cell for the WebGL renderer: bit 0 painted, bit 1 in another part
+  flags: null, // Uint8Array per cell for the WebGL renderer: its state (glview's CELL bits)
   useGl: false, // this canvas is drawn by the WebGL renderer
 
   // colors as 32-bit pixels
@@ -434,57 +434,78 @@ export function paletteDisplayOrder() {
 const SWATCH_PATH = "M26 2H37A13 13 0 0 1 50 15V37A13 13 0 0 1 37 50H15A13 13 0 0 1 2 37V15A13 13 0 0 1 15 2Z";
 const swatches = [];
 const textColorFor = (r, g, b) => (0.3 * r + 0.59 * g + 0.11 * b > 140 ? "#000" : "#fff");
+/**
+ * The progress ring shows on the selected swatch only, so there is one, moved to whichever swatch is
+ * selected (hundreds of swatches with a ring each were hundreds of SVGs to build and keep).
+ */
+const ring = document.createElement("div");
+ring.innerHTML = `<svg viewBox="0 0 52 52"><path class="ring" d="${SWATCH_PATH}"/><path class="ring-progress" pathLength="100" d="${SWATCH_PATH}"/></svg>`;
+const ringSvg = ring.firstChild;
+const ringProgress = ringSvg.lastChild;
+let ringDash = "";
 
+/** The strip: built as one piece of HTML; one click handler for all of it (see #palette onclick). */
 export function renderPalette() {
   const el = $("#palette");
-  el.innerHTML = "";
   swatches.length = 0;
-  const utility = (iconName, onClick) => {
-    const b = document.createElement("button");
-    b.className = "swatch utility";
-    b.innerHTML = icon(iconName);
-    b.onclick = onClick;
-    el.append(b);
-  };
-  utility("grid", openAllColors);
-  utility("sort", cyclePaletteSort);
   const pal = game.canvas.palette;
+  let html =
+    `<button class="swatch utility" data-act="grid">${icon("grid")}</button>` +
+    `<button class="swatch utility" data-act="sort">${icon("sort")}</button>`;
   for (const k of paletteDisplayOrder()) {
     if (game.part >= 0 && !game.partColorCount[k]) continue;
     const [r, g, b] = [pal[k * 3], pal[k * 3 + 1], pal[k * 3 + 2]];
-    const btn = document.createElement("button");
-    btn.className = "swatch with-progress";
-    btn.innerHTML =
-      `<svg viewBox="0 0 52 52"><path class="ring" d="${SWATCH_PATH}"/><path class="ring-progress" pathLength="100" d="${SWATCH_PATH}"/></svg>` +
-      `<u style="background:rgb(${r},${g},${b});color:${textColorFor(r, g, b)}">${k + 1}<i></i></u>`;
-    btn.onclick = () => selectColor(k + 1);
-    el.append(btn);
+    html +=
+      `<button class="swatch with-progress" data-k="${k}">` +
+      `<u style="background:rgb(${r},${g},${b});color:${textColorFor(r, g, b)}">${k + 1}<i></i></u></button>`;
+  }
+  el.innerHTML = html;
+  for (const btn of el.querySelectorAll("[data-k]")) {
+    const k = +btn.dataset.k;
+    btn._left = btn.querySelector("i");
     swatches[k] = btn;
     updateSwatch(k);
   }
 }
+$("#palette").onclick = (e) => {
+  const btn = e.target.closest(".swatch");
+  if (!btn) return;
+  if (btn.dataset.k) selectColor(+btn.dataset.k + 1);
+  else if (btn.dataset.act === "grid") openAllColors();
+  else if (btn.dataset.act === "sort") cyclePaletteSort();
+};
 
-/** The parts of a swatch that change while painting: cells left and the progress ring. */
+/**
+ * The parts of a swatch that change while painting: cells left, and the progress ring if it is the
+ * selected one. A value that did not change is not written again (every write makes the browser restyle
+ * and repaint the strip).
+ */
 function updateSwatchProgress(k) {
   const btn = swatches[k];
   if (!btn) return;
   const left = remainingOf(k);
+  const text = left ? String(left) : "✓";
+  if (btn._text !== text) btn._left.textContent = btn._text = text;
+  if (ringSvg.parentNode !== btn) return;
   const total = game.part < 0 ? game.totalOfColor[k] : game.partColorCount[k];
-  btn.querySelector("i").textContent = left || "✓";
-  btn.querySelector(".ring-progress").style.strokeDasharray = (total ? (100 * (total - left)) / total : 100) + " 101";
+  const dash = (total ? Math.round((1000 * (total - left)) / total) / 10 : 100) + " 101";
+  if (ringDash !== dash) ringProgress.style.strokeDasharray = ringDash = dash;
 }
 
+const progressPill = $("#play-progress");
 /** Percentage in the pill at the top. */
 function updateProgressPill() {
   const total = game.part < 0 ? cellCount() : game.partTotal;
   const correct = game.part < 0 ? game.correct : game.partCorrect;
-  $("#play-progress").textContent = (total ? (correct / total) * 100 : 0).toFixed(1) + "%";
+  const text = (total ? (correct / total) * 100 : 0).toFixed(1) + "%";
+  if (progressPill.textContent !== text) progressPill.textContent = text;
 }
 
 export function updateSwatch(k) {
   const btn = swatches[k];
   if (!btn) return;
   const left = remainingOf(k);
+  if (game.selected === k + 1 && ringSvg.parentNode !== btn) btn.prepend(ringSvg);
   updateSwatchProgress(k);
   btn.classList.toggle("on", game.selected === k + 1);
   btn.classList.toggle("done", !left);
@@ -769,15 +790,20 @@ function flood(i, accept) {
   let tail = 0;
   floodQueue[tail++] = i;
   floodSeen[i] = 1;
+  // (no array per cell for its neighbours: a fill over a big area visits hundreds of thousands)
+  const visit = (j) => {
+    if (!floodSeen[j] && accept(j)) {
+      floodSeen[j] = 1;
+      floodQueue[tail++] = j;
+    }
+  };
   while (head < tail) {
     const c = floodQueue[head++];
     const x = c % W;
-    const y = (c / W) | 0;
-    for (const j of [x > 0 ? c - 1 : -1, x < W - 1 ? c + 1 : -1, y > 0 ? c - W : -1, y < H - 1 ? c + W : -1])
-      if (j >= 0 && !floodSeen[j] && accept(j)) {
-        floodSeen[j] = 1;
-        floodQueue[tail++] = j;
-      }
+    if (x > 0) visit(c - 1);
+    if (x < W - 1) visit(c + 1);
+    if (c >= W) visit(c - W);
+    if (c < W * (H - 1)) visit(c + W);
   }
   for (let k = 0; k < tail; k++) floodSeen[floodQueue[k]] = 0;
   return tail;
@@ -920,6 +946,115 @@ export function requestDraw() {
   drawQueued = true;
   requestAnimationFrame(() => drawQueued && draw());
 }
+
+/*
+ * Lighter frames while the picture moves. A weak phone's GPU may not manage the whole screen at full
+ * resolution 60 times a second. While the picture is panned or zoomed, the WebGL canvas then gets fewer
+ * pixels (the browser stretches it over the screen, which nobody notices in motion), and the sharp frame
+ * follows as soon as it stops. How many fewer is learned on the device, from frame times measured while
+ * moving: a step down when frames come too slowly, a step up after a few smooth gestures (settings.mq).
+ * Painting keeps full resolution: then the picture stands still and its numbers must stay sharp.
+ */
+const MOTION_SCALES = [1, 0.85, 0.7, 0.6, 0.5];
+const MOTION_END_MS = 150; // no movement for this long and for two frames (or the finger lifted): it is over
+const motion = {
+  active: false,
+  moved: false, // since the last frame
+  still: 0, // frames in a row without movement
+  lastMove: 0,
+  lastFrame: 0,
+  average: 0, // frame time while moving (moving average), ms
+  gpu: 0, // time the GPU took for a frame, from drawing to done (moving average), ms
+  gpuSamples: 0,
+  samples: 0,
+  vsync: 16.7, // shortest frame time seen: the display's refresh
+  smooth: 0, // gestures in a row that were smooth
+  wait: 5, // smooth gestures before a sharper step is tried (doubles each time that turns out too slow)
+  tried: false, // the current step is a sharper one being tried
+};
+
+/** The GL canvas size for now: full resolution, or the motion step while the picture moves. */
+function applyGlSize() {
+  if (!glView) return;
+  const scale = motion.active ? MOTION_SCALES[Math.min(settings.mq | 0, MOTION_SCALES.length - 1)] : 1;
+  glView.resize(Math.round(screen.width * screen.dpr * scale), Math.round(screen.height * screen.dpr * scale));
+}
+
+/** The picture moved (pan, pinch, wheel). */
+function noteMotion() {
+  motion.moved = true;
+  motion.lastMove = performance.now();
+  if (motion.active) return;
+  motion.active = true;
+  motion.still = motion.samples = motion.lastFrame = motion.gpuSamples = 0;
+  if (glView && game.useGl) glView.trackGpu(true);
+  requestAnimationFrame(measureFrame);
+  if (game.useGl && settings.mq) {
+    applyGlSize();
+    drawNow(); // right away: a resized canvas is blank until drawn
+  }
+}
+
+function endMotion() {
+  if (!motion.active) return;
+  motion.active = false;
+  if (glView) glView.trackGpu(false);
+  if (game.useGl && motion.samples >= 5) {
+    // Too slow: frames more than 1.4 refreshes apart (under ~43 fps on a 60 Hz screen) while the GPU is
+    // what holds them up (still busy with a frame well into the next ones; if it is not, fewer pixels would
+    // not help): fewer pixels next time. Smooth for `wait` gestures in a row: a sharper step is tried; if
+    // that is too slow, it goes back and the next try waits twice as long.
+    const step = settings.mq | 0;
+    let next = step;
+    const gpuBound = motion.gpuSamples < 3 || motion.gpu > motion.vsync * 2.5;
+    if (motion.average > motion.vsync * 1.4 && gpuBound) {
+      next = Math.min(MOTION_SCALES.length - 1, step + 1);
+      if (motion.tried) motion.wait = Math.min(80, motion.wait * 2);
+      motion.smooth = 0;
+      motion.tried = false;
+    } else if (motion.average < motion.vsync * 1.15) {
+      if (++motion.smooth >= motion.wait && step > 0) {
+        next = step - 1;
+        motion.smooth = 0;
+        motion.tried = true;
+      }
+    } else motion.smooth = 0;
+    if (next !== step) {
+      settings.mq = next;
+      saveSettings();
+    }
+  }
+  if (game.useGl && glView && glCanvas.width !== Math.round(screen.width * screen.dpr)) {
+    applyGlSize();
+    drawNow();
+  } else if (!game.useGl) drawNow(); // the 2D drawing leaves out the details while moving (see draw2d)
+}
+
+/**
+ * Frame time while moving, from the browser's own frame callbacks: they come as fast as the phone manages
+ * the frames the moving picture asks for. Also ends the motion once the picture stands still (counted in
+ * frames: on a slow phone the moves themselves come one long frame apart).
+ */
+function measureFrame(t) {
+  if (!motion.active) return;
+  if (motion.moved) {
+    motion.moved = false;
+    motion.still = 0;
+  } else if (++motion.still >= 2 && performance.now() - motion.lastMove > MOTION_END_MS) return endMotion();
+  const dt = t - motion.lastFrame;
+  if (motion.lastFrame && dt < 1000) {
+    if (dt > 5) motion.vsync = Math.min(motion.vsync, Math.max(6, dt));
+    motion.average = motion.samples ? motion.average * 0.8 + dt * 0.2 : dt;
+    motion.samples++;
+  }
+  if (glView)
+    for (const busy of glView.pollGpu(t)) {
+      motion.gpu = motion.gpuSamples ? motion.gpu * 0.8 + busy * 0.2 : busy;
+      motion.gpuSamples++;
+    }
+  motion.lastFrame = t;
+  requestAnimationFrame(measureFrame);
+}
 /**
  * Draws right now instead of at the next animation frame. A finger touching down is reported between
  * frames; waiting for the next frame would show the first dab of paint one frame late.
@@ -954,7 +1089,7 @@ export function handleResize() {
   }
   playCanvas.width = Math.round(screen.width * screen.dpr);
   playCanvas.height = Math.round(screen.height * screen.dpr);
-  if (glView) glView.resize(playCanvas.width, playCanvas.height);
+  applyGlSize();
   placeMinimap();
   draw();
 }
@@ -1011,6 +1146,11 @@ function isFilled(x, y) {
 }
 
 let overlayUsed = false; // something is drawn on the 2D canvas above the WebGL picture
+let overlayShown = true; // the 2D canvas is visible (opacity) at all
+/** When the swatches and the percentage were last brought up to date while a finger paints. */
+let liveProgressAt = 0;
+const LIVE_PROGRESS_MS = 150;
+const fades = { cell: 0, number: 0, grid: 0, contrastNumbers: false };
 
 function draw() {
   drawQueued = false;
@@ -1020,17 +1160,17 @@ function draw() {
   // canvas.mode: "n" numbers (the silhouette gives way to plain cells with numbers when zoomed in),
   //              "s" silhouette only, "b" both (numbers on top of the silhouette)
   const mode = game.canvas.mode;
-  const fades = {
-    cell: mode === "n" && settings.sil ? smoothstep(4, 16, s) : 0,
-    number: mode !== "s" ? smoothstep(10, 18, s) : 0,
-    grid: settings.grid ? smoothstep(5, 10, s) : 0,
-    // over a silhouette every number picks black or white, whichever reads better on its cell
-    contrastNumbers: mode === "b",
-  };
+  fades.cell = mode === "n" && settings.sil ? smoothstep(4, 16, s) : 0;
+  fades.number = mode !== "s" ? smoothstep(10, 18, s) : 0;
+  fades.grid = settings.grid ? smoothstep(5, 10, s) : 0;
+  // over a silhouette every number picks black or white, whichever reads better on its cell
+  fades.contrastNumbers = mode === "b";
   const withGl = !!(game.useGl && glView.ready && drawGl(fades));
   if (glCanvas.hidden === withGl) glCanvas.hidden = !withGl;
-  if (game.stroke && game.touchedColors.size) {
-    // the finger is still down: keep the progress rings and the percentage up to date as it paints
+  if (game.stroke && game.touchedColors.size && performance.now() - liveProgressAt > LIVE_PROGRESS_MS) {
+    // the finger is still down: keep the progress rings and the percentage up to date as it paints (a few
+    // times a second: every frame, the restyling of the strip costs a weak phone frames)
+    liveProgressAt = performance.now();
     game.touchedColors.forEach(updateSwatchProgress);
     updateProgressPill();
   }
@@ -1060,36 +1200,84 @@ function draw() {
     drawSplitOverlay(ctx);
     overlayUsed = true;
   }
+  // An empty 2D canvas over the WebGL picture still costs the GPU a whole screen of blending every frame:
+  // while nothing is drawn on it, it is made fully transparent, which the browser skips (it still gets the
+  // touches)
+  if (overlayShown !== overlayUsed) {
+    overlayShown = overlayUsed;
+    playCanvas.style.opacity = overlayUsed ? "" : "0";
+  }
   drawMinimap();
 }
+
+/**
+ * The CELL bits of the cells in rect and one cell around it (their grid lines depend on their neighbours):
+ * painted, in another part, hidden, and on which sides a grid line is needed. Returns that larger rectangle.
+ */
+let filledScratch = new Uint8Array(0);
+function updateCellStates(rect) {
+  const { width: W, height: H, partOf } = game.canvas;
+  const { paint, flags: states, part } = game;
+  const hideOthers = !settings.oth;
+  const x0 = Math.max(0, rect[0] - 1);
+  const y0 = Math.max(0, rect[1] - 1);
+  const x1 = Math.min(W - 1, rect[2] + 1);
+  const y1 = Math.min(H - 1, rect[3] + 1);
+  // filled, for those cells and one more around: no grid line is needed between two filled cells (painted,
+  // hidden, or outside the picture)
+  const fw = x1 - x0 + 3;
+  const fh = y1 - y0 + 3;
+  if (filledScratch.length < fw * fh) filledScratch = new Uint8Array(fw * fh);
+  const filled = filledScratch;
+  for (let fy = 0, y = y0 - 1; fy < fh; fy++, y++)
+    for (let fx = 0, x = x0 - 1; fx < fw; fx++, x++) {
+      const i = y * W + x;
+      filled[fy * fw + fx] =
+        x < 0 || y < 0 || x >= W || y >= H || paint[i] !== 0 || (hideOthers && part >= 0 && partOf[i] !== part) ? 1 : 0;
+    }
+  for (let y = y0; y <= y1; y++)
+    for (let x = x0, j = (y - y0 + 1) * fw + 1; x <= x1; x++, j++) {
+      const i = y * W + x;
+      const outside = part >= 0 && partOf[i] !== part;
+      const self = filled[j];
+      let s = (paint[i] ? CELL.PAINTED : 0) | (outside ? CELL.OUTSIDE : 0) | (outside && hideOthers ? CELL.HIDDEN : 0);
+      if (!(self && filled[j - 1])) s |= CELL.LINE_LEFT;
+      if (!(self && filled[j + 1])) s |= CELL.LINE_RIGHT;
+      if (!(self && filled[j - fw])) s |= CELL.LINE_TOP;
+      if (!(self && filled[j + fw])) s |= CELL.LINE_BOTTOM;
+      states[i] = s;
+    }
+  return [x0, y0, x1, y1];
+}
+
+/** What glView.draw gets, filled in every frame (one object, not a new one every frame). */
+const glFrame = {};
 
 /** WebGL path: send what changed to the GPU, draw the screen in one call. Returns false if it could not draw. */
 function drawGl(fades) {
   const rect = game.buffer.take("gl");
-  if (rect) {
-    const { width: W, partOf } = game.canvas;
-    const { paint, flags, part } = game;
-    for (let y = rect[1]; y <= rect[3]; y++)
-      for (let i = y * W + rect[0], end = y * W + rect[2]; i <= end; i++)
-        flags[i] = (paint[i] ? 1 : 0) | (part >= 0 && partOf[i] !== part ? 2 : 0);
-    glView.upload(game.buffer.pixels, flags, rect);
-  }
-  return glView.draw({
-    x: view.x,
-    y: view.y,
-    scale: view.scale,
-    dpr: screen.dpr,
-    theme: game.theme,
-    cellFade: fades.cell,
-    gridFade: fades.grid,
-    numberFade: fades.number,
-    contrastNumbers: fades.contrastNumbers,
-    selected: settings.hl ? game.selected : 0,
-    showOthers: !!settings.oth,
-  });
+  if (rect) glView.upload(game.buffer.pixels, game.flags, updateCellStates(rect));
+  const f = glFrame;
+  f.x = view.x;
+  f.y = view.y;
+  f.scale = view.scale;
+  f.dpr = glCanvas.width / screen.width; // device pixels of the GL canvas (fewer while moving, see motion)
+  f.now = performance.now();
+  f.theme = game.theme;
+  f.cellFade = fades.cell;
+  f.gridFade = fades.grid;
+  f.numberFade = fades.number;
+  f.contrastNumbers = fades.contrastNumbers;
+  f.selected = settings.hl ? game.selected : 0;
+  return glView.draw(f);
 }
 
-/** Fallback without WebGL: the same picture drawn with the 2D canvas API (slow when many cells are visible). */
+/**
+ * Fallback without WebGL: the same picture drawn with the 2D canvas API (slow when many cells are visible:
+ * a call per cell). While the picture moves only the picture itself is drawn (its silhouette: one call, and
+ * its shapes to find the way by); the cells, grid and numbers follow when it stops. A phone without WebGL 2
+ * is a weak one.
+ */
 function draw2d(fades) {
   const { width: W, height: H, target } = game.canvas;
   const theme = game.theme;
@@ -1122,6 +1310,7 @@ function draw2d(fades) {
     (y1 - y0) * s,
   );
 
+  if (motion.active) return;
   if (fades.cell > 0) {
     for (let y = y0; y < y1; y++)
       for (let x = x0; x < x1; x++) {
@@ -1493,6 +1682,7 @@ playCanvas.addEventListener(
   (e) => {
     e.preventDefault();
     noteActivity();
+    noteMotion();
     zoomAround(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
     requestDraw();
   },
@@ -1600,6 +1790,7 @@ playCanvas.addEventListener("pointermove", (e) => {
     const dist = Math.hypot(a[0] - b[0], a[1] - b[1]);
     const center = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
     if (input.pinchDist) {
+      noteMotion();
       zoomAround(center[0], center[1], dist / input.pinchDist);
       if (settings.two || game.splitting) {
         view.x += center[0] - input.pinchCenter[0];
@@ -1622,6 +1813,7 @@ playCanvas.addEventListener("pointermove", (e) => {
       view.x += now[0] - input.downAt[0];
       view.y += now[1] - input.downAt[1];
     } else return;
+    noteMotion();
     requestDraw();
   } else if (game.stroke && brushActive()) {
     if (input.doubleTap && input.moved <= TAP_SLOP) return; // a double tap's finger paints only once it moves
@@ -1641,6 +1833,7 @@ const DOUBLE_TAP_TOOLS = ["brush", "bucket", "wand"];
 
 function pointerUp(e) {
   if (!pointers.delete(e.pointerId) || pointers.size) return;
+  endMotion(); // the picture stops with the finger: the sharp frame right away
   if (game.splitting && splitPointerUp()) return;
   const c = cellAt(e);
   const eventsBefore = game.events.length;

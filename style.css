@@ -927,6 +927,9 @@ header b {
   font-size: 15px;
   position: relative;
   padding: 0;
+  /* a palette of hundreds of colors: the browser lays out and paints only the swatches in view */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 52px auto 52px;
 }
 .swatch i {
   position: absolute;

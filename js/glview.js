@@ -4,8 +4,8 @@
 // number): thousands of calls per frame when zoomed in, and all numbers re-rasterized on every zoom step.
 // Here the whole screen is one triangle and a fragment shader works out every screen pixel by itself:
 //   - which cell it is in, and that cell's color (texture uColor = the game's pixel buffer);
-//   - whether the cell is empty / highlighted / in another part (textures uFlags, uTarget);
-//   - whether it lies on a grid line (only next to at least one empty cell);
+//   - its color number and whether it is empty / highlighted / in another part (texture uInfo);
+//   - whether it lies on a grid line (only next to at least one empty cell: game.js marks the sides);
 //   - whether it lies on a digit of the cell's number (digits come from a small atlas texture, uGlyphs).
 // The cost of a frame depends on the screen size only, not on the canvas size or the zoom level.
 //
@@ -19,142 +19,188 @@ void main() {
   gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0);
 }`;
 
-const FRAGMENT = `#version 300 es
+/**
+ * State of a cell, as game.js sets it (blue channel of the info texture). The line bits say on which sides
+ * of the cell a grid line is needed: only next to at least one empty cell (so finished areas look clean).
+ */
+export const CELL = {
+  PAINTED: 1,
+  OUTSIDE: 2, // belongs to another part than the one being colored
+  HIDDEN: 4, // ...and other parts are not shown
+  LINE_LEFT: 8,
+  LINE_RIGHT: 16,
+  LINE_TOP: 32,
+  LINE_BOTTOM: 64,
+};
+
+/*
+ * The fragment shader comes in three variants, by what the zoom shows: PLAIN (zoomed out: cell colors and
+ * the highlight only), CELLS (+ empty cells turning into flat cells, grid lines) and NUMBERS (+ digits).
+ * One shader with everything switched off at run time cost nearly as much as with everything on: the GPU
+ * reserves registers for all of its code, and a phone's GPU then runs fewer pixels at once.
+ */
+const fragmentSource = (cells, numbers) => `#version 300 es
 precision highp float;
 precision highp int;
+#define CELLS ${cells ? 1 : 0}
+#define NUMBERS ${numbers ? 1 : 0}
 uniform sampler2D uColor;   // W x H, what every cell looks like (premultiplied; alpha 0 = hidden cell)
-uniform sampler2D uFlags;   // W x H, bit 0: painted, bit 1: belongs to another part than the one being colored
-uniform sampler2D uTarget;  // W x H, color index of the cell (low byte, high byte)
+uniform sampler2D uInfo;    // W x H: color index of the cell (red: low byte, green: high byte), state (blue)
 uniform sampler2D uGlyphs;  // digits 0-9 in a row
-uniform sampler2D uHiPal;   // K x 1: the "highlighted" shade of every color number (index = number - 1)
 uniform vec2 uView;         // screen position of the picture's top-left corner, device pixels
 uniform float uK;           // device pixels per cell
+uniform float uInvK;        // cells per device pixel
+uniform float uLod;         // mip level of uColor (zoomed out below one pixel per cell), else 0
 uniform vec2 uSize;         // picture size in cells
-uniform vec2 uScreen;       // screen size, device pixels
+uniform vec2 uInvSize;
+uniform float uScreenH;     // screen height, device pixels
 uniform vec3 uBg0;          // background gradient, start
 uniform vec3 uBg1;          // background gradient, end (same as uBg0 for a plain background)
+uniform vec2 uBgDir;        // gradient direction divided by its squared length
+uniform vec3 uHiSel;        // empty cell of the selected number (its highlight shade)
+uniform int uSelected;      // selected color number (1-based), 0 = none or highlighting is off
+#if CELLS
 uniform vec3 uCell;         // empty cell color when zoomed in
 uniform vec3 uHighlight;    // empty cell of the selected number when zoomed in
-uniform vec3 uNumber;       // digit color
-uniform vec4 uGrid;         // grid line color; alpha already includes the zoom fade (0 = no grid)
 uniform float uCellFade;    // 0..1: empty cells turn from the silhouette shade into uCell / uHighlight
+uniform vec4 uGrid;         // grid line color; alpha already includes the zoom fade (0 = no grid)
+uniform float uLine;        // half the width of a grid line, device pixels
+#endif
+#if NUMBERS
+uniform vec3 uNumber;       // digit color
 uniform float uNumberFade;  // 0..1: numbers fade in
 uniform float uNumberAuto;  // 1: every number is black or white, whichever contrasts with its cell
-uniform int uSelected;      // selected color number (1-based), 0 = none or highlighting is off
-uniform float uShowOthers;  // 1: cells of other parts are shown dimmed, 0: they are hidden
-uniform float uLine;        // half the width of a grid line, device pixels
-uniform vec4 uGlyph;        // digit advance (cells), digit box height (cells), advance and padding (atlas u)
-uniform float uGlyphPx;     // digit box height in atlas pixels
+uniform vec2 uGlyph;        // advance and padding of a digit in the atlas (u)
+uniform vec4 uGlyphX;       // for numbers of 1, 2, 3 and 4 digits: digit advances per cell width
+uniform vec4 uGlyphY;       // ...digit boxes per cell height
+uniform vec4 uGlyphLod;     // ...mip level of the digits
+#endif
 out vec4 outColor;
 
-const int POW10[4] = int[4](1, 10, 100, 1000);
+const uint PAINTED = ${CELL.PAINTED}u;
+const uint OUTSIDE = ${CELL.OUTSIDE}u;
+const uint HIDDEN = ${CELL.HIDDEN}u;
 
-int flagsAt(ivec2 c) {
-  if (c.x < 0 || c.y < 0 || c.x >= int(uSize.x) || c.y >= int(uSize.y)) return -1;
-  return int(texelFetch(uFlags, c, 0).r * 255.0 + 0.5);
+#if CELLS
+float lineCover(uint state, vec2 fr) {
+  vec2 d0 = fr * uK;          // device pixels to the left / top border of the cell
+  vec2 d1 = (1.0 - fr) * uK;  // ...to the right / bottom one
+  float w = uLine + 0.5;
+  float cover = 0.0;
+  if ((state & ${CELL.LINE_LEFT}u) != 0u) cover = max(cover, w - d0.x);
+  if ((state & ${CELL.LINE_RIGHT}u) != 0u) cover = max(cover, w - d1.x);
+  if ((state & ${CELL.LINE_TOP}u) != 0u) cover = max(cover, w - d0.y);
+  if ((state & ${CELL.LINE_BOTTOM}u) != 0u) cover = max(cover, w - d1.y);
+  return clamp(cover, 0.0, 1.0);
 }
-// No grid line is needed between two cells that are both "filled": painted, hidden, or outside the picture.
-bool filled(int f) {
-  return f < 0 || (f & 1) != 0 || ((f & 2) != 0 && uShowOthers < 0.5);
+
+// Just outside the picture: the outer half of its border lines (where the edge cell is still empty)
+vec3 edgeLine(vec2 c, vec3 bg) {
+  vec2 away = max(-c, c - uSize) * uK; // device pixels outside, per axis (negative: inside on that axis)
+  float w = uLine + 0.5;
+  if (uGrid.a <= 0.0 || max(away.x, away.y) >= w || min(away.x, away.y) > 0.0) return bg;
+  ivec2 edge = ivec2(clamp(floor(c), vec2(0.0), uSize - 1.0));
+  uint state = uint(texelFetch(uInfo, edge, 0).b * 255.0 + 0.5);
+  uint side = c.x < 0.0 ? ${CELL.LINE_LEFT}u : c.x >= uSize.x ? ${CELL.LINE_RIGHT}u
+    : c.y < 0.0 ? ${CELL.LINE_TOP}u : ${CELL.LINE_BOTTOM}u;
+  if ((state & side) == 0u) return bg;
+  return mix(bg, uGrid.rgb, uGrid.a * clamp(w - max(away.x, away.y), 0.0, 1.0));
 }
+#endif
+
+#if NUMBERS
+vec3 number(vec3 col, int n, vec2 fr) {
+  // (most of a cell is beside its number: that is found out first and cheaply)
+  if (abs(fr.y - 0.5) * uGlyphY.x > 0.5) return col;
+  int digits = n < 10 ? 1 : n < 100 ? 2 : n < 1000 ? 3 : 4;
+  float fd = float(digits);
+  float ty = (fr.y - 0.5) * uGlyphY[digits - 1] + 0.5;  // 0..1 down the digit box
+  float tx = (fr.x - 0.5) * uGlyphX[digits - 1] + fd * 0.5; // 0..digits across the number
+  if (tx < 0.0 || tx >= fd || ty < 0.0 || ty > 1.0) return col;
+  float slot = floor(tx);
+  float power = fd - 1.0 - slot; // of ten, for this digit
+  float unit = power < 0.5 ? 1.0 : power < 1.5 ? 10.0 : power < 2.5 ? 100.0 : 1000.0;
+  float digit = mod(floor((float(n) + 0.5) / unit), 10.0); // float math: integer division is slow on phones
+  vec2 guv = vec2(digit * 0.1 + uGlyph.y + (tx - slot) * uGlyph.x, ty);
+  vec3 ink = uNumber;
+  if (uNumberAuto > 0.5) ink = dot(col, vec3(0.3, 0.59, 0.11)) > 0.55 ? vec3(0.08, 0.08, 0.12) : vec3(0.96, 0.96, 0.98);
+  // mip level by hand: the automatic choice breaks at the seams between digits, where u jumps
+  return mix(col, ink, textureLod(uGlyphs, guv, uGlyphLod[digits - 1]).r * uNumberFade);
+}
+#endif
 
 void main() {
-  vec2 P = vec2(gl_FragCoord.x, uScreen.y - gl_FragCoord.y); // y down, like the 2D canvas
-  vec2 dir = vec2(0.35 * uScreen.x, uScreen.y);
-  vec3 bg = mix(uBg0, uBg1, clamp(dot(P, dir) / dot(dir, dir), 0.0, 1.0));
-  vec3 col = bg;
-
-  vec2 c = (P - uView) / uK; // position in cells
-  ivec2 ci = ivec2(floor(c));
-  int f = flagsAt(ci);
-  if (f >= 0) {
-    vec2 fr = c - floor(c);
-    // Zoomed in: each cell is one flat color with a 1-pixel smooth edge (no shimmer at fractional zooms).
-    // Zoomed out below one pixel per cell: ordinary smooth downscaling (mipmaps).
-    vec2 uv = uK >= 1.0
-      ? (floor(c) + 0.5 + clamp(fr * uK, 0.0, 0.5) - clamp((1.0 - fr) * uK, 0.0, 0.5)) / uSize
-      : c / uSize;
-    // explicit mip level: the automatic one is undefined inside a branch
-    vec4 px = textureLod(uColor, uv, uK >= 1.0 ? 0.0 : log2(1.0 / uK));
-    col = px.rgb + bg * (1.0 - px.a);
-    bool painted = (f & 1) != 0;
-    bool outside = (f & 2) != 0;
-    int n = 0; // number of an empty, visible cell (0 = painted or hidden)
-    if (!painted && !(outside && uShowOthers < 0.5) && (uSelected > 0 || uCellFade > 0.0 || uNumberFade > 0.0)) {
-      vec2 tg = texelFetch(uTarget, ci, 0).rg * 255.0 + 0.5;
-      n = int(tg.x) + int(tg.y) * 256 + 1;
-    }
-    // Empty cells of the selected number. Done here rather than stored in uColor, so choosing another
+  vec2 P = vec2(gl_FragCoord.x, uScreenH - gl_FragCoord.y); // y down, like the 2D canvas
+  vec3 bg = mix(uBg0, uBg1, clamp(dot(P, uBgDir), 0.0, 1.0));
+  vec2 c = (P - uView) * uInvK; // position in cells
+  vec2 cf = floor(c);
+  if (cf.x < 0.0 || cf.y < 0.0 || cf.x >= uSize.x || cf.y >= uSize.y) {
+#if CELLS
+    outColor = vec4(edgeLine(c, bg), 1.0);
+#else
+    outColor = vec4(bg, 1.0);
+#endif
+    return;
+  }
+  ivec2 ci = ivec2(cf);
+  uvec3 info = uvec3(texelFetch(uInfo, ci, 0).rgb * 255.0 + 0.5);
+  uint state = info.b;
+  vec2 fr = c - cf;
+  // Zoomed in: each cell is one flat color with a 1-pixel smooth edge (no shimmer at fractional zooms).
+  // Zoomed out below one pixel per cell: ordinary smooth downscaling (mipmaps).
+  vec2 uv = uK >= 1.0 ? (cf + 0.5 + clamp(fr * uK, 0.0, 0.5) - clamp((1.0 - fr) * uK, 0.0, 0.5)) * uInvSize
+                      : c * uInvSize;
+  vec4 px = textureLod(uColor, uv, uLod);
+  vec3 col = px.rgb + bg * (1.0 - px.a);
+  if ((state & (PAINTED | HIDDEN)) == 0u) {
+    // an empty cell that is shown
+    int n = int(info.r + info.g * 256u) + 1;
+    bool outside = (state & OUTSIDE) != 0u;
+    bool selected = n == uSelected && !outside;
+    // Empty cells of the selected number: done here rather than stored in uColor, so choosing another
     // color changes one uniform instead of re-sending every cell of both colors to the GPU.
     // (Zoomed out below one pixel per cell it is skipped: a single cell would only flicker.)
-    if (n > 0 && n == uSelected && !outside && uK >= 1.0) col = texelFetch(uHiPal, ivec2(n - 1, 0), 0).rgb;
-    if (n > 0 && (uCellFade > 0.0 || uNumberFade > 0.0)) {
-      if (uCellFade > 0.0) {
-        col = mix(col, (!outside && n == uSelected) ? uHighlight : uCell, uCellFade);
-        if (outside) col = mix(col, bg, 0.62 * uCellFade);
-      }
-      if (uNumberFade > 0.0 && !outside) {
-        int digits = n < 10 ? 1 : n < 100 ? 2 : n < 1000 ? 3 : 4;
-        float fit = min(1.0, 0.88 / (float(digits) * uGlyph.x)); // long numbers shrink to stay inside the cell
-        float tx = (fr.x - 0.5) / (uGlyph.x * fit) + float(digits) * 0.5; // 0..digits across the number
-        float ty = (fr.y - 0.5) / (uGlyph.y * fit) + 0.5;                 // 0..1 down the digit box
-        if (tx >= 0.0 && tx < float(digits) && ty >= 0.0 && ty <= 1.0) {
-          int slot = int(tx);
-          int digit = (n / POW10[digits - 1 - slot]) % 10;
-          vec2 guv = vec2(float(digit) * 0.1 + uGlyph.w + fract(tx) * uGlyph.z, ty);
-          // atlas pixels per screen pixel decide the mip level (computed by hand: the automatic choice
-          // breaks at the seams between digits, where the texture coordinate jumps)
-          float lod = log2(max(1.0, uGlyphPx / (uGlyph.y * fit * uK)));
-          vec3 ink = uNumber;
-          if (uNumberAuto > 0.5) ink = dot(col, vec3(0.3, 0.59, 0.11)) > 0.55 ? vec3(0.08, 0.08, 0.12) : vec3(0.96, 0.96, 0.98);
-          col = mix(col, ink, textureLod(uGlyphs, guv, lod).r * uNumberFade);
-        }
-      }
-    }
+    if (selected && uK >= 1.0) col = uHiSel;
+#if CELLS
+    col = mix(col, selected ? uHighlight : uCell, uCellFade);
+    if (outside) col = mix(col, bg, 0.62 * uCellFade);
+#endif
+#if NUMBERS
+    if (!outside) col = number(col, n, fr);
+#endif
   }
-
-  if (uGrid.a > 0.0) {
-    vec2 b = floor(c + 0.5);       // nearest cell border on each axis
-    vec2 d = abs(c - b) * uK;      // distance to it, device pixels
-    float cover = 0.0;
-    if (d.x < uLine + 0.5) {
-      ivec2 right = ivec2(int(b.x), ci.y);
-      if (!(filled(flagsAt(right - ivec2(1, 0))) && filled(flagsAt(right)))) cover = clamp(uLine + 0.5 - d.x, 0.0, 1.0);
-    }
-    if (d.y < uLine + 0.5) {
-      ivec2 below = ivec2(ci.x, int(b.y));
-      if (!(filled(flagsAt(below - ivec2(0, 1))) && filled(flagsAt(below))))
-        cover = max(cover, clamp(uLine + 0.5 - d.y, 0.0, 1.0));
-    }
-    col = mix(col, uGrid.rgb, uGrid.a * cover);
-  }
+#if CELLS
+  if (uGrid.a > 0.0) col = mix(col, uGrid.rgb, uGrid.a * lineCover(state, fr));
+#endif
   outColor = vec4(col, 1.0);
 }`;
 
+/** Uniforms of every variant (those a variant lacks just have no location). */
 const UNIFORMS = [
-  "uColor",
-  "uFlags",
-  "uTarget",
-  "uGlyphs",
-  "uHiPal",
   "uView",
   "uK",
+  "uInvK",
+  "uLod",
   "uSize",
-  "uScreen",
+  "uInvSize",
+  "uScreenH",
   "uBg0",
   "uBg1",
+  "uBgDir",
+  "uHiSel",
+  "uSelected",
   "uCell",
   "uHighlight",
-  "uNumber",
-  "uGrid",
   "uCellFade",
+  "uGrid",
+  "uLine",
+  "uNumber",
   "uNumberFade",
   "uNumberAuto",
-  "uSelected",
-  "uShowOthers",
-  "uLine",
   "uGlyph",
-  "uGlyphPx",
+  "uGlyphX",
+  "uGlyphY",
+  "uGlyphLod",
 ];
 
 /** Digits 0-9 drawn once into a strip; the shader composes cell numbers from it. */
@@ -211,7 +257,8 @@ const rgbaToVec = (text) => {
 
 /**
  * Creates the renderer on a canvas element. Returns null if WebGL 2 is not available.
- * Methods: setCanvas, upload, draw, resize; field `ready` is false while the GPU context is lost.
+ * Methods: setCanvas, upload, setHighlightColors, draw, resize; field `ready` is false while the GPU context
+ * is lost.
  */
 export function createGlView(element, onRestored) {
   const options = { alpha: false, antialias: false, depth: false, stencil: false, powerPreference: "high-performance" };
@@ -219,14 +266,19 @@ export function createGlView(element, onRestored) {
   if (!gl) return null;
 
   const view = { ready: false, maxSize: 0 };
-  let program = null;
-  let uniform = {};
-  let textures = null; // { color, flags, target, glyphs }
+  let programs = null; // [plain, cells, numbers]: { program, uniform }
+  let textures = null; // { color, info, glyphs }
   let glyphs = null;
   let size = null; // { width, height } of the canvas the textures hold
+  let info = null; // the info texture's bytes (see uInfo): color index, state
   let mipsStale = true;
-  let sentTheme = null; // theme object whose colors are currently in the shader
-  let gridColor = [0, 0, 0, 0];
+  let highlight = []; // highlight shade of every number (pixels 0xAABBGGRR)
+  let themeOf = null; // theme object whose colors are parsed into themeVec
+  let themeVec = null;
+  // GPU timing (see trackGpu): fences of drawn frames the GPU has not finished yet, with when they were drawn
+  let tracking = false;
+  const pending = [];
+  const glyphLod = new Float32Array(4);
 
   function compile(type, source) {
     const shader = gl.createShader(type);
@@ -236,22 +288,41 @@ export function createGlView(element, onRestored) {
     return shader;
   }
 
-  function init() {
-    program = gl.createProgram();
+  function link(cells, numbers) {
+    const program = gl.createProgram();
     gl.attachShader(program, compile(gl.VERTEX_SHADER, VERTEX));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FRAGMENT));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource(cells, numbers)));
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     gl.useProgram(program);
-    uniform = {};
+    const uniform = {};
     for (const name of UNIFORMS) uniform[name] = gl.getUniformLocation(program, name);
+    gl.uniform1i(gl.getUniformLocation(program, "uColor"), 0);
+    gl.uniform1i(gl.getUniformLocation(program, "uInfo"), 1);
+    gl.uniform1i(gl.getUniformLocation(program, "uGlyphs"), 2);
+    if (numbers) {
+      gl.uniform2f(uniform.uGlyph, glyphs.advanceU, glyphs.padU);
+      gl.uniform4fv(
+        uniform.uGlyphX,
+        glyphs.fit.map((f) => 1 / (glyphs.advanceCells * f)),
+      );
+      gl.uniform4fv(
+        uniform.uGlyphY,
+        glyphs.fit.map((f) => 1 / (glyphs.heightCells * f)),
+      );
+    }
+    return { program, uniform };
+  }
+
+  function init() {
+    view.maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     gl.bindVertexArray(gl.createVertexArray());
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    view.maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-
     glyphs = makeGlyphAtlas();
+    // per number length (1-4 digits): long numbers shrink to stay inside the cell
+    glyphs.fit = [1, 2, 3, 4].map((d) => Math.min(1, 0.88 / (d * glyphs.advanceCells)));
     const tex = gl.createTexture();
-    gl.activeTexture(gl.TEXTURE3);
+    gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, glyphs.canvas);
     gl.generateMipmap(gl.TEXTURE_2D);
@@ -259,23 +330,10 @@ export function createGlView(element, onRestored) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    // highlight shades: filled in by setHighlightColors
-    const hiPal = gl.createTexture();
-    gl.activeTexture(gl.TEXTURE4);
-    gl.bindTexture(gl.TEXTURE_2D, hiPal);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    textures = { glyphs: tex, hiPal, color: null, flags: null, target: null };
-    gl.uniform1i(uniform.uColor, 0);
-    gl.uniform1i(uniform.uFlags, 1);
-    gl.uniform1i(uniform.uTarget, 2);
-    gl.uniform1i(uniform.uGlyphs, 3);
-    gl.uniform1i(uniform.uHiPal, 4);
-    gl.uniform4f(uniform.uGlyph, glyphs.advanceCells, glyphs.heightCells, glyphs.advanceU, glyphs.padU);
-    gl.uniform1f(uniform.uGlyphPx, glyphs.boxHeight);
+    textures = { glyphs: tex, color: null, info: null };
+    programs = [link(false, false), link(true, false), link(true, true)];
     size = null;
-    sentTheme = null;
+    themeOf = null;
   }
 
   function makeTexture(unit, format, width, height, levels, filter) {
@@ -296,17 +354,16 @@ export function createGlView(element, onRestored) {
    */
   view.setCanvas = (width, height, target) => {
     if (!view.ready || width > view.maxSize || height > view.maxSize) return false;
-    for (const name of ["color", "flags", "target"]) if (textures[name]) gl.deleteTexture(textures[name]);
+    for (const name of ["color", "info"]) if (textures[name]) gl.deleteTexture(textures[name]);
     const levels = Math.floor(Math.log2(Math.max(width, height))) + 1;
     textures.color = makeTexture(0, gl.RGBA8, width, height, levels, gl.LINEAR);
-    textures.flags = makeTexture(1, gl.R8, width, height, 1, gl.NEAREST);
-    textures.target = makeTexture(2, gl.RG8, width, height, 1, gl.NEAREST);
-    const bytes = new Uint8Array(width * height * 2);
+    textures.info = makeTexture(1, gl.RGBA8, width, height, 1, gl.NEAREST);
+    info = new Uint8Array(width * height * 4);
     for (let i = 0; i < target.length; i++) {
-      bytes[i * 2] = target[i] & 255;
-      bytes[i * 2 + 1] = target[i] >> 8;
+      info[i * 4] = target[i] & 255;
+      info[i * 4 + 1] = target[i] >> 8;
     }
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RG, gl.UNSIGNED_BYTE, bytes);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, info);
     size = { width, height };
     mipsStale = true;
     return true;
@@ -314,21 +371,26 @@ export function createGlView(element, onRestored) {
 
   /**
    * Copies the rectangle [x0, y0, x1, y1] (inclusive, in cells) of the game's arrays to the GPU.
-   * pixels: Uint32Array (the pixel buffer), flags: Uint8Array, both width * height long.
+   * pixels: Uint32Array (the pixel buffer), states: Uint8Array of CELL bits, both width * height long.
    */
-  view.upload = (pixels, flags, [x0, y0, x1, y1]) => {
+  view.upload = (pixels, states, [x0, y0, x1, y1]) => {
     if (!view.ready || !size) return;
+    const W = size.width;
     const w = x1 - x0 + 1;
     const h = y1 - y0 + 1;
+    for (let y = y0; y <= y1; y++)
+      for (let i = y * W + x0, end = y * W + x1; i <= end; i++) info[i * 4 + 2] = states[i];
     // ROW_LENGTH + SKIP_*: upload a sub-rectangle straight out of the full-size array, no copying
-    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, size.width);
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, W);
     gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, x0);
     gl.pixelStorei(gl.UNPACK_SKIP_ROWS, y0);
     gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures.color);
     const bytes = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
     gl.activeTexture(gl.TEXTURE1);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, y0, w, h, gl.RED, gl.UNSIGNED_BYTE, flags);
+    gl.bindTexture(gl.TEXTURE_2D, textures.info);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, info);
     gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
     gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
     gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
@@ -337,24 +399,10 @@ export function createGlView(element, onRestored) {
 
   /**
    * The shade an empty cell of each number gets while that number is selected (pixels as in the pixel
-   * buffer: 0xAABBGGRR). Sent once per canvas / theme change; selecting a number then costs nothing.
+   * buffer: 0xAABBGGRR). Only the selected number's goes to the shader, as one uniform.
    */
   view.setHighlightColors = (pixels) => {
-    if (!view.ready || !pixels.length) return;
-    const data = Uint32Array.from(pixels);
-    gl.activeTexture(gl.TEXTURE4);
-    gl.bindTexture(gl.TEXTURE_2D, textures.hiPal);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      data.length,
-      1,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      new Uint8Array(data.buffer),
-    );
+    highlight = Array.from(pixels);
   };
 
   /** Matches the drawing buffer to the element's size in device pixels. */
@@ -365,7 +413,7 @@ export function createGlView(element, onRestored) {
 
   /**
    * Draws a frame.
-   * p: { x, y, scale (CSS px), dpr, theme, cellFade, gridFade, numberFade, contrastNumbers, selected, showOthers }
+   * p: { x, y, scale (CSS px), dpr, theme, cellFade, gridFade, numberFade, contrastNumbers, selected }
    */
   view.draw = (p) => {
     if (!view.ready || !size) return false;
@@ -373,35 +421,86 @@ export function createGlView(element, onRestored) {
     if (k < 1 && mipsStale) {
       // only needed when zoomed far out, and only after the picture changed
       gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, textures.color);
       gl.generateMipmap(gl.TEXTURE_2D);
       mipsStale = false;
     }
-    gl.viewport(0, 0, element.width, element.height);
-    gl.uniform2f(uniform.uView, p.x * p.dpr, p.y * p.dpr);
-    gl.uniform1f(uniform.uK, k);
-    gl.uniform2f(uniform.uSize, size.width, size.height);
-    gl.uniform2f(uniform.uScreen, element.width, element.height);
     const theme = p.theme;
-    if (theme !== sentTheme) {
-      // theme colors are parsed and sent only when the theme object changes, not every frame
-      sentTheme = theme;
+    if (theme !== themeOf) {
+      // theme colors are parsed only when the theme object changes, not every frame
+      themeOf = theme;
       const [bg0, bg1] = theme.gradient || [theme.bg, theme.bg];
-      gl.uniform3fv(uniform.uBg0, hexToRgb(bg0));
-      gl.uniform3fv(uniform.uBg1, hexToRgb(bg1));
-      gl.uniform3fv(uniform.uCell, hexToRgb(theme.cell));
-      gl.uniform3fv(uniform.uHighlight, hexToRgb(theme.highlight));
-      gl.uniform3fv(uniform.uNumber, hexToRgb(theme.number));
-      gridColor = rgbaToVec(theme.grid);
+      themeVec = {
+        bg0: hexToRgb(bg0),
+        bg1: hexToRgb(bg1),
+        cell: hexToRgb(theme.cell),
+        highlight: hexToRgb(theme.highlight),
+        number: hexToRgb(theme.number),
+        grid: rgbaToVec(theme.grid),
+      };
     }
-    gl.uniform4f(uniform.uGrid, gridColor[0], gridColor[1], gridColor[2], gridColor[3] * p.gridFade);
-    gl.uniform1f(uniform.uCellFade, p.cellFade);
-    gl.uniform1f(uniform.uNumberFade, p.numberFade);
-    gl.uniform1f(uniform.uNumberAuto, p.contrastNumbers ? 1 : 0);
-    gl.uniform1i(uniform.uSelected, p.selected);
-    gl.uniform1f(uniform.uShowOthers, p.showOthers ? 1 : 0);
-    gl.uniform1f(uniform.uLine, p.dpr / 2);
+    const gridA = themeVec.grid[3] * p.gridFade;
+    const { program, uniform: u } = programs[p.numberFade > 0 ? 2 : p.cellFade > 0 || gridA > 0 ? 1 : 0];
+    gl.useProgram(program);
+    gl.viewport(0, 0, element.width, element.height);
+    gl.uniform2f(u.uView, p.x * p.dpr, p.y * p.dpr);
+    gl.uniform1f(u.uK, k);
+    gl.uniform1f(u.uInvK, 1 / k);
+    gl.uniform1f(u.uLod, k >= 1 ? 0 : Math.log2(1 / k));
+    gl.uniform2f(u.uSize, size.width, size.height);
+    gl.uniform2f(u.uInvSize, 1 / size.width, 1 / size.height);
+    gl.uniform1f(u.uScreenH, element.height);
+    gl.uniform3fv(u.uBg0, themeVec.bg0);
+    gl.uniform3fv(u.uBg1, themeVec.bg1);
+    // the background gradient runs along (0.35 * width, height): its direction over its squared length
+    const dx = 0.35 * element.width;
+    const dy = element.height;
+    const len2 = dx * dx + dy * dy;
+    gl.uniform2f(u.uBgDir, dx / len2, dy / len2);
+    const hi = highlight[p.selected - 1] || 0;
+    gl.uniform3f(u.uHiSel, (hi & 255) / 255, ((hi >> 8) & 255) / 255, ((hi >> 16) & 255) / 255);
+    gl.uniform1i(u.uSelected, p.selected);
+    if (u.uCell) {
+      gl.uniform3fv(u.uCell, themeVec.cell);
+      gl.uniform3fv(u.uHighlight, themeVec.highlight);
+      gl.uniform1f(u.uCellFade, p.cellFade);
+      gl.uniform4f(u.uGrid, themeVec.grid[0], themeVec.grid[1], themeVec.grid[2], gridA);
+      gl.uniform1f(u.uLine, p.dpr / 2);
+    }
+    if (u.uNumber) {
+      gl.uniform3fv(u.uNumber, themeVec.number);
+      gl.uniform1f(u.uNumberFade, p.numberFade);
+      gl.uniform1f(u.uNumberAuto, p.contrastNumbers ? 1 : 0);
+      // digits are drawn at their atlas size or smaller: atlas pixels per screen pixel give the mip level
+      for (let d = 0; d < 4; d++)
+        glyphLod[d] = Math.log2(Math.max(1, glyphs.boxHeight / (glyphs.heightCells * glyphs.fit[d] * k)));
+      gl.uniform4fv(u.uGlyphLod, glyphLod);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (tracking && pending.length < 6) {
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (sync) pending.push({ sync, t: p.now });
+    }
     return true;
+  };
+
+  /**
+   * How long the GPU takes for the frames drawn while tracking is on: pollGpu(now) returns, for every frame
+   * it finished since the last call, the time from drawing it to finding it done (checked once a frame, so
+   * a frame the GPU finishes in time reads as about one frame; a slow GPU as two or more).
+   */
+  view.trackGpu = (on) => {
+    tracking = on;
+    if (!on) while (pending.length) gl.deleteSync(pending.shift().sync);
+  };
+  view.pollGpu = (now) => {
+    const done = [];
+    while (pending.length && gl.getSyncParameter(pending[0].sync, gl.SYNC_STATUS) === gl.SIGNALED) {
+      const { sync, t } = pending.shift();
+      gl.deleteSync(sync);
+      done.push(now - t);
+    }
+    return done;
   };
 
   // The browser may take the GPU context away (app in the background, memory pressure) and give it back later.
