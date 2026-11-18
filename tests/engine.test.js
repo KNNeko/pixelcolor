@@ -571,3 +571,18 @@ test("black-and-white pictures: exact grays, and enough of them for smooth shadi
   const autoColor = await suggestColorCount(tinted, params, NO_ADJUST);
   assert.ok(auto >= 40 && auto > autoColor, `gray: ${auto}, warm: ${autoColor}`);
 });
+
+test("suggestColorCount: an exact count between its checkpoints, up to 1000", async () => {
+  // 19 flat colors in blocks: exactly 19 (the checkpoints around are 16 and 24)
+  const colors = [];
+  for (let k = 0; k < 19; k++) colors.push([(k * 53) % 256, (k * 97 + 40) % 256, (k * 31 + 90) % 256]);
+  const blocks = image(190, 100, (x) => colors[Math.floor(x / 10)]);
+  const params = { width: 190, height: 100, colors: 32, style: "photo", clean: 3 };
+  assert.equal(await suggestColorCount(blocks, params, NO_ADJUST), 19);
+  // noise that no palette gets right: the ceiling, 1000 (it was 600)
+  let seed = 1;
+  const random = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 256;
+  const noise = image(130, 130, () => [random(), random(), random()].map(Math.floor));
+  const big = { width: 130, height: 130, colors: 32, style: "photo", clean: 3 };
+  assert.equal(await suggestColorCount(noise, big, NO_ADJUST), 1000);
+});

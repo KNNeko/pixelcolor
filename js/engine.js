@@ -1348,10 +1348,10 @@ function paletteToLab(pal, K) {
 const L_WEIGHT = 2;
 
 /** `count` evenly spaced cell numbers out of pixelCount. */
-function evenCells(pixelCount, count) {
+function evenCells(pixelCount, count, offset = 0) {
   const step = pixelCount / count;
   const cells = new Uint32Array(count);
-  for (let i = 0; i < count; i++) cells[i] = (i * step) | 0;
+  for (let i = 0; i < count; i++) cells[i] = ((i + offset) * step) | 0;
   return cells;
 }
 
@@ -2418,18 +2418,28 @@ export function rescueRareColors(rgba, N, pal, K, idx, focus = null) {
  * And no visible color may go missing: at most AUTO_LOST of the (visibility-weighted) cells may end up farther
  * than AUTO_LOST_DE from every palette color. That keeps small areas of their own color (skin in a picture
  * that is mostly white background, eyes, a red badge) that the average would hardly notice.
+ *
+ * Each palette is fitted on one set of cells and judged on another (the cells halfway between them): judged
+ * on its own cells, a palette of many colors looks better than it is, by a tenth at 400 colors and by a third
+ * at 1000, so that the count fell short more the more colors a picture needed. AUTO_SHARE, AUTO_LOW and
+ * AUTO_HIGH were raised with that (from 0.32, 0.7, 1.5), so that at 200 000 cells the counts stayed about
+ * where they were; pictures of fine detail and big canvases get more than before.
+ * The count is exact, not one of the checkpoints of AUTO_STEPS: between the last checkpoint that fails a rule
+ * and the first that passes, the average error is interpolated, and the other rules (nothing lost, a few flat
+ * colors, the marks) are found by halving the gap until it is under AUTO_EXACTNESS.
  */
 const AUTO_SEEN = 3;
 const AUTO_FLAT = 0.7;
-const AUTO_SHARE = 0.32;
-const AUTO_LOW = 0.7;
-const AUTO_HIGH = 1.5;
+const AUTO_SHARE = 0.34;
+const AUTO_LOW = 0.73;
+const AUTO_HIGH = 1.6;
 const AUTO_EXACT = 0.4;
 const AUTO_LOST_DE = 8;
 const AUTO_LOST = 0.004;
-const AUTO_MAX = 600;
-const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240, 300, 400, 500, 600];
+const AUTO_MAX = 1000;
+const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240, 300, 400, 500, 600, 800, 1000];
 const AUTO_REF_FITS = 5;
+const AUTO_EXACTNESS = 0.02;
 
 /**
  * How much each sampled cell's color error shows. seen: 1 in a smooth area, towards 0 in texture and on edges;
@@ -2522,35 +2532,42 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
   const rgba = prepared.focus ? prepareImage({ ...source, mask: null }, params, userAdjust) : prepared;
   // plain Lab here: the limits are perceived differences
   const count = Math.min(N, 10000);
-  const sample = paletteSample(rgba, N, count, 1);
-  const { seen, bands } = visibility(rgba, W, H, sample.cells);
+  const sample = paletteSample(rgba, N, count, 1); // the palettes are fitted on these cells...
+  const check = sampleCells(rgba, evenCells(N, count, 0.5), 1); // ...and judged on these
+  const { seen, bands } = visibility(rgba, W, H, check.cells);
   const gray = isGrayPicture(rgba, N); // black and white: stricter (see AUTO_LOW_GRAY)
+  const exact = gray ? AUTO_EXACT / 2 : AUTO_EXACT;
   const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
+  const judge = async (K, iterations = 4, seed = 7) => {
+    hooks.progress(K);
+    const fit = await kmeansFit(sample, K, iterations, hooks, seed);
+    if (!fit) throw new Error("cancelled");
+    return visibleError(check, fit.palette, K, seen, bands);
+  };
   let target = 0;
   let prevK = 0;
   let prevError = 0;
   let enough = 0; // color count at which the average error is low enough (x1.15 headroom)
-  let complete = 0; // first count with no visible color missing
+  let complete = 0; // first checkpoint with no visible color missing
+  let incomplete = 0; // the checkpoint before it
   let found = maxK;
   for (const K of AUTO_STEPS) {
     if (K > maxK) break;
-    hooks.progress(K);
-    const fit = await kmeansFit(sample, K, 4, hooks);
-    if (!fit) throw new Error("cancelled");
-    const { error, lost } = visibleError(sample, fit.palette, K, seen, bands);
+    const { error, lost } = await judge(K);
     if (lost <= AUTO_LOST && !complete) complete = K;
-    if (error <= (gray ? AUTO_EXACT / 2 : AUTO_EXACT) && complete) {
-      found = K; // a picture of a few flat colors
+    if (!complete) incomplete = K;
+    if (error <= exact && complete) {
+      // a picture of a few flat colors: the fewest that are exact and lose nothing
+      found = await fewestColors(prevK, K, async (k) => {
+        const r = await judge(k);
+        return r.error <= exact && r.lost <= AUTO_LOST;
+      });
       break;
     }
     if (K === 16) {
       // what 16 colors leave: the best of a few fits (see AUTO_REF_FITS)
       let best = error;
-      for (let r = 1; r <= AUTO_REF_FITS; r++) {
-        const more = await kmeansFit(sample, K, 8, hooks, 7 + 101 * r);
-        if (!more) throw new Error("cancelled");
-        best = Math.min(best, visibleError(sample, more.palette, K, seen, bands).error);
-      }
+      for (let r = 1; r <= AUTO_REF_FITS; r++) best = Math.min(best, (await judge(K, 8, 7 + 101 * r)).error);
       target = Math.max(gray ? AUTO_LOW_GRAY : AUTO_LOW, Math.min(AUTO_HIGH, AUTO_SHARE * best));
     }
     if (target && error <= target && !enough) {
@@ -2559,6 +2576,11 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
       enough = Math.exp(Math.log(prevK) + t * (Math.log(K) - Math.log(prevK))) * 1.15;
     }
     if (enough && complete) {
+      // nothing lost only from a checkpoint above the average's count: where exactly between the two
+      if (complete > enough)
+        complete = await fewestColors(Math.max(incomplete, Math.floor(enough)), complete, async (k) => {
+          return (await judge(k)).lost <= AUTO_LOST;
+        });
       found = Math.min(maxK, Math.round(Math.max(enough, complete)));
       break;
     }
@@ -2566,6 +2588,21 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     prevError = error;
   }
   return prepared.focus ? focusColorCount(prepared, W, H, count, found, maxK, hooks) : found;
+}
+
+/**
+ * The fewest colors in (fails, passes] for which passes(k) holds, as far as halving the gap (on a log scale)
+ * down to AUTO_EXACTNESS finds it: passes(passes) is taken to hold, passes(fails) not.
+ */
+async function fewestColors(fails, passes, ok) {
+  let lo = Math.max(1, fails);
+  let hi = passes;
+  while (hi - lo > 1 && hi > lo * (1 + AUTO_EXACTNESS)) {
+    const mid = Math.min(hi - 1, Math.max(lo + 1, Math.round(Math.sqrt(lo * hi))));
+    if (await ok(mid)) hi = mid;
+    else lo = mid;
+  }
+  return hi;
 }
 
 /**
@@ -2578,12 +2615,17 @@ async function focusColorCount(rgba, W, H, count, found, maxK, hooks) {
   const { seen } = visibility(rgba, W, H, sample.cells);
   for (let i = 0; i < seen.length; i++) seen[i] = i < count ? 0 : seen[i] * sample.share[i]; // marked ones only
   const limit = Math.max(found, Math.min(maxK, Math.round(found * FOCUS_MORE)));
-  for (const K of [found, ...AUTO_STEPS.filter((k) => k > found && k < limit), limit]) {
+  const ok = async (K) => {
     hooks.progress(K);
     const fit = await kmeansFit(sample, K, 4, hooks);
     if (!fit) throw new Error("cancelled");
-    const { error } = visibleError(sample, fit.palette, K, seen);
-    if (error <= FOCUS_ERROR) return K;
+    return visibleError(sample, fit.palette, K, seen).error <= FOCUS_ERROR;
+  };
+  let last = 0;
+  for (const K of [found, ...AUTO_STEPS.filter((k) => k > found * (1 + AUTO_EXACTNESS) && k < limit), limit]) {
+    // the first checkpoint that is enough, then exactly where between it and the one before
+    if (await ok(K)) return last ? fewestColors(last, K, ok) : K;
+    last = K;
   }
   return limit;
 }
