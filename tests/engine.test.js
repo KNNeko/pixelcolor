@@ -20,6 +20,7 @@ import {
   cleanPalette,
   ditherRamps,
   smoothGradients,
+  srgbToLab,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -460,4 +461,23 @@ test("marked cells get more of the palette; Auto colors never drops because of m
   const auto = await suggestColorCount(src, params, NO_ADJUST);
   const autoMarked = await suggestColorCount(marked, params, NO_ADJUST);
   assert.ok(autoMarked >= auto, `auto: ${auto} without marks, ${autoMarked} with`);
+});
+
+test("a small detail in a color of its own keeps it (rescueRareColors): a blue iris does not turn gray", async () => {
+  const W = 300;
+  const H = 300;
+  // a big smooth gradient takes the palette, evenly; 2x2 cells of saturated blue are found nowhere else
+  // (and fall between the cells the palette search samples)
+  const eye = (x, y) => x >= 150 && x < 152 && y >= 100 && y < 102;
+  const src = image(W, H, (x, y) => (eye(x, y) ? [40, 120, 230] : [230 - x * 0.4, 190 - x * 0.35, 170 - y * 0.3]));
+  for (const style of ["art", "photo"]) {
+    const r = await generate(src, { width: W, height: H, colors: 64, style, clean: 3 }, NO_ADJUST);
+    const k = r.idx[100 * W + 150];
+    const lab = new Float32Array(6);
+    srgbToLab(40, 120, 230, lab, 0);
+    srgbToLab(r.pal[k * 3], r.pal[k * 3 + 1], r.pal[k * 3 + 2], lab, 3);
+    const d = Math.hypot(lab[0] - lab[3], lab[1] - lab[4], lab[2] - lab[5]);
+    assert.ok(d < 10, `${style}: the blue cells got rgb(${r.pal.slice(k * 3, k * 3 + 3)}), ΔE ${d.toFixed(1)}`);
+    assert.ok(r.pal.length / 3 <= 64, `${style}: ${r.pal.length / 3} colors`);
+  }
 });

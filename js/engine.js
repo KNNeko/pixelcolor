@@ -1982,6 +1982,7 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   if (!pal) return null;
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
+  if (!dither) rescueRareColors(rgba, W * H, pal, K, idx, rgba.focus);
   if (!dither && clean > 0) {
     settle(idx, rgba, W, H, pal, K, clean, lines, smooth);
     // only specks that hardly differ from their surroundings: small details that stand out stay
@@ -1995,32 +1996,205 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
 }
 
 /*
+ * Small details in a color of their own (an iris, a gem, a colored highlight): the palette search spends its
+ * colors where many cells are, so a few cells of a color found nowhere else get matched to a far-off color of
+ * about the same lightness (a blue eye turns gray). After matching, the cells left farther than RESCUE_DE
+ * (Lab ΔE) from their color are gathered into groups of similar color (within RESCUE_GROUP); each group of at
+ * least RESCUE_MIN cells, the biggest error first (marked cells count more), takes the place of one of the two
+ * closest palette colors while those are closer than RESCUE_SWAP or, in a smaller palette whose colors lie
+ * further apart, than RESCUE_SPACING times the usual distance between neighbouring colors (a gradient loses
+ * one of its many steps, a band gets a little wider), so the number of colors stays. At most one color in
+ * RESCUE_SHARE is given away like this.
+ */
+const RESCUE_DE = 10;
+const RESCUE_GROUP = 12;
+const RESCUE_MIN = 3;
+const RESCUE_SWAP = 3;
+const RESCUE_SPACING = 1.25;
+const RESCUE_SHARE = 16;
+
+/** See above. Changes pal, and idx (all cells matched again) when a group got a color; returns how many did. */
+export function rescueRareColors(rgba, N, pal, K, idx, focus = null) {
+  const maxSwaps = Math.floor(K / RESCUE_SHARE);
+  if (!maxSwaps) return 0;
+  let palLab = paletteToLab(pal, K);
+  // Lab of each color, cached by its top 6 bits per channel (close enough for these limits)
+  const cacheLab = new Float32Array(262144 * 3);
+  const cached = new Uint8Array(262144);
+  const labOf = (p) => {
+    const key = ((rgba[p] >> 2) << 12) | ((rgba[p + 1] >> 2) << 6) | (rgba[p + 2] >> 2);
+    if (!cached[key]) {
+      srgbToLab((rgba[p] & 252) + 2, (rgba[p + 1] & 252) + 2, (rgba[p + 2] & 252) + 2, cacheLab, key * 3);
+      cached[key] = 1;
+    }
+    return key * 3;
+  };
+  // the cells far from their color, and how far
+  let far = [];
+  for (let i = 0; i < N; i++) {
+    const l = labOf(i * 4);
+    const c = idx[i] * 3;
+    const d = Math.hypot(cacheLab[l] - palLab[c], cacheLab[l + 1] - palLab[c + 1], cacheLab[l + 2] - palLab[c + 2]);
+    if (d > RESCUE_DE) far.push(i, d);
+  }
+  if (far.length < RESCUE_MIN * 2) return 0;
+  if (far.length > 40000) far = far.slice(0, 40000); // (a picture this far off needs more colors, not this)
+  const n = far.length / 2;
+  // seeds: the densest spots among those colors (4 bits per channel, counted with the spots around), so a
+  // detail whose few cells spread over a small gradient leads, and stray noise does not
+  const binOf = (p) => ((rgba[p] >> 4) << 8) | ((rgba[p + 1] >> 4) << 4) | (rgba[p + 2] >> 4);
+  const bins = new Map();
+  for (let j = 0; j < n; j++) {
+    const key = binOf(far[j * 2] * 4);
+    bins.set(key, (bins.get(key) || 0) + 1);
+  }
+  const density = (key) => {
+    let sum = 0;
+    for (let dr = -1; dr <= 1; dr++)
+      for (let dg = -1; dg <= 1; dg++)
+        for (let db = -1; db <= 1; db++) {
+          const r = (key >> 8) + dr;
+          const g = ((key >> 4) & 15) + dg;
+          const b = (key & 15) + db;
+          if (r < 0 || g < 0 || b < 0 || r > 15 || g > 15 || b > 15) continue;
+          sum += bins.get((r << 8) | (g << 4) | b) || 0;
+        }
+    return sum;
+  };
+  const seeds = [...bins.keys()]
+    .map((key) => [key, density(key)])
+    .filter(([, d]) => d >= RESCUE_MIN)
+    .sort((a, b) => b[1] - a[1]);
+  const taken = new Uint8Array(n);
+  const groups = [];
+  for (const [key] of seeds.slice(0, 8 * maxSwaps)) {
+    // the seed's color: the mean of its spot's free cells
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    let m = 0;
+    for (let j = 0; j < n; j++) {
+      const p = far[j * 2] * 4;
+      if (taken[j] || binOf(p) !== key) continue;
+      sr += rgba[p];
+      sg += rgba[p + 1];
+      sb += rgba[p + 2];
+      m++;
+    }
+    if (!m) continue;
+    const seed = new Float32Array(3);
+    srgbToLab(Math.round(sr / m), Math.round(sg / m), Math.round(sb / m), seed, 0); // (whole numbers: a table)
+    // the group: every free far cell of about that color
+    let gr = 0;
+    let gg = 0;
+    let gb = 0;
+    let count = 0;
+    let score = 0;
+    const members = [];
+    for (let j = 0; j < n; j++) {
+      if (taken[j]) continue;
+      const l = labOf(far[j * 2] * 4);
+      if (Math.hypot(cacheLab[l] - seed[0], cacheLab[l + 1] - seed[1], cacheLab[l + 2] - seed[2]) > RESCUE_GROUP)
+        continue;
+      members.push(j);
+    }
+    if (members.length < RESCUE_MIN) continue;
+    for (const j of members) {
+      taken[j] = 1;
+      const i = far[j * 2];
+      gr += rgba[i * 4];
+      gg += rgba[i * 4 + 1];
+      gb += rgba[i * 4 + 2];
+      count++;
+      score += far[j * 2 + 1] * (focus ? 1 + (3 * focus[i]) / 255 : 1);
+    }
+    groups.push({ rgb: [gr / count, gg / count, gb / count], score });
+  }
+  if (!groups.length) return 0;
+  groups.sort((a, b) => b.score - a.score);
+  const counts = new Float64Array(K);
+  for (let i = 0; i < N; i++) counts[idx[i]]++;
+  const fresh = new Uint8Array(K); // given to a group: not given away again
+  const dist = (x, y) =>
+    Math.hypot(
+      palLab[x * 3] - palLab[y * 3],
+      palLab[x * 3 + 1] - palLab[y * 3 + 1],
+      palLab[x * 3 + 2] - palLab[y * 3 + 2],
+    );
+  const spacing = new Float32Array(K).fill(1e9); // each color's distance to its nearest other color
+  for (let x = 0; x < K; x++)
+    for (let y = x + 1; y < K; y++) spacing[x] = spacing[y] = Math.min(spacing[x], spacing[y], dist(x, y));
+  const limit = Math.max(RESCUE_SWAP, RESCUE_SPACING * [...spacing].sort((a, b) => a - b)[K >> 1]);
+  let swaps = 0;
+  for (const g of groups) {
+    if (swaps >= maxSwaps) break;
+    let best = limit;
+    let a = -1;
+    let b = -1;
+    for (let x = 0; x < K; x++) {
+      if (fresh[x]) continue;
+      for (let y = x + 1; y < K; y++) {
+        if (fresh[y]) continue;
+        const d = dist(x, y);
+        if (d < best) {
+          best = d;
+          a = x;
+          b = y;
+        }
+      }
+    }
+    if (a < 0) break; // no look-alike pair left to spare
+    const drop = counts[a] <= counts[b] ? a : b;
+    for (let j = 0; j < 3; j++) pal[drop * 3 + j] = Math.round(g.rgb[j]);
+    srgbToLab(pal[drop * 3], pal[drop * 3 + 1], pal[drop * 3 + 2], palLab, drop * 3);
+    fresh[drop] = 1;
+    swaps++;
+  }
+  if (!swaps) return 0;
+  const nearest = makeNearest(pal, K);
+  for (let i = 0; i < N; i++) idx[i] = nearest(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+  return swaps;
+}
+
+/*
  * "Auto colors". The old rule (the fewest colors whose average error stays under a fixed limit) asked for
  * hundreds of colors, up to the maximum, as soon as a picture had texture or JPEG noise: the error that noise
  * leaves can only be pushed down with ever more colors, though nobody sees it.
  *
  * Now: an error only counts as far as it shows. A cell in a smooth area (a gradient, skin, sky) counts fully,
  * one in busy texture or on an edge hardly (AUTO_SEEN: spread of colors around a cell, Lab ΔE, at which it
- * counts half). The palette then grows until that error is down to AUTO_SHARE of what 16 colors leave: a
- * picture whose error drops fast with more colors (flat areas, clean drawing) stops early, a rich one
- * (gradients, a painted picture, a photo) goes on, up to AUTO_MAX. A picture that is already exact with
- * a few colors (AUTO_EXACT) takes just those.
+ * counts half). And only where colors change: too few colors show as bands across gradients, while a flat
+ * fill (a white background, a black dress) shows nothing even if its color is a little off, so a cell whose
+ * surroundings vary by less than AUTO_FLAT barely counts (a picture that is half white background no longer
+ * looks "good enough" with a palette that bands every gradient on it).
+ * The palette then grows until that error is down to AUTO_SHARE of what 16 colors leave, but always to at most
+ * AUTO_HIGH and never further than AUTO_LOW (tuned on anime and digital art at 200 000 cells: soft shading
+ * gets about 150-280 colors, a sketch or flat art 70-200, a photo 200-450): a picture whose error drops fast
+ * with more colors stops early, a rich one goes on, up to AUTO_MAX. A picture that is already exact with a few
+ * colors (AUTO_EXACT) takes just those.
  * And no visible color may go missing: at most AUTO_LOST of the (visibility-weighted) cells may end up farther
  * than AUTO_LOST_DE from every palette color. That keeps small areas of their own color (skin in a picture
  * that is mostly white background, eyes, a red badge) that the average would hardly notice.
  */
 const AUTO_SEEN = 3;
-const AUTO_SHARE = 0.4;
+const AUTO_FLAT = 0.7;
+const AUTO_SHARE = 0.3;
+const AUTO_LOW = 0.7;
+const AUTO_HIGH = 1.5;
 const AUTO_EXACT = 0.4;
 const AUTO_LOST_DE = 8;
 const AUTO_LOST = 0.004;
-const AUTO_MAX = 240;
-const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240];
+const AUTO_MAX = 600;
+const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240, 300, 400, 500, 600];
 
-/** How much each sampled cell's color error shows: 1 in a smooth area, towards 0 in texture and on edges. */
+/**
+ * How much each sampled cell's color error shows. seen: 1 in a smooth area, towards 0 in texture and on edges;
+ * bands: the same, but also towards 0 in a flat fill (see "Auto colors" above).
+ */
 function visibility(rgba, W, H, cells) {
   const count = cells.length;
   const seen = new Float32Array(count);
+  const bands = new Float32Array(count);
   const lab = new Float32Array(27);
   for (let s = 0; s < count; s++) {
     const i = cells[s];
@@ -2049,21 +2223,26 @@ function visibility(rgba, W, H, cells) {
     m2 /= n;
     let v = 0;
     for (let j = 0; j < n; j++) v += (lab[j * 3] - m0) ** 2 + (lab[j * 3 + 1] - m1) ** 2 + (lab[j * 3 + 2] - m2) ** 2;
-    seen[s] = 1 / (1 + v / n / (AUTO_SEEN * AUTO_SEEN));
+    v /= n;
+    seen[s] = 1 / (1 + v / (AUTO_SEEN * AUTO_SEEN));
+    bands[s] = (seen[s] * v) / (v + AUTO_FLAT * AUTO_FLAT);
   }
-  return seen;
+  return { seen, bands };
 }
 
 /**
- * Visible error of a palette over the sample: { error: mean Lab distance to the nearest color, lost: share of
- * cells farther than AUTO_LOST_DE }, both weighted by `seen`.
+ * Visible error of a palette over the sample: { error: mean Lab distance to the nearest color, weighted by
+ * `bands` (by `seen` without it, or where nothing varies), lost: share of cells farther than AUTO_LOST_DE,
+ * weighted by `seen` }.
  */
-function visibleError(sample, palette, K, seen) {
+function visibleError(sample, palette, K, seen, bands = null) {
   const pal = new Float32Array(K * 3);
   for (let k = 0; k < K; k++) srgbToLab(palette[k * 3], palette[k * 3 + 1], palette[k * 3 + 2], pal, k * 3);
   const pts = sample.lab;
   let total = 0;
   let weight = 0;
+  let banded = 0;
+  let bandWeight = 0;
   let lost = 0;
   for (let i = 0; i < sample.count; i++) {
     let best = 1e12;
@@ -2076,10 +2255,16 @@ function visibleError(sample, palette, K, seen) {
     }
     total += Math.sqrt(best) * seen[i];
     weight += seen[i];
+    if (bands) {
+      banded += Math.sqrt(best) * bands[i];
+      bandWeight += bands[i];
+    }
     if (best > AUTO_LOST_DE * AUTO_LOST_DE) lost += seen[i];
   }
   weight = Math.max(1e-9, weight);
-  return { error: total / weight, lost: lost / weight };
+  // a picture of flat fills only: its plain average error decides (it is exact with its own few colors)
+  const error = bands && bandWeight > 0.01 * weight ? banded / bandWeight : total / weight;
+  return { error, lost: lost / weight };
 }
 
 /** Color count for "Auto colors" (see above). */
@@ -2094,7 +2279,7 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
   // plain Lab here: the limits are perceived differences
   const count = Math.min(N, 10000);
   const sample = paletteSample(rgba, N, count, 1);
-  const seen = visibility(rgba, W, H, sample.cells);
+  const { seen, bands } = visibility(rgba, W, H, sample.cells);
   const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
   let target = 0;
   let prevK = 0;
@@ -2107,13 +2292,13 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     hooks.progress(K);
     const fit = await kmeansFit(sample, K, 4, hooks);
     if (!fit) throw new Error("cancelled");
-    const { error, lost } = visibleError(sample, fit.palette, K, seen);
+    const { error, lost } = visibleError(sample, fit.palette, K, seen, bands);
     if (lost <= AUTO_LOST && !complete) complete = K;
     if (error <= AUTO_EXACT && complete) {
       found = K; // a picture of a few flat colors
       break;
     }
-    if (K === 16) target = AUTO_SHARE * error;
+    if (K === 16) target = Math.max(AUTO_LOW, Math.min(AUTO_HIGH, AUTO_SHARE * error));
     if (target && error <= target && !enough) {
       // between the last two steps, where the error (on log scales) crosses the target
       const t = prevError > error ? Math.log(prevError / target) / Math.log(prevError / error) : 1;
@@ -2136,7 +2321,7 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
  */
 async function focusColorCount(rgba, W, H, count, found, maxK, hooks) {
   const sample = paletteSample(rgba, W * H, count, 1, rgba.focus);
-  const seen = visibility(rgba, W, H, sample.cells);
+  const { seen } = visibility(rgba, W, H, sample.cells);
   for (let i = 0; i < seen.length; i++) seen[i] = i < count ? 0 : seen[i] * sample.share[i]; // marked ones only
   const limit = Math.max(found, Math.min(maxK, Math.round(found * FOCUS_MORE)));
   for (const K of [found, ...AUTO_STEPS.filter((k) => k > found && k < limit), limit]) {
