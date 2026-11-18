@@ -510,6 +510,13 @@ test("unifyLines: one outline gets one number, a line of another color keeps its
     Array.from(idx.slice(0, W)).every((k) => k === 0),
     "the background is not touched",
   );
+  // cells marked "important" keep their own number
+  const marked = new Uint16Array(W * H);
+  for (let x = 0; x < W; x++) marked[W + x] = x < 30 ? (x % 3 ? 1 : 2) : 3;
+  const focus = new Uint8Array(W * H);
+  for (let x = 0; x < 10; x++) focus[W + x] = 255;
+  unifyLines(marked, rgba, W, H, pal, 4, ink, focus);
+  for (let x = 0; x < 10; x++) assert.equal(marked[W + x], x % 3 ? 1 : 2, `marked cell ${x}`);
 });
 
 test("removeSpecks: a lone cell merges a little more readily than a bigger speck, a clearly different one stays", () => {

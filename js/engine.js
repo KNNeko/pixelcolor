@@ -1990,7 +1990,7 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
   if (!idx) return null;
   if (!dither) rescueRareColors(rgba, W * H, pal, K, idx, rgba.focus);
-  if (rgba.ink) unifyLines(idx, rgba, W, H, pal, K, rgba.ink);
+  if (rgba.ink) unifyLines(idx, rgba, W, H, pal, K, rgba.ink, rgba.focus);
   if (!dither && clean > 0) {
     settle(idx, rgba, W, H, pal, K, clean, lines, smooth);
     // only specks that hardly differ from their surroundings: small details that stand out stay; a lone cell
@@ -2013,20 +2013,22 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
  * of the line whose own color is within LINE_REACH (Lab ΔE; LINE_REACH_LIGHT for light lines and highlights,
  * whose shade shows more) of it; among the cells left, their most used color does the same, and so on.
  * A line of clearly different colors (red lips meeting a black outline, a darker shadow line) keeps them.
+ * Cells marked "important" are left as they are, like everywhere else in the clean-up.
  */
 const LINE_REACH = 8;
 const LINE_REACH_LIGHT = 5;
 
-/** See above: changes idx of line cells (ink: 1 dark line, 2 light line, 0 none). */
-export function unifyLines(idx, rgba, W, H, pal, K, ink) {
+/** See above: changes idx of line cells (ink: 1 dark line, 2 light line, 0 none; focus: the marks or null). */
+export function unifyLines(idx, rgba, W, H, pal, K, ink, focus = null) {
   const N = W * H;
+  const lineKind = (i) => (focus && focus[i] >= FOCUS_KEEP ? 0 : ink[i]);
   const palLab = paletteToLab(pal, K);
   const seen = new Uint8Array(N);
   const queue = new Int32Array(N);
   const lab = new Float32Array(3);
   const count = new Int32Array(K);
   for (let start = 0; start < N; start++) {
-    const kind = ink[start];
+    const kind = lineKind(start);
     if (!kind || seen[start]) continue;
     // the line: line cells of the same kind, 8-connected
     let n = 0;
@@ -2043,7 +2045,7 @@ export function unifyLines(idx, rgba, W, H, pal, K, ink) {
           const xx = x + dx;
           if (xx < 0 || xx >= W) continue;
           const j = yy * W + xx;
-          if (seen[j] || ink[j] !== kind) continue;
+          if (seen[j] || lineKind(j) !== kind) continue;
           seen[j] = 1;
           queue[n++] = j;
         }
