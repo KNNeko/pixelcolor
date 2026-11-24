@@ -3,7 +3,6 @@
 import {
   $,
   icon,
-  PAW_PATH,
   openSheet,
   closeSheet,
   actionButton,
@@ -99,54 +98,70 @@ const lazyLoader = new IntersectionObserver(
 const lazyImg = (entry) => `<img data-thumb="${entry.id}" alt="">`;
 
 /*
- * A finished canvas gets a stamp in its picture's corner: a paw in a double ring, in the app's accent ink,
- * tilted a few degrees (every canvas its own way), with slightly worn edges and gaps in the ink like a real
- * rubber stamp.
- * The wear comes from SVG noise filters, a few variants so stamps side by side differ. The ink is the dark
- * accent on a light corner and the light one on a dark corner (see inkStamp).
+ * A finished canvas gets a stamp in its picture's corner: a paw in a double ring, drawn in pixels like the
+ * pictures themselves, in the app's accent ink: the dark accent on a light corner and the light one on a dark
+ * corner (see inkStamp).
  */
-const STAMP_FILTERS = 4;
-document.body.insertAdjacentHTML(
-  "beforeend",
-  `<svg width="0" height="0" style="position:absolute" aria-hidden="true">${[...Array(STAMP_FILTERS).keys()]
-    .map(
-      (n) =>
-        `<filter id="stamp-ink-${n}" x="-8%" y="-8%" width="116%" height="116%">` +
-        // ragged edges: the outline pushed about by fine noise
-        `<feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" seed="${n * 7 + 3}" result="edge"/>` +
-        `<feDisplacementMap in="SourceGraphic" in2="edge" scale="1.6" xChannelSelector="R" yChannelSelector="G" result="ragged"/>` +
-        // patchy ink: coarser noise turned into an alpha mask with some light spots and a few gaps
-        `<feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="3" seed="${n * 11 + 5}" result="ink"/>` +
-        `<feColorMatrix in="ink" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -3.4 0 0 0 2.75" result="mask"/>` +
-        `<feComposite in="ragged" in2="mask" operator="in"/></filter>`,
-    )
-    .join("")}</svg>`,
-);
-/** A number from a canvas id that stays the same every time (the stamp's tilt and wear). */
-function idHash(id) {
-  let h = 2166136261;
-  for (const ch of String(id)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
-  return h >>> 0;
-}
+const STAMP = [
+  "..........########..........",
+  "........############........",
+  "......#####......#####......",
+  ".....###...######...###.....",
+  "....###.###......###.###....",
+  "...###.##..........##.###...",
+  "..###.#..............#.###..",
+  "..##.#................#.##..",
+  ".##.##....##....##....##.##.",
+  ".##.#....####..####....#.##.",
+  "###.#....####..####....#.###",
+  "##.#......##....##......#.##",
+  "##.#...##..........##...#.##",
+  "##.#...###...##...###...#.##",
+  "##.#...###..####..###...#.##",
+  "##.#....#..######..#....#.##",
+  "##.#......########......#.##",
+  "###.#....##########....#.###",
+  ".##.#....##########....#.##.",
+  ".##.##....########....##.##.",
+  "..##.#.....##..##.....#.##..",
+  "..###.#..............#.###..",
+  "...###.##..........##.###...",
+  "....###.###......###.###....",
+  ".....###...######...###.....",
+  "......#####......#####......",
+  "........############........",
+  "..........########..........",
+];
+const STAMP_PATH = STAMP.map((row, y) => {
+  let d = "";
+  for (let x = 0; x < row.length; x++) {
+    if (row[x] !== "#" || row[x - 1] === "#") continue;
+    let n = 1;
+    while (row[x + n] === "#") n++;
+    d += `M${x} ${y}h${n}v1h-${n}z`;
+  }
+  return d;
+}).join("");
 const stampHtml = (entry) => {
-  const h = idHash(entry.id);
-  const tilt = -4 + (h % 8); // degrees: -4..3, nearly straight
   // a third of the picture's width, but not more than about 60% of its height (wide pictures); in plain
-  // percentages, which every browser knows
+  // percentages, which every browser knows (inkStamp then makes it whole pixels)
   const side = Math.min(33, 62 / (entry.width / entry.height || 1));
   return (
-    `<i class="stamp" style="width:${side.toFixed(1)}%;--tilt:${tilt}deg"><svg viewBox="0 0 100 100">` +
-    `<g filter="url(#stamp-ink-${(h >> 8) % STAMP_FILTERS})" fill="none" stroke="currentColor">` +
-    `<circle cx="50" cy="50" r="45" stroke-width="6"/><circle cx="50" cy="50" r="36.5" stroke-width="2"/>` +
-    `<path d="${PAW_PATH}" fill="currentColor" stroke="none" transform="translate(50 52) scale(2.35) translate(-16 -16)"/>` +
-    `</g></svg></i>`
+    `<i class="stamp" style="width:${side.toFixed(1)}%"><svg viewBox="0 0 ${STAMP.length} ${STAMP.length}" ` +
+    `shape-rendering="crispEdges"><path d="${STAMP_PATH}" fill="currentColor"/></svg></i>`
   );
 };
 
-/** Picks the stamp's ink by how light the picture is under it, once the thumbnail has loaded. */
+/**
+ * Once the thumbnail has loaded: the stamp's size in whole screen pixels per stamp pixel (else some of its
+ * pixels come out a screen pixel wider than others), and its ink by how light the picture is under it.
+ */
 function inkStamp(img) {
   const stamp = img.nextElementSibling;
   if (!stamp || !img.naturalWidth) return;
+  const ratio = window.devicePixelRatio || 1;
+  const unit = Math.max(1, Math.floor((stamp.getBoundingClientRect().width * ratio) / STAMP.length));
+  stamp.style.width = `${(unit * STAMP.length) / ratio}px`;
   const w = img.naturalWidth;
   const h = img.naturalHeight;
   const side = Math.min(0.33 * w, 0.62 * h); // as in stampHtml

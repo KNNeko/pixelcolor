@@ -228,7 +228,7 @@ test("pickCellColors: a thin line is drawn lighter than its ink, by how little o
   }
 });
 
-test("pickCellColors: a stroke a cell and a half thick is drawn as a solid band of ink, not a two-tone line", () => {
+test("pickCellColors: a short stroke a cell and a half thick (an eyebrow) is one solid band of ink", () => {
   // 6 samples wide, 3 in cell 3 and 3 in cell 4: both cells are three quarters covered. Averaged cell by cell,
   // it counted as a thin line and was lightened on one row only: a thick eyebrow came out as a line with a shadow.
   const src = image(40, 40, (x) => (x >= 13 && x < 19 ? [70, 40, 45] : [250, 225, 210]));

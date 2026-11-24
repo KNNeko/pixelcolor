@@ -382,19 +382,20 @@ const LINE_INK = 0.7;
  */
 const LINE_WEIGHT = 0.6;
 /**
- * A line cell takes in the ink of the line cells around it only where it has the same hue: Lab distance with
- * lightness counted at LINE_HUE_L (a paler stretch of one line is the same line) within LINE_HUE_REACH.
+ * A line cell of a colorful ink (chroma at least LINE_HUE_CHROMA: a red iris, not a dark outline) takes in the
+ * ink of the line cells around it only where it has the same hue: Lab distance with lightness counted at
+ * LINE_HUE_L (a paler stretch of one line is the same line) within LINE_HUE_REACH.
  */
+const LINE_HUE_CHROMA = 20;
 const LINE_HUE_L = 0.25;
 const LINE_HUE_REACH = 18;
-/**
- * Dense line work (see rasterizeThinLines): a cell with at least this share of line samples, among at least
- * DENSE_AROUND of its 8 neighbours that have as many, keeps its average tone.
- */
-const DENSE_LINES = 0.25;
-const DENSE_AROUND = 6;
 /** Lines of at most this many cells (dots, short dashes: a pupil, a highlight) never give way to another line. */
 const SHORT_LINE = 3;
+/**
+ * Lines of at most this many cells are strokes of their own (an eyebrow, an eyelid line, a short strand):
+ * their shade follows their width (see lightenThinLines). Longer ones are outlines.
+ */
+const STROKE_LINE = 40;
 
 /**
  * Running maximum (or minimum) over a window of 2r+1 samples along the rows of a w x h byte image, in O(1) per
@@ -835,25 +836,6 @@ function rasterizeThinLines(rgba, W, H, k) {
       if (y < H - 1) around += both[c + W];
       if (around >= 3) texture[c] = 1;
     }
-  // Dense line work: a cell with line samples in it whose neighbours nearly all have them too (the strokes of a
-  // furry eyebrow, eyelashes, the iris and lid lines of a small eye, a mass of hair strands) is a shape of
-  // its own, not single lines: drawn as lines, a thick eyebrow became its outline with skin-colored cells
-  // inside. It keeps its average tone instead, like texture.
-  const lineShare = new Float32Array(cells);
-  for (let c = 0; c < cells; c++) lineShare[c] = (count[1][c] + count[2][c]) / n;
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++) {
-      const c = y * W + x;
-      if (lineShare[c] < DENSE_LINES || texture[c]) continue;
-      let around = 0;
-      for (let dy = -1; dy <= 1; dy++)
-        for (let dx = -1; dx <= 1; dx++) {
-          const xx = x + dx;
-          const yy = y + dy;
-          if ((dx || dy) && xx >= 0 && yy >= 0 && xx < W && yy < H && lineShare[yy * W + xx] >= DENSE_LINES) around++;
-        }
-      if (around >= DENSE_AROUND) texture[c] = 2;
-    }
   for (let c = 0; c < cells; c++) if (texture[c]) kind[c] = 0;
   const same = (x, y, t) => x >= 0 && y >= 0 && x < W && y < H && kind[y * W + x] === t;
   // Clean one-cell lines, the way a pixel artist draws them. Cells that the line does not need go, the
@@ -1006,9 +988,10 @@ function rasterizeThinLines(rgba, W, H, k) {
     const x = c % W;
     const y = (c - x) / W;
     // The cell's own ink: its strongest samples. Then samples of the line around it join in, from the
-    // strongest neighbour down to the same share, but only those of the same hue: a line keeps one color
-    // along its length (a cell it only grazes is merely paler), while a colored detail inside a dark one
-    // (a red iris under black lashes, at a few cells per eye) keeps its color instead of the lashes' ink.
+    // strongest neighbour down to the same share: a line keeps one color along its length (a cell it only
+    // grazes is merely paler). A cell of a colorful ink takes in only samples of its own hue: a colored
+    // detail inside a dark one (a red iris under black lashes, at a few cells per eye) keeps its color
+    // instead of the lashes' ink.
     let top = 0;
     for (let dy = -1; dy <= 1; dy++)
       for (let dx = -1; dx <= 1; dx++) if (same(x + dx, y + dy, t)) top = Math.max(top, peak[t][(y + dy) * W + x + dx]);
@@ -1027,6 +1010,7 @@ function rasterizeThinLines(rgba, W, H, k) {
         ownWeight += strength[i];
       }
     if (ownWeight) srgbToLab(or / ownWeight, og / ownWeight, ob / ownWeight, own, 0);
+    const colorful = ownWeight > 0 && Math.hypot(own[1], own[2]) >= LINE_HUE_CHROMA;
     const floor = top * LINE_INK;
     let r = 0;
     let gg = 0;
@@ -1039,7 +1023,7 @@ function rasterizeThinLines(rgba, W, H, k) {
           for (let sx = (x + dx) * k; sx < (x + dx + 1) * k; sx++) {
             const i = sy * w + sx;
             if (type[i] !== t || strength[i] < floor) continue;
-            if (ownWeight && (dx || dy)) {
+            if (colorful && (dx || dy)) {
               srgbToLab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], lab, 0);
               const dl = (lab[0] - own[0]) * LINE_HUE_L;
               const da = lab[1] - own[1];
@@ -1227,9 +1211,9 @@ const BITS3 = [0, 1, 1, 2, 1, 2, 2, 3];
  * a third of a cell wide darkens its cells only a little ("contours stand out too much on arts with thin
  * lines"). So a dark line cell's color moves from the ink towards the background around it, the more the
  * thinner the line: by coverage^LINE_WEIGHT of the way, where coverage is how far the cell's plain average
- * got from that background towards the ink, taken as the line's width over a few cells (one line, one
- * weight: no flicker). Lines a cell wide or more stay ink; so do short dark marks (a pupil, a mole: lines of
- * at most SHORT_LINE cells) and light lines (highlights).
+ * got from that background towards the ink, averaged along the line (one line, one weight: no flicker); for a
+ * short stroke, its width there. Lines a cell wide or more stay ink; so do short dark marks (a pupil, a mole:
+ * lines of at most SHORT_LINE cells) and light lines (highlights).
  */
 function lightenThinLines(rgba, W, H, k, kind, color, near, lineOf) {
   const w = W * k;
@@ -1303,15 +1287,20 @@ function lightenThinLines(rgba, W, H, k, kind, color, near, lineOf) {
     const ab = back[c * 3 + 2] - all[c * 3 + 2] / n;
     coverage[c] = Math.max(0, Math.min(1, (ar * dr + ag * dg + ab * db) / span));
   }
-  // The line's width at a cell: its coverage summed over the 3 x 3 cells around, per cell of its length there
-  // (the most columns or rows it spans). A plain average of the cells took a stroke one and a half cells thick,
-  // drawn as two rows of partly covered cells, for a thin line: a thick eyebrow came out as a two-tone line.
-  // Cells of the stroke off its skeleton (no line of their own) count with it.
+  // An outline: the coverage averaged over its cells around (one weight along it, as it always was). A short
+  // stroke: its width there, the coverage summed over the 3 x 3 cells around per cell of its length (the
+  // most columns or rows it spans), its cells off the skeleton (no line of their own) included. Averaged,
+  // an eyebrow one and a half cells thick, drawn as two rows of partly covered cells, came out as a
+  // two-tone line; by its width it is one solid shape. (On outlines that made their two-cell steps as dark
+  // as the rest: uneven lines.)
   for (let c = 0; c < cells; c++) {
-    if (coverage[c] < 0 || !(size.get(lineOf[c]) > SHORT_LINE)) continue;
+    const lineSize = size.get(lineOf[c]);
+    if (coverage[c] < 0 || !(lineSize > SHORT_LINE)) continue;
+    const stroke = lineSize <= STROKE_LINE;
     const x = c % W;
     const y = (c - x) / W;
     let sum = 0;
+    let m = 0;
     let cols = 0;
     let rows = 0;
     for (let dy = -1; dy <= 1; dy++)
@@ -1320,12 +1309,14 @@ function lightenThinLines(rgba, W, H, k, kind, color, near, lineOf) {
         const yy = y + dy;
         if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
         const j = yy * W + xx;
-        if (coverage[j] < 0 || (lineOf[j] !== lineOf[c] && lineOf[j] >= 0)) continue;
+        if (coverage[j] < 0 || (lineOf[j] !== lineOf[c] && !(stroke && lineOf[j] < 0))) continue;
         sum += coverage[j];
+        m++;
         cols |= 1 << (dx + 1);
         rows |= 1 << (dy + 1);
       }
-    const weight = Math.pow(Math.min(1, sum / Math.max(BITS3[cols], BITS3[rows])), LINE_WEIGHT);
+    const width = stroke ? sum / Math.max(BITS3[cols], BITS3[rows]) : sum / m;
+    const weight = Math.pow(Math.min(1, width), LINE_WEIGHT);
     for (let j = 0; j < 3; j++) color[c * 3 + j] = back[c * 3 + j] + (color[c * 3 + j] - back[c * 3 + j]) * weight;
   }
 }
@@ -1375,10 +1366,21 @@ export function pickCellColors(rgba, W, H, k) {
       }
       // the cell's samples, without the ones on or right beside a thin line (unless the whole patch is fine
       // hatching); if a line fills the cell, the background around it: the same samples of the neighbouring
-      // cells; failing that, all but the line samples; failing that, all of them
+      // cells; failing that, all but the line samples; failing that, all of them. A cell between two dark line
+      // cells on opposite sides lies inside a narrow outlined shape (a thick eyebrow drawn with an outline):
+      // its own samples off the lines come first there, not those around it (they took the skin below the
+      // eyebrow and left holes in it).
       const skipLines = thin && !thin.texture[i];
+      const dark = (xx, yy) => xx >= 0 && yy >= 0 && xx < W && yy < H && thin.kind[yy * W + xx] === 1;
+      const inside =
+        skipLines &&
+        ((dark(x - 1, y) && dark(x + 1, y)) ||
+          (dark(x, y - 1) && dark(x, y + 1)) ||
+          (dark(x - 1, y - 1) && dark(x + 1, y + 1)) ||
+          (dark(x + 1, y - 1) && dark(x - 1, y + 1)));
       let m = 0;
-      for (let pass = 0; pass < 4 && !m; pass++) {
+      for (let step = 0; step < 4 && !m; step++) {
+        const pass = inside && step > 0 && step < 3 ? 3 - step : step;
         if (pass === 1 && !skipLines) continue;
         const x0 = pass === 1 ? Math.max(0, x - 1) : x;
         const x1 = pass === 1 ? Math.min(W - 1, x + 1) : x;

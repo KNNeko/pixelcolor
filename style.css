@@ -435,21 +435,18 @@ header b {
   display: block;
   object-fit: contain;
 }
-/* "finished": a rubber stamp pressed in the picture's corner (its width is set per card, see stampHtml) */
+/* "finished": a pixel stamp in the picture's corner (its width is set per card, see stampHtml and inkStamp) */
 .stamp {
   position: absolute;
   right: 3px;
   bottom: 3px;
-  transform: rotate(var(--tilt));
   /* the app's accent: its dark navy on a light corner of the picture, its lavender on a dark one */
   color: #191b45;
-  filter: drop-shadow(0 0 0.8px #ffffff8c);
-  opacity: 0.85;
+  opacity: 0.9;
   pointer-events: none;
 }
 .stamp.light-ink {
   color: #c5c9f5;
-  filter: drop-shadow(0 0 0.8px #0000008c);
 }
 .stamp::before {
   content: "";
