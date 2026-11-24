@@ -228,6 +228,19 @@ test("pickCellColors: a thin line is drawn lighter than its ink, by how little o
   }
 });
 
+test("pickCellColors: a stroke a cell and a half thick is drawn as a solid band of ink, not a two-tone line", () => {
+  // 6 samples wide, 3 in cell 3 and 3 in cell 4: both cells are three quarters covered. Averaged cell by cell,
+  // it counted as a thin line and was lightened on one row only: a thick eyebrow came out as a line with a shadow.
+  const src = image(40, 40, (x) => (x >= 13 && x < 19 ? [70, 40, 45] : [250, 225, 210]));
+  const out = pickCellColors(src.data, 10, 10, 4);
+  for (let y = 2; y < 8; y++) {
+    const a = out[(y * 10 + 3) * 4];
+    const b = out[(y * 10 + 4) * 4];
+    assert.ok(a < 100 && b < 100, `row ${y}: ${a}, ${b} (both ink)`);
+    assert.ok(Math.abs(a - b) < 12, `row ${y}: ${a}, ${b} (one shade)`);
+  }
+});
+
 test("pickCellColors: a highlight inside a small dark iris stays light; the gap between two dark lines is no line", () => {
   // a dark disk (radius 6 samples) with a white dot (2 x 2 samples) in it, on skin
   const iris = image(40, 40, (x, y) => {
