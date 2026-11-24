@@ -37,6 +37,11 @@ export const DEFAULTS = {
   tot: null, // lifetime painting statistics (stats.js); null until first counted
 };
 
+/** Canvas themes in the order the menus list them: the two standard ones and the custom light and dark. */
+export const CANVAS_THEMES = ["cw", "cusl", "cd", "cusd"];
+/** Silhouette themes: the standard gray and the custom tint. */
+export const SILHOUETTE_THEMES = ["sg", "cus"];
+
 export const settings = { ...DEFAULTS };
 try {
   Object.assign(settings, JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"));
@@ -57,6 +62,10 @@ export function upgradeSettings(s) {
     delete s.cc;
   }
   delete s.mq; // resolution while moving, learned by v36; gone
+  // presets dropped by v43: the standard canvas of the same kind (light or dark), the standard gray silhouette
+  const CANVAS = { clg: "cw", gl1: "cw", gl2: "cw", cb: "cd", gd1: "cd", gd2: "cd" };
+  if (CANVAS[s.ct]) s.ct = CANVAS[s.ct];
+  if (s.sit !== undefined && !SILHOUETTE_THEMES.includes(s.sit)) s.sit = "sg";
 }
 
 export function saveSettings() {
@@ -82,38 +91,25 @@ export function applyAppTheme() {
   document.querySelector("meta[name=theme-color]").content = dark ? "#13142a" : "#f3f1ff";
 }
 
-const SOLID_THEMES = { cw: ["#ffffff", 0], clg: ["#e6e8ee", 0], cd: ["#161616", 1], cb: ["#000000", 1] };
-/** Canvas themes in the order the menus list them. */
-export const CANVAS_THEMES = ["cw", "clg", "gl1", "gl2", "cusl", "cd", "cb", "gd1", "gd2", "cusd"];
-const GRADIENT_THEMES = {
-  gl1: ["#f7f3ff", "#d6e6fb", 0],
-  gl2: ["#fff4ee", "#f8d9ea", 0],
-  gd1: ["#262a58", "#0b0c20", 1],
-  gd2: ["#14414d", "#090d28", 1],
-};
+const SOLID_THEMES = { cw: ["#ffffff", 0], cd: ["#161616", 1] };
 
 /**
  * Colors used to draw the coloring canvas for the current canvas theme. Light or dark decides the cells,
  * numbers, grid and silhouette; for the custom themes that is the user's choice, whatever the color.
- * base: brightness of the background (0..255; a gradient's average), what the dark silhouette starts from.
+ * base: brightness of the background (0..255), what the dark silhouette starts from.
  */
 export function canvasTheme() {
   let bg;
-  let gradient = null;
+  const gradient = null; // (no theme has one any more; the drawing still could)
   let dark;
-  if (GRADIENT_THEMES[settings.ct]) {
-    const g = GRADIENT_THEMES[settings.ct];
-    gradient = [g[0], g[1]];
-    bg = g[0];
-    dark = g[2];
-  } else if (settings.ct === "cusl" || settings.ct === "cusd") {
+  if (settings.ct === "cusl" || settings.ct === "cusd") {
     dark = settings.ct === "cusd" ? 1 : 0;
     bg = dark ? settings.ccd : settings.ccl;
     if (!/^#[0-9a-f]{6}$/i.test(bg)) bg = dark ? DEFAULTS.ccd : DEFAULTS.ccl;
   } else {
     [bg, dark] = SOLID_THEMES[settings.ct] || SOLID_THEMES.cw;
   }
-  const base = gradient ? (hexLuma(gradient[0]) + hexLuma(gradient[1])) / 2 : hexLuma(bg);
+  const base = hexLuma(bg);
   // dark: neutral grays (no blue cast); the selected number's empty cells go almost black
   return dark
     ? {

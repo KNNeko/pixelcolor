@@ -1,7 +1,14 @@
 // Settings screen: one row per setting, plus backup export/import.
 import { $, showScreen, translatePage, syncFullscreen, download, setBusy, yieldToBrowser, toast } from "./ui.js";
 import { t } from "./i18n.js";
-import { settings, saveSettings, applyAppTheme, upgradeSettings, CANVAS_THEMES } from "./settings.js";
+import {
+  settings,
+  saveSettings,
+  applyAppTheme,
+  upgradeSettings,
+  CANVAS_THEMES,
+  SILHOUETTE_THEMES,
+} from "./settings.js";
 import { exportBackup, importBackup, requestPersistence } from "./storage.js";
 import { refreshLibrary, renderSortOptions, clearThumbCache } from "./library.js";
 import { restartAutosave } from "./game.js";
@@ -20,7 +27,7 @@ const ROWS = [
   ["ccl", "color"],
   ["ccd", "color"],
   ["sil", "toggle"],
-  ["sit", "select", ["sg", "se", "sb", "sm", "sr", "sv", "cus"]],
+  ["sit", "select", SILHOUETTE_THEMES],
   ["sic", "color"],
   ["grid", "toggle"],
   ["mini", "toggle"],

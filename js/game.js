@@ -14,7 +14,7 @@ import {
   createCanvas,
 } from "./ui.js";
 import { t } from "./i18n.js";
-import { settings, saveSettings, canvasTheme, hexToPixel, CANVAS_THEMES } from "./settings.js";
+import { settings, saveSettings, canvasTheme, hexToPixel, CANVAS_THEMES, SILHOUETTE_THEMES } from "./settings.js";
 import { saveCanvas } from "./storage.js";
 import { paletteOrder, colorFamilies } from "./colorsort.js";
 import { renderThumbnails } from "./render.js";
@@ -173,7 +173,6 @@ const ctx = playCanvas.getContext("2d");
 const glCanvas = $("#play-gl");
 let glView; // created when the first canvas is opened; null = WebGL 2 is not available
 const PART_TINTS = ["#ff4d73", "#4da3ff", "#3ecf8e", "#ffb84d", "#a66bff", "#ff7ad9", "#4de0d0", "#c2e04d"];
-const SILHOUETTE_TINTS = { sg: 0, se: "#7a4a1c", sb: "#2c5fb3", sm: "#17866a", sr: "#c23a72", sv: "#6a46c8" };
 
 export const inCurrentPart = (i) => game.part < 0 || game.canvas.partOf[i] === game.part;
 export const remainingOf = (k) => (game.part < 0 ? game.remaining[k] : game.partRemaining[k]);
@@ -197,8 +196,8 @@ const DARK_SILHOUETTE = 0.62;
 const DARK_HIGHLIGHT = 0.15;
 /** Silhouette shade of a color with luma L, tinted with the chosen silhouette color (0 = no tint). */
 function tintedShade(L, highlighted) {
-  const hex = settings.sit === "cus" ? settings.sic : SILHOUETTE_TINTS[settings.sit];
-  if (!hex) return 0;
+  if (settings.sit !== "cus" || !/^#[0-9a-f]{6}$/i.test(settings.sic)) return 0;
+  const hex = settings.sic;
   const n = parseInt(hex.slice(1), 16);
   const tint = [n >> 16, (n >> 8) & 255, n & 255];
   let rgb;
@@ -2052,7 +2051,7 @@ $("#play-more").onclick = () => {
       actionButton("wand", "tset", "menu-tools") +
       actionButton("image", "png", "menu-png") +
       `</div>${toggle("sil")}` +
-      `<div class="chips nowrap"><select id="menu-sil-tint">${options(["sg", "se", "sb", "sm", "sr", "sv", "cus"], settings.sit, "sit")}</select>${colorButtonHtml("menu-sil-color", settings.sic)}</div>` +
+      `<div class="chips nowrap"><select id="menu-sil-tint">${options(SILHOUETTE_THEMES, settings.sit, "sit")}</select>${colorButtonHtml("menu-sil-color", settings.sic)}</div>` +
       `<div class="chips nowrap"><select id="menu-canvas-theme">${options(CANVAS_THEMES, settings.ct, "ct")}</select>${colorButtonHtml("menu-canvas-color", settings[customCanvasKey()])}</div>` +
       toggle("mini") +
       toggle("oth"),
