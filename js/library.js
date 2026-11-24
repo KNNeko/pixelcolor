@@ -99,8 +99,9 @@ const lazyLoader = new IntersectionObserver(
 const lazyImg = (entry) => `<img data-thumb="${entry.id}" alt="">`;
 
 /*
- * A finished canvas gets a stamp on its picture's corner: a paw in a double ring, in the app's accent ink,
- * tilted a little (every canvas its own way), with worn edges and gaps in the ink like a real rubber stamp.
+ * A finished canvas gets a stamp in its picture's corner: a paw in a double ring, in the app's accent ink,
+ * tilted a few degrees (every canvas its own way), with slightly worn edges and gaps in the ink like a real
+ * rubber stamp.
  * The wear comes from SVG noise filters, a few variants so stamps side by side differ. The ink is the dark
  * accent on a light corner and the light one on a dark corner (see inkStamp).
  */
@@ -113,7 +114,7 @@ document.body.insertAdjacentHTML(
         `<filter id="stamp-ink-${n}" x="-8%" y="-8%" width="116%" height="116%">` +
         // ragged edges: the outline pushed about by fine noise
         `<feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" seed="${n * 7 + 3}" result="edge"/>` +
-        `<feDisplacementMap in="SourceGraphic" in2="edge" scale="3.2" xChannelSelector="R" yChannelSelector="G" result="ragged"/>` +
+        `<feDisplacementMap in="SourceGraphic" in2="edge" scale="1.6" xChannelSelector="R" yChannelSelector="G" result="ragged"/>` +
         // patchy ink: coarser noise turned into an alpha mask with some light spots and a few gaps
         `<feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="3" seed="${n * 11 + 5}" result="ink"/>` +
         `<feColorMatrix in="ink" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -3.4 0 0 0 2.75" result="mask"/>` +
@@ -129,9 +130,12 @@ function idHash(id) {
 }
 const stampHtml = (entry) => {
   const h = idHash(entry.id);
-  const tilt = -17 + (h % 23); // degrees: -17..5, mostly leaning left like a hand-pressed stamp
+  const tilt = -4 + (h % 8); // degrees: -4..3, nearly straight
+  // a third of the picture's width, but not more than about 60% of its height (wide pictures); in plain
+  // percentages, which every browser knows
+  const side = Math.min(33, 62 / (entry.width / entry.height || 1));
   return (
-    `<i class="stamp" style="--tilt:${tilt}deg"><svg viewBox="0 0 100 100">` +
+    `<i class="stamp" style="width:${side.toFixed(1)}%;--tilt:${tilt}deg"><svg viewBox="0 0 100 100">` +
     `<g filter="url(#stamp-ink-${(h >> 8) % STAMP_FILTERS})" fill="none" stroke="currentColor">` +
     `<circle cx="50" cy="50" r="45" stroke-width="6"/><circle cx="50" cy="50" r="36.5" stroke-width="2"/>` +
     `<path d="${PAW_PATH}" fill="currentColor" stroke="none" transform="translate(50 52) scale(2.35) translate(-16 -16)"/>` +
@@ -145,10 +149,10 @@ function inkStamp(img) {
   if (!stamp || !img.naturalWidth) return;
   const w = img.naturalWidth;
   const h = img.naturalHeight;
-  const side = Math.min(0.33 * w, 0.62 * h); // as in the CSS
+  const side = Math.min(0.33 * w, 0.62 * h); // as in stampHtml
   const probe = createCanvas(8, 8);
   const ctx = probe.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(img, w * 0.97 - side, h - w * 0.03 - side, side, side, 0, 0, 8, 8);
+  ctx.drawImage(img, w - side, h - side, side, side, 0, 0, 8, 8);
   const d = ctx.getImageData(0, 0, 8, 8).data;
   // the ink that differs more from what is under it, on average (luma of the two inks: 27 and 203)
   let dark = 0;
