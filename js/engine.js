@@ -31,6 +31,8 @@ export const DEFAULT_MODE = "art";
 export const DEFAULT_CLEAN = 3;
 /** "Transition dithering" slider of the art mode, 0..3 (0 = off): see ditherTransitions. */
 export const DEFAULT_BLEND = 1;
+/** "Merge look-alike colors" (0/1): see LOOKALIKE. */
+export const DEFAULT_MERGE = 1;
 
 export const NO_ADJUST = { bri: 100, con: 100, sat: 100, tmp: 0, shp: 0, blk: 0, wht: 255, enh: 0 };
 
@@ -55,7 +57,9 @@ export function normalizeParams(p) {
   if (clean == null) clean = p.denoise == null ? DEFAULT_CLEAN : Math.round(p.denoise * 1.2 + (p.specks || 0) / 4);
   // transition dithering (art mode, 0..3); canvases made before it existed had none
   const blend = p.blend == null ? 0 : Math.max(0, Math.min(3, Math.round(p.blend)));
-  return { ...p, style, clean: Math.max(0, Math.min(10, clean)), blend };
+  // "merge look-alike colors"; canvases made before it existed had it off
+  const merge = p.merge ? 1 : 0;
+  return { ...p, style, clean: Math.max(0, Math.min(10, clean)), blend, merge };
 }
 
 /* ---------- helpers ---------- */
@@ -228,12 +232,70 @@ export function applyAdjustments(rgba, w, h, a) {
   return rgba;
 }
 
+/*
+ * Small details. A cell that has at most DETAIL_SAME_MAX of its 8 neighbours within DETAIL_SAME of its color
+ * (|dR|+|dG|+|dB|) and differs from all the others by at least DETAIL_MIN is part of a small detail: a dot, a
+ * highlight of up to 2 x 2 cells, a pupil, a cell of a faint strand. The smoothing steps of the clean-up leave it as it is: blurred
+ * into the cells around it (even at the lowest setting a detail a little stronger than noise went half way),
+ * it then fell into their color, and the clean-up ate a fifth of the small details of a picture.
+ */
+const DETAIL_SAME = 12;
+const DETAIL_SAME_MAX = 3;
+const DETAIL_MIN = 24;
+
+/** True if cell (x, y) of the W x H cell image is a small detail (see above). */
+function isDetail(rgba, W, H, x, y) {
+  const p = (y * W + x) * 4;
+  let same = 0;
+  let others = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    const yy = y + dy;
+    if (yy < 0 || yy >= H) continue;
+    for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx;
+      if ((!dx && !dy) || xx < 0 || xx >= W) continue;
+      const q = (yy * W + xx) * 4;
+      const d = Math.abs(rgba[q] - rgba[p]) + Math.abs(rgba[q + 1] - rgba[p + 1]) + Math.abs(rgba[q + 2] - rgba[p + 2]);
+      if (d <= DETAIL_SAME) {
+        if (++same > DETAIL_SAME_MAX) return false;
+      } else if (d < DETAIL_MIN) return false;
+      else others++;
+    }
+  }
+  return others > 0;
+}
+
+/**
+ * True if cell (x, y) differs from none of its 8 neighbours by more than `step` (|dR|+|dG|+|dB|): a gradient
+ * or a flat area changes in small steps from cell to cell; fine texture (fabric, petals, hair) and the cells
+ * next to a small detail change in big ones, even where the colors of a block stay close together.
+ */
+function gentleAround(rgba, W, H, x, y, step) {
+  if (step === Infinity) return true;
+  const p = (y * W + x) * 4;
+  for (let dy = -1; dy <= 1; dy++) {
+    const yy = y + dy;
+    if (yy < 0 || yy >= H) continue;
+    for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx;
+      if ((!dx && !dy) || xx < 0 || xx >= W) continue;
+      const q = (yy * W + xx) * 4;
+      if (
+        Math.abs(rgba[q] - rgba[p]) + Math.abs(rgba[q + 1] - rgba[p + 1]) + Math.abs(rgba[q + 2] - rgba[p + 2]) >
+        step
+      )
+        return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Edge-preserving smoothing of the cell image. Neighbours that differ only slightly (noise, JPEG blocks,
  * banding steps) are averaged with full weight; neighbours that differ clearly get none, so borders stay sharp.
  * The weight is flat up to the threshold on purpose: inside a soft gradient this is then a plain blur, which
  * keeps the gradient smooth. (A bell-shaped weight pulls every cell towards its own value and turns gradients
- * into flat blotches.)
+ * into flat blotches.) Small details (see isDetail) keep their color.
  */
 export function smoothFlat(rgba, w, h, clean, lines = null) {
   if (clean <= 0) return rgba;
@@ -255,8 +317,8 @@ export function smoothFlat(rgba, w, h, clean, lines = null) {
         const r = src[p];
         const g = src[p + 1];
         const b = src[p + 2];
-        if (lines && lines[y * w + x]) {
-          // thin-line cells keep their color
+        if ((lines && lines[y * w + x]) || isDetail(src, w, h, x, y)) {
+          // thin-line cells and small details keep their color
           out[p] = r;
           out[p + 1] = g;
           out[p + 2] = b;
@@ -293,17 +355,18 @@ export function smoothFlat(rgba, w, h, clean, lines = null) {
  * Art mode: inside soft gradients and flat areas (the 5x5 block around a cell holds only close colors) each
  * cell becomes the average of its block. Then noise (JPEG, grain) no longer decides on which side of a band
  * border a cell falls, and the borders between the bands of a gradient run as smooth curves instead of ragged
- * blotches. Blocks with any real detail or border in them are left as they are. Thin-line cells are skipped.
+ * blotches. Blocks with any real detail or border in them are left as they are. Thin-line cells and small
+ * details (see isDetail) are skipped.
  * range: largest |dR|+|dG|+|dB| between any two cells of a block that still counts as smooth.
  */
-export function smoothGradients(rgba, W, H, range, lines = null) {
+export function smoothGradients(rgba, W, H, range, lines = null, step = Infinity) {
   if (range <= 0) return rgba;
   const out = new Uint8ClampedArray(rgba);
   const smooth = new Uint8Array(W * H); // 1 = inside a soft gradient or flat area (for settle)
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
-      if (lines && lines[i]) continue;
+      if ((lines && lines[i]) || isDetail(rgba, W, H, x, y) || !gentleAround(rgba, W, H, x, y, step)) continue;
       let r0 = 255;
       let r1 = 0;
       let g0 = 255;
@@ -1602,6 +1665,52 @@ function paletteToLab(pal, K) {
 }
 
 /**
+ * CIEDE2000 difference of the Lab colors a[i..i+2] and b[j..j+2]: what the eye sees as different, more evenly
+ * than the plain Lab distance (which overstates differences between bright, saturated colors).
+ */
+export function deltaE2000(a, i, b, j) {
+  const L1 = a[i];
+  const L2 = b[j];
+  const C1 = Math.hypot(a[i + 1], a[i + 2]);
+  const C2 = Math.hypot(b[j + 1], b[j + 2]);
+  const c7 = ((C1 + C2) / 2) ** 7;
+  const G = 0.5 * (1 - Math.sqrt(c7 / (c7 + 6103515625))); // 25^7
+  const a1 = (1 + G) * a[i + 1];
+  const a2 = (1 + G) * b[j + 1];
+  const C1p = Math.hypot(a1, a[i + 2]);
+  const C2p = Math.hypot(a2, b[j + 2]);
+  const h1 = C1p ? (Math.atan2(a[i + 2], a1) * DEG + 360) % 360 : 0;
+  const h2 = C2p ? (Math.atan2(b[j + 2], a2) * DEG + 360) % 360 : 0;
+  let dh = 0;
+  let hm = h1 + h2;
+  if (C1p && C2p) {
+    dh = h2 - h1;
+    if (dh > 180) dh -= 360;
+    else if (dh < -180) dh += 360;
+    if (Math.abs(h1 - h2) > 180) hm += hm < 360 ? 360 : -360;
+    hm /= 2;
+  }
+  const dL = L2 - L1;
+  const dC = C2p - C1p;
+  const dH = 2 * Math.sqrt(C1p * C2p) * Math.sin(dh / DEG / 2);
+  const Lm = (L1 + L2) / 2 - 50;
+  const Cm = (C1p + C2p) / 2;
+  const T =
+    1 -
+    0.17 * Math.cos((hm - 30) / DEG) +
+    0.24 * Math.cos((2 * hm) / DEG) +
+    0.32 * Math.cos((3 * hm + 6) / DEG) -
+    0.2 * Math.cos((4 * hm - 63) / DEG);
+  const cm7 = Cm ** 7;
+  const Rt = -2 * Math.sqrt(cm7 / (cm7 + 6103515625)) * Math.sin((60 * Math.exp(-(((hm - 275) / 25) ** 2))) / DEG);
+  const l = dL / (1 + (0.015 * Lm * Lm) / Math.sqrt(20 + Lm * Lm));
+  const c = dC / (1 + 0.045 * Cm);
+  const h = dH / (1 + 0.015 * Cm * T);
+  return Math.sqrt(l * l + c * c + h * h + Rt * c * h);
+}
+const DEG = 180 / Math.PI;
+
+/**
  * Lightness counts this much more than hue and saturation when the palette is picked and cells are matched to
  * it. Banding in a gradient is seen in its lightness first: with lightness weighted, the palette lays its colors
  * out along the gradient's light-dark course, and the bands follow it as smooth, evenly ordered rings instead of
@@ -1749,7 +1858,7 @@ function keptCells(lines, focus, N) {
  * sample.weight is optional (all 1 without it).
  * Returns { palette: RGB Float32Array (averaged in RGB so colors don't drift), error: mean Lab distance }.
  */
-export async function kmeansFit(sample, K, iterations, hooks = noHooks, seed = 7) {
+export async function kmeansFit(sample, K, iterations, hooks = noHooks, seed = 7, start = null) {
   const { lab: pts, rgb, count: S } = sample;
   const weight = sample.weight || new Float32Array(S).fill(1);
   const random = makeRandom(seed);
@@ -1757,8 +1866,10 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks, seed = 7
   const nearestDist = new Float32Array(S).fill(1e12);
   const seedIndex = new Int32Array(K);
 
+  // start: given centers (Lab, as the points), else k-means++ seeding
+  if (start) centers.set(start.subarray(0, K * 3));
   let s = (random() * S) | 0;
-  for (let k = 0; k < K; k++) {
+  for (let k = 0; k < K && !start; k++) {
     seedIndex[k] = s;
     for (let j = 0; j < 3; j++) centers[k * 3 + j] = pts[s * 3 + j];
     let total = 0;
@@ -1830,13 +1941,72 @@ export async function kmeansFit(sample, K, iterations, hooks = noHooks, seed = 7
   for (let k = 0; k < K; k++)
     for (let j = 0; j < 3; j++)
       palette[k * 3 + j] = Math.round(mass[k] ? sums[k * 3 + j] / mass[k] : rgb[seedIndex[k] * 3 + j]);
-  return { palette, error: error / S };
+  return { palette, error: error / S, centers, mass };
 }
 
-export async function kmeansPalette(rgba, pixelCount, K, hooks, focus = null) {
+/**
+ * The palette: k-means on a sample of the cells (RGB Float32Array, K colors; null if cancelled). With
+ * lookalikes, colors that look alike (LOOKALIKE) are merged and the palette is fitted again from there with that
+ * many colors, LOOKALIKE_ROUNDS times: the colors left spread evenly over the picture's colors (a gradient gets
+ * steps that can all be told apart) instead of keeping the gaps the merging left. Fewer than K colors then.
+ */
+export async function kmeansPalette(rgba, pixelCount, K, hooks, focus = null, lookalikes = false) {
   const sample = paletteSample(rgba, pixelCount, Math.min(pixelCount, K > 300 ? 16000 : 30000), L_WEIGHT, focus);
-  const fit = await kmeansFit(sample, K, 8, hooks);
+  let fit = await kmeansFit(sample, K, 8, hooks);
+  for (let round = 0; fit && lookalikes && round < LOOKALIKE_ROUNDS; round++) {
+    const merged = mergeLookalikeCenters(fit, K);
+    if (!merged) break;
+    K = merged.length / 3;
+    fit = await kmeansFit(sample, K, 4, hooks, 7, merged);
+  }
   return fit && fit.palette;
+}
+
+const LOOKALIKE_ROUNDS = 2;
+
+/**
+ * The centers of a k-means fit with look-alike colors merged (closest pairs first, each color in one merge a
+ * pass, at most 3 passes; a merged center is the weighted mean of the two), or null if none look alike.
+ */
+function mergeLookalikeCenters(fit, K) {
+  const centers = Float32Array.from(fit.centers);
+  const mass = Float64Array.from(fit.mass, (m) => Math.max(m, 1e-9));
+  const pal = Float32Array.from(fit.palette);
+  const alive = new Uint8Array(K).fill(1);
+  let merges = 0;
+  for (let pass = 0; pass < 3; pass++) {
+    const lab = paletteToLab(pal, K);
+    const pairs = [];
+    for (let a = 0; a < K; a++) {
+      if (!alive[a]) continue;
+      for (let b = a + 1; b < K; b++) {
+        if (!alive[b]) continue;
+        const d = Math.hypot(lab[a * 3] - lab[b * 3], lab[a * 3 + 1] - lab[b * 3 + 1], lab[a * 3 + 2] - lab[b * 3 + 2]);
+        if (d >= 4 * LOOKALIKE) continue;
+        const e = deltaE2000(lab, a * 3, lab, b * 3);
+        if (e < LOOKALIKE) pairs.push([e, a, b]);
+      }
+    }
+    if (!pairs.length) break;
+    pairs.sort((p, q) => p[0] - q[0]);
+    const used = new Uint8Array(K);
+    for (const [, a, b] of pairs) {
+      if (used[a] || used[b]) continue;
+      used[a] = used[b] = 1;
+      const total = mass[a] + mass[b];
+      for (let j = 0; j < 3; j++) {
+        centers[a * 3 + j] = (centers[a * 3 + j] * mass[a] + centers[b * 3 + j] * mass[b]) / total;
+        pal[a * 3 + j] = (pal[a * 3 + j] * mass[a] + pal[b * 3 + j] * mass[b]) / total;
+      }
+      mass[a] = total;
+      alive[b] = 0;
+      merges++;
+    }
+  }
+  if (!merges) return null;
+  const out = new Float32Array((K - merges) * 3);
+  for (let k = 0, n = 0; k < K; k++) if (alive[k]) out.set(centers.subarray(k * 3, k * 3 + 3), 3 * n++);
+  return out;
 }
 
 /* ---------- quantization ---------- */
@@ -2215,6 +2385,14 @@ const TRANSITION_REACH = 12;
 const TRANSITION_SOFT = 60; // |dR| + |dG| + |dB| between the cells of the 3 x 3 block around a cell
 /** Half-width of the mixed strip (in parts of the way from one color to the next) per setting 0..3. */
 export const TRANSITION_WIDTH = [0, 0.18, 0.28, 0.4];
+/**
+ * ...for a step of this size between the two colors (CIEDE2000). A step that shows more gets a wider strip, one
+ * that hardly shows a narrower one (between TRANSITION_LESS and TRANSITION_MORE times): the blending goes where
+ * bands would be seen, and spares texture where they would not (merged look-alikes leave bigger steps).
+ */
+const TRANSITION_STEP = 3;
+const TRANSITION_LESS = 0.6;
+const TRANSITION_MORE = 1.6;
 const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
 
 /** See above. strength: 0..3; lines: thin-line and marked cells (left alone), or null. */
@@ -2225,6 +2403,17 @@ export function ditherTransitions(idx, rgba, W, H, pal, K, strength, lines = nul
   const lab = new Float32Array(3);
   const before = new Uint16Array(idx);
   const reach2 = TRANSITION_REACH * TRANSITION_REACH;
+  const stepWidth = new Map(); // lo * K + hi -> the strip's half-width for that pair
+  const widthFor = (lo, hi) => {
+    const key = lo * K + hi;
+    let w = stepWidth.get(key);
+    if (w === undefined) {
+      const f = deltaE2000(palLab, lo * 3, palLab, hi * 3) / TRANSITION_STEP;
+      w = Math.min(0.5, width * Math.max(TRANSITION_LESS, Math.min(TRANSITION_MORE, f)));
+      stepWidth.set(key, w);
+    }
+    return w;
+  };
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
@@ -2274,24 +2463,30 @@ export function ditherTransitions(idx, rgba, W, H, pal, K, strength, lines = nul
       let t = 0;
       for (let j = 0; j < 3; j++) t += (lab[j] - palLab[lo * 3 + j]) * (palLab[hi * 3 + j] - palLab[lo * 3 + j]);
       t /= gap2;
-      const threshold = 0.5 + ((BAYER4[(y & 3) * 4 + (x & 3)] + 0.5) / 16 - 0.5) * 2 * width;
+      const threshold = 0.5 + ((BAYER4[(y & 3) * 4 + (x & 3)] + 0.5) / 16 - 0.5) * 2 * widthFor(lo, hi);
       idx[i] = t > threshold ? hi : lo;
     }
 }
 
 /** Two palette colors closer than this (Lab distance; ~2.3 is the smallest difference people notice) become one. */
 export const SAME_COLOR = 0.8;
+/**
+ * "Merge look-alike colors" (on by default): colors closer than this (CIEDE2000) become one. Below 2 a
+ * difference shows only side by side and on a close look: on a phone two such swatches look the same.
+ */
+export const LOOKALIKE = 2;
 /** A color used by only a few cells joins its nearest color if that one is within this distance. */
 const TINY_COLOR_REACH = 10;
 
 /**
  * Palette clean-up for playing: nobody wants two numbers that look the same, or a number with 2 cells.
- *   1. colors closer than SAME_COLOR are merged (closest pairs first; the merged color is their weighted mean);
+ *   1. colors closer than SAME_COLOR (with lookalikes: LOOKALIKE in CIEDE2000) are merged (closest pairs first;
+ *      the merged color is their weighted mean);
  *   2. colors used by at most tinyCells cells join the nearest other color, unless they really stand out
  *      or are used in a marked ("important") cell (focus, see FOCUS_KEEP).
  * Rewrites idx and pal in place; colors that end up unused are dropped later by finalizePalette.
  */
-export function cleanPalette(idx, pal, K, tinyCells = 0, focus = null) {
+export function cleanPalette(idx, pal, K, tinyCells = 0, focus = null, lookalikes = false) {
   const counts = new Float64Array(K);
   for (let i = 0; i < idx.length; i++) counts[idx[i]]++;
   // colors in marked cells are never "tiny": a highlight of two cells in a marked eye stays
@@ -2309,7 +2504,13 @@ export function cleanPalette(idx, pal, K, tinyCells = 0, focus = null) {
       for (let b = a + 1; b < K; b++) {
         if (!counts[b]) continue;
         const d = labDist(a, b);
-        if (d < SAME_COLOR) pairs.push([d, a, b]);
+        if (lookalikes) {
+          // (CIEDE2000 is never far above the plain distance: only near pairs need it)
+          if (d < 4 * LOOKALIKE) {
+            const e = deltaE2000(lab, a * 3, lab, b * 3);
+            if (e < LOOKALIKE) pairs.push([e, a, b]);
+          }
+        } else if (d < SAME_COLOR) pairs.push([d, a, b]);
       }
     }
     if (!pairs.length) break;
@@ -2396,7 +2597,7 @@ export function prepareImage(source, params, userAdjust) {
   const focus = focusCells(source.mask, W, H);
   const ink = rgba.lines || null;
   const lines = keptCells(ink, focus, W * H);
-  if (style === "art") rgba = smoothGradients(rgba, W, H, clean > 0 ? 24 + 4 * clean : 0, lines);
+  if (style === "art") rgba = smoothGradients(rgba, W, H, clean > 0 ? 24 + 4 * clean : 0, lines, 14 + 2 * clean);
   const smooth = rgba.smooth || null;
   const out = smoothFlat(rgba, W, H, clean, lines);
   out.lines = lines; // thin-line cells (art mode) and marked ones: the clean-up steps leave them alone
@@ -2433,9 +2634,9 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   const rgba = preparedImage(source, p, userAdjust); // read only: kept for the next job
   const lines = rgba.lines; // art mode: thin-line cells, left alone by the clean-up
   const smooth = rgba.smooth; // art mode: cells inside soft gradients
-  const K = Math.max(1, Math.min(p.colors, W * H));
-  const pal = await kmeansPalette(rgba, W * H, K, hooks, rgba.focus);
+  const pal = await kmeansPalette(rgba, W * H, Math.max(1, Math.min(p.colors, W * H)), hooks, rgba.focus, !!p.merge);
   if (!pal) return null;
+  const K = pal.length / 3; // (fewer than asked when look-alikes were merged)
   const gray = isGrayPicture(rgba, W * H);
   if (gray) grayPalette(pal, K);
   const idx = await quantize(rgba, W, H, pal, K, dither, hooks);
@@ -2454,7 +2655,8 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
   // there the "transition dithering" setting decides, see ditherTransitions)
   if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
   if (p.style === "art") ditherTransitions(idx, rgba, W, H, pal, K, p.blend, lines);
-  cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0, rgba.focus);
+  const tiny = clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0;
+  cleanPalette(idx, pal, K, tiny, rgba.focus, !!p.merge);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }
 
@@ -2784,6 +2986,12 @@ const AUTO_REF_FITS = 5;
 const AUTO_EXACTNESS = 0.02;
 /** Share of the colors the average-error rule asks for, per transition dithering setting 0..3 (art mode). */
 const AUTO_BLEND = [1, 0.85, 0.75, 0.66];
+/**
+ * With "merge look-alike colors" the count is this many times higher: the palette is fitted with more colors
+ * (small areas and fine steps of shading get colors of their own), and those that come out looking alike are
+ * merged afterwards, so the number to paint grows much less than the count asked for.
+ */
+const AUTO_MERGE_MORE = 1.4;
 
 /**
  * How much each sampled cell's color error shows. seen: 1 in a smooth area, towards 0 in texture and on edges;
@@ -2935,6 +3143,7 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     prevK = K;
     prevError = error;
   }
+  if (p.merge) found = Math.min(maxK, Math.round(found * AUTO_MERGE_MORE));
   return prepared.focus ? focusColorCount(prepared, W, H, count, found, maxK, hooks) : found;
 }
 

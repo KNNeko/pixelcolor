@@ -22,6 +22,7 @@ import {
   MODES,
   DEFAULT_CLEAN,
   DEFAULT_BLEND,
+  DEFAULT_MERGE,
   NO_ADJUST,
   normalizeParams,
   kmeansPalette,
@@ -130,7 +131,8 @@ $("#panel-pixel").innerHTML =
   `<div class="chips"><label class="field grow"><span data-i="cn"></span><input id="colors-exact" type="number" min="2" max="1000" value="32"></label></div>` +
   `<button class="chip" id="btn-auto-colors" data-i="autoc"></button>` +
   sliderHtml("clean", "clean", 0, 10, DEFAULT_CLEAN) +
-  `<div id="blend-field">${sliderHtml("blend", "blend", 0, 3, DEFAULT_BLEND)}</div>`;
+  `<div id="blend-field">${sliderHtml("blend", "blend", 0, 3, DEFAULT_BLEND)}</div>` +
+  `<div class="inline-row"><span data-i="merge"></span><label class="toggle"><input id="px-merge" type="checkbox" checked><i></i></label></div>`;
 
 $$("#panel-crop .range,#panel-adjust .range,#panel-pixel .range").forEach(initRangeSlider);
 
@@ -218,6 +220,7 @@ export async function startWizard(file, restore = null) {
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
   setBlend(settings.pbl ?? DEFAULT_BLEND);
+  $("#px-merge").checked = !!(settings.pmg ?? DEFAULT_MERGE);
   setSlider("colors", DEFAULT_COLORS);
   $("#colors-exact").value = DEFAULT_COLORS;
   $("#keep-ratio").checked = true; // (a canvas made again sets its own, see applyState)
@@ -281,6 +284,7 @@ function applyState(st) {
   wiz.autoColors = false;
   setSlider("clean", p.clean);
   setBlend(p.blend);
+  $("#px-merge").checked = !!p.merge;
   wiz.style = p.style;
   wiz.sized = true;
   wiz.sizedRatio = cropRatio();
@@ -2798,6 +2802,7 @@ function pixelParams() {
     style: wiz.style,
     clean: +$("#clean").value,
     blend: wiz.style === "art" ? +$("#blend").value : 0,
+    merge: $("#px-merge").checked ? 1 : 0,
   };
 }
 
@@ -2862,7 +2867,7 @@ let draftTimer = 0;
 let draftAt = 0;
 let previewSeq = 0; // counts schedulePreview calls: a draft started before the last one leaves the rest to it
 let shownParams = null; // params of the last full preview
-const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend]);
+const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend, p.merge]);
 
 function schedulePreview() {
   previewSeq++;
@@ -3111,6 +3116,7 @@ async function createCanvasFromResult() {
     settings.pm = p.style;
     settings.pcl = p.clean;
     if (p.style === "art") settings.pbl = p.blend;
+    settings.pmg = p.merge;
     saveSettings();
     const { blob, scale } = await encodeSourcePhoto();
     const state = sourceState(p, scale);

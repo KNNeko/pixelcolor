@@ -228,6 +228,7 @@ export const STRINGS = {
   sets: "Settings|Настройки",
   pxc: "Pixel count|Количество пикселей",
   autoc: "Auto colors|Авто-подбор цветов",
+  merge: "Merge look-alike colors|Склеивать неразличимые цвета",
   png: "Export PNG|Экспорт PNG",
   png_full: "Finished picture|Готовая картинка",
   png_prog: "Current progress|Текущий прогресс",

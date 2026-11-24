@@ -23,6 +23,8 @@ import {
   srgbToLab,
   unifyLines,
   ditherTransitions,
+  deltaE2000,
+  LOOKALIKE,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -692,4 +694,59 @@ test("normalizeParams: transition dithering is off for canvases made before it e
   assert.equal(normalizeParams({ style: "art", clean: 3 }).blend, 0);
   assert.equal(normalizeParams({ style: "art", clean: 3, blend: 2 }).blend, 2);
   assert.equal(normalizeParams({ style: "art", blend: 9 }).blend, 3);
+});
+
+test("deltaE2000 gives the published CIEDE2000 values", () => {
+  // pairs from Sharma, Wu and Dalal's test data
+  const pairs = [
+    [[50, 2.6772, -79.7751], [50, 0, -82.7485], 2.0425],
+    [[50, 0, 0], [50, -1, 2], 2.3669],
+    [[50, 2.49, -0.001], [50, -2.49, 0.0009], 7.1792],
+    [[60.2574, -34.0099, 36.2677], [60.4626, -34.1751, 39.4387], 1.2644],
+    [[90.8027, -2.0831, 1.441], [91.1528, -1.6435, 0.0447], 1.4441],
+  ];
+  for (const [a, b, want] of pairs) assert.ok(Math.abs(deltaE2000(a, 0, b, 0) - want) < 1e-4, `${a} ${b}`);
+});
+
+test("merge look-alike colors: no two palette colors look alike, the picture stays close", async () => {
+  // a soft two-way gradient: plenty of shades a step apart
+  const src = image(120, 90, (x, y) => [150 + x * 0.6, 120 + y * 0.5, 160 - x * 0.3]);
+  const params = { width: 60, height: 45, colors: 120, style: "art", clean: 3 };
+  const plain = await generate(src, params, NO_ADJUST);
+  const merged = await generate(src, { ...params, merge: 1 }, NO_ADJUST);
+  const K = merged.pal.length / 3;
+  assert.ok(K < plain.pal.length / 3, `${K} colors after merging, ${plain.pal.length / 3} before`);
+  const lab = new Float32Array(K * 3);
+  for (let k = 0; k < K; k++) srgbToLab(merged.pal[k * 3], merged.pal[k * 3 + 1], merged.pal[k * 3 + 2], lab, k * 3);
+  for (let a = 0; a < K; a++)
+    for (let b = a + 1; b < K; b++) assert.ok(deltaE2000(lab, a * 3, lab, b * 3) >= LOOKALIKE * 0.999, `${a} ${b}`);
+  // each cell within a small step of where it was
+  let worst = 0;
+  const p = new Float32Array(3);
+  const q = new Float32Array(3);
+  for (let i = 0; i < merged.idx.length; i++) {
+    srgbToLab(...merged.pal.subarray(merged.idx[i] * 3, merged.idx[i] * 3 + 3), p, 0);
+    srgbToLab(...plain.pal.subarray(plain.idx[i] * 3, plain.idx[i] * 3 + 3), q, 0);
+    worst = Math.max(worst, Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]));
+  }
+  assert.ok(worst < 6, `a cell moved by ${worst}`);
+  assert.equal(normalizeParams({ width: 1, height: 1 }).merge, 0); // canvases made before: off
+});
+
+test("the clean-up smoothing keeps a small highlight on a plain area", () => {
+  // a 1-cell and a 2 x 2 highlight on skin, a little brighter than noise
+  const src = image(12, 12, (x, y) =>
+    (x === 3 && y === 3) || (x >= 7 && x <= 8 && y >= 7 && y <= 8) ? [250, 214, 196] : [232, 196, 178],
+  );
+  for (const clean of [3, 6, 9]) {
+    const flat = smoothFlat(src.data, 12, 12, clean);
+    const grad = smoothGradients(src.data, 12, 12, 24 + 4 * clean, null, 14 + 2 * clean);
+    for (const out of [flat, grad])
+      for (const [x, y] of [
+        [3, 3],
+        [7, 7],
+        [8, 8],
+      ])
+        assert.ok(out[(y * 12 + x) * 4] > 245, `clean ${clean}, cell ${x},${y}: ${out[(y * 12 + x) * 4]}`);
+  }
 });

@@ -34,6 +34,7 @@ export const DEFAULTS = {
   pm: "art", // pixelization mode used last (art | photo | dither)
   pcl: 3, // pixelization "cleanliness" used last, 0..10
   pbl: 1, // transition dithering of the art mode used last, 0..3
+  pmg: 1, // "merge look-alike colors" used last
   tot: null, // lifetime painting statistics (stats.js); null until first counted
 };
 
