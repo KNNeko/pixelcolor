@@ -14,7 +14,7 @@ import {
   createCanvas,
 } from "./ui.js";
 import { t } from "./i18n.js";
-import { settings, saveSettings, canvasTheme, hexToPixel } from "./settings.js";
+import { settings, saveSettings, canvasTheme, hexToPixel, CANVAS_THEMES } from "./settings.js";
 import { saveCanvas } from "./storage.js";
 import { paletteOrder, colorFamilies } from "./colorsort.js";
 import { renderThumbnails } from "./render.js";
@@ -123,6 +123,9 @@ export const game = {
   highlightPixel: [], // unpainted cell of the selected number
   backgroundPixel: 0,
   partTint: [],
+  // dark canvas with the silhouette: cells of the picture's white background (see findBackdrop), left out
+  backdrop: null, // Uint8Array per cell, 1 = background; null until needed
+  backdropOn: false,
 
   // cells grouped by target color: cells of color k are cellsByColor[colorStart[k] .. colorStart[k+1]-1]
   cellsByColor: null,
@@ -147,6 +150,7 @@ export const game = {
 
   // tools
   selected: 0, // 1-based color number, 0 = none
+  brushColor: 0, // "color with the brush only" (settings.bonly): the brush's color while another tool is out
   tool: "brush",
   brushSize: 1,
   eraserSize: 1,
@@ -186,6 +190,13 @@ const mixPixel = (c, d, a) => {
   return 0xff000000 | ((b | 0) << 16) | ((g | 0) << 8) | (r | 0);
 };
 
+/**
+ * Silhouette on a dark canvas: a color of luma L gets the background's brightness (base) plus a share of the
+ * way to white (DARK_SILHOUETTE at white), so dark parts sink into the background and light ones stand out.
+ * Its highlight is lighter by DARK_HIGHLIGHT. On a light canvas it is the other way round (white sinks).
+ */
+const DARK_SILHOUETTE = 0.62;
+const DARK_HIGHLIGHT = 60;
 /** Silhouette shade of a color with luma L, tinted with the chosen silhouette color (0 = no tint). */
 function tintedShade(L, highlighted) {
   const hex = settings.sit === "cus" ? settings.sic : SILHOUETTE_TINTS[settings.sit];
@@ -194,8 +205,9 @@ function tintedShade(L, highlighted) {
   const tint = [n >> 16, (n >> 8) & 255, n & 255];
   let rgb;
   if (game.theme.dark) {
-    const b = Math.min(1, (L / 255) * 0.395 + (highlighted ? 0.3 : 0));
-    rgb = tint.map((v) => 28 + (v * 0.4 + 125) * b);
+    const base = game.theme.base;
+    const b = Math.min(1, (L / 255) * DARK_SILHOUETTE + (highlighted ? DARK_HIGHLIGHT / 255 : 0));
+    rgb = tint.map((v) => Math.min(255, base + (153 + v * 0.4 - base) * b));
   } else {
     const a = (255 - L) / 510;
     const e = highlighted ? 1 - 0.6 * (1 - a) : a;
@@ -223,16 +235,61 @@ export function updateColors() {
     const L = 0.3 * r + 0.59 * g + 0.11 * b;
     game.colorPixel.push(0xff000000 | (b << 16) | (g << 8) | r);
     if (settings.sil) {
-      const shade = theme.dark ? 28 + L * 0.35 : 255 - (255 - L) * 0.5;
+      const shade = theme.dark ? theme.base + (L / 255) * DARK_SILHOUETTE * (255 - theme.base) : 255 - (255 - L) * 0.5;
       game.emptyPixel.push(tintedShade(L, false) || gray(shade));
-      game.highlightPixel.push(tintedShade(L, true) || gray(theme.dark ? shade + 60 : shade * 0.6));
+      game.highlightPixel.push(
+        tintedShade(L, true) || gray(theme.dark ? Math.min(255, shade + DARK_HIGHLIGHT) : shade * 0.6),
+      );
     } else {
       game.emptyPixel.push(hexToPixel(theme.cell));
       game.highlightPixel.push(hexToPixel(theme.highlight));
     }
   }
   game.partTint = PART_TINTS.map(hexToPixel);
+  game.backdropOn = !!(theme.dark && settings.sil);
+  if (game.backdropOn && !game.backdrop) game.backdrop = findBackdrop();
   if (game.useGl) glView.setHighlightColors(game.highlightPixel);
+}
+
+/** Near-white colors (luma) a picture's background may be made of (see findBackdrop). */
+const BACKDROP_LUMA = 228;
+/**
+ * The picture's white background: near-white cells joined to the picture's edge through near-white cells.
+ * On a dark canvas the silhouette leaves them out (they show the canvas), the way white simply disappears
+ * into a light canvas; white inside the figure keeps its light shade. Returns a Uint8Array, 1 = background.
+ */
+function findBackdrop() {
+  const { width: W, height: H, target, palette: pal } = game.canvas;
+  const K = pal.length / 3;
+  const light = new Uint8Array(K);
+  for (let k = 0; k < K; k++)
+    light[k] = 0.3 * pal[k * 3] + 0.59 * pal[k * 3 + 1] + 0.11 * pal[k * 3 + 2] >= BACKDROP_LUMA ? 1 : 0;
+  const out = new Uint8Array(W * H);
+  const queue = new Int32Array(W * H);
+  let tail = 0;
+  const visit = (i) => {
+    if (!out[i] && light[target[i]]) {
+      out[i] = 1;
+      queue[tail++] = i;
+    }
+  };
+  for (let x = 0; x < W; x++) {
+    visit(x);
+    visit((H - 1) * W + x);
+  }
+  for (let y = 0; y < H; y++) {
+    visit(y * W);
+    visit(y * W + W - 1);
+  }
+  for (let head = 0; head < tail; head++) {
+    const c = queue[head];
+    const x = c % W;
+    if (x > 0) visit(c - 1);
+    if (x < W - 1) visit(c + 1);
+    if (c >= W) visit(c - W);
+    if (c < W * (H - 1)) visit(c + W);
+  }
+  return out;
 }
 
 /** What a cell looks like on screen right now. */
@@ -248,10 +305,12 @@ export function cellPixel(i) {
     ? game.colorPixel[painted - 1]
     : settings.hl && !game.useGl && target + 1 === game.selected
       ? game.highlightPixel[target]
-      : game.emptyPixel[target];
+      : game.backdropOn && game.backdrop[i]
+        ? 0 // transparent: the canvas shows through
+        : game.emptyPixel[target];
   const part = game.canvas.partOf[i];
-  if (game.splitting && part) c = mixPixel(c, game.partTint[part % game.partTint.length], 0.4);
-  else if (game.part >= 0 && part !== game.part) c = settings.oth ? mixPixel(c, game.backgroundPixel, 0.62) : 0;
+  if (game.splitting && part) c = mixPixel(c || game.backgroundPixel, game.partTint[part % game.partTint.length], 0.4);
+  else if (game.part >= 0 && part !== game.part) c = settings.oth && c ? mixPixel(c, game.backgroundPixel, 0.62) : 0;
   return c;
 }
 
@@ -314,7 +373,10 @@ export async function openGame(canvas, events, isNew = false) {
   game.paint = new Uint16Array(N);
   for (const e of events) for (let k = 0; k < e.cells.length; k++) game.paint[e.cells[k]] = e.values[k];
   game.hintCell = null;
-  game.selected = 0;
+  game.selected = game.brushColor = 0;
+  game.backdrop = null;
+  dropHeldTap();
+  sortVersion++;
   game.touchedColors.clear();
   game.part = -1;
   game.splitting = false;
@@ -355,6 +417,10 @@ export async function closeGame() {
   if (!game.canvas) return;
   if (game.splitting) return stopSplitMode();
   commitStroke();
+  flushHeldTap(); // (may finish the picture: the show below is stopped before it starts)
+  stopFinish(false);
+  if (finish.stopConfetti) finish.stopConfetti(); // not over the library
+  finish.stopConfetti = null;
   await saveGame(true);
   game.canvas = game.buffer = game.paint = game.flags = null;
   floodQueue = floodSeen = null;
@@ -368,7 +434,16 @@ export async function closeGame() {
 let autosaveTimer = 0;
 export function restartAutosave() {
   clearInterval(autosaveTimer);
-  autosaveTimer = setInterval(() => saveGame(false), settings.asv * 60000);
+  autosaveTimer = setInterval(autosave, settings.asv * 60000);
+}
+/**
+ * Saving costs a weak phone a few frames: not while a finger paints or moves the picture. Then it waits
+ * for the finger to lift (see pointerUp).
+ */
+let autosaveDue = false;
+function autosave() {
+  if (pointers.size || game.stroke) autosaveDue = true;
+  else saveGame(false);
 }
 
 /** Writes new paint events + library entry; with withThumbs also re-renders the library thumbnails. */
@@ -422,13 +497,58 @@ export function markCanvasChanged() {
 /* ---------- palette ---------- */
 
 let orderCache = { key: "", order: [] };
-/** Palette indices in the chosen display order (cached per canvas / sort mode / part). */
+/**
+ * Sorted by count, the strip follows the cells LEFT of each color. It is sorted again only when a finger
+ * lifts (see resortPalette), not while painting: swatches moving under the finger would be hard to hit.
+ */
+let sortVersion = 0;
+/** Palette indices in the chosen display order (cached per canvas / sort mode / part / re-sort). */
 export function paletteDisplayOrder() {
-  const key = `${game.canvas.id}|${settings.ps}|${colorCount()}|${game.part}`;
+  const key = `${game.canvas.id}|${settings.ps}|${colorCount()}|${game.part}|${settings.ps === "cnt" ? sortVersion : 0}`;
   if (orderCache.key === key) return orderCache.order;
-  const counts = game.part < 0 ? game.totalOfColor : game.partColorCount;
+  const counts = game.part < 0 ? game.remaining : game.partRemaining;
   orderCache = { key, order: paletteOrder(game.canvas.palette, settings.ps, counts) };
   return orderCache.order;
+}
+
+/**
+ * Sorted by count: puts the swatches in the order of the cells left now. Those in view slide to their new
+ * places (the rest just move); the selected color is brought back to the middle.
+ */
+function resortPalette() {
+  if (settings.ps !== "cnt" || !game.canvas) return;
+  const old = orderCache.order;
+  sortVersion++;
+  const order = paletteDisplayOrder();
+  if (old.length === order.length && old.every((k, n) => k === order[n])) return;
+  const strip = $("#palette");
+  const from = strip.scrollLeft - strip.clientWidth;
+  const to = strip.scrollLeft + 2 * strip.clientWidth;
+  const before = new Map();
+  for (const k of order) {
+    const b = swatches[k];
+    if (b && b.offsetLeft > from && b.offsetLeft < to) before.set(b, b.offsetLeft);
+  }
+  const moved = document.createDocumentFragment();
+  for (const k of order) if (swatches[k]) moved.append(swatches[k]);
+  strip.append(moved);
+  const sliding = [];
+  for (const [b, left] of before) {
+    const dx = left - b.offsetLeft;
+    if (!dx) continue;
+    b.style.transition = "none";
+    b.style.transform = `translateX(${dx}px)`;
+    sliding.push(b);
+  }
+  if (sliding.length) {
+    strip.offsetWidth; // the start position is laid out before the transition begins
+    for (const b of sliding) {
+      b.style.transition = "transform .3s ease";
+      b.style.transform = "";
+    }
+    setTimeout(() => sliding.forEach((b) => (b.style.transition = "")), 350);
+  }
+  if (game.selected) scrollPaletteTo(swatches[game.selected - 1]);
 }
 
 const SWATCH_PATH = "M26 2H37A13 13 0 0 1 50 15V37A13 13 0 0 1 37 50H15A13 13 0 0 1 2 37V15A13 13 0 0 1 15 2Z";
@@ -470,10 +590,19 @@ export function renderPalette() {
 $("#palette").onclick = (e) => {
   const btn = e.target.closest(".swatch");
   if (!btn) return;
-  if (btn.dataset.k) selectColor(+btn.dataset.k + 1);
+  if (btn.dataset.k) pickColor(+btn.dataset.k + 1);
   else if (btn.dataset.act === "grid") openAllColors();
   else if (btn.dataset.act === "sort") cyclePaletteSort();
 };
+// a finger on the strip stops its scrolling animation (see scrollPaletteTo)
+for (const type of ["pointerdown", "wheel"])
+  $("#palette").addEventListener(type, () => cancelAnimationFrame(stripAnimation), { passive: true });
+
+/** A color chosen in the strip or the list of all colors: with "color with the brush only", takes the brush. */
+function pickColor(n) {
+  if (settings.bonly && game.tool !== "brush") setTool("brush", n);
+  else selectColor(n);
+}
 
 /**
  * The parts of a swatch that change while painting: cells left, and the progress ring if it is the
@@ -521,17 +650,37 @@ function cyclePaletteSort() {
 
 /**
  * Scrolls the palette strip so the swatch is centered. Done by hand: scrollIntoView would also scroll
- * the screen itself when the panel is hidden, pushing the top buttons out of reach.
+ * the screen itself when the panel is hidden, pushing the top buttons out of reach. "smooth" is a short
+ * animation of its own (the browser's smooth scrolling takes its time over long distances); anything else
+ * jumps.
  */
+const STRIP_SCROLL_MS = 250;
+let stripAnimation = 0;
 function scrollPaletteTo(btn, behavior = "smooth") {
   if (!btn || game.dockHidden) return;
   const strip = $("#palette");
-  strip.scrollTo({ left: btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2, behavior });
+  const left = Math.max(
+    0,
+    Math.min(strip.scrollWidth - strip.clientWidth, btn.offsetLeft - strip.clientWidth / 2 + btn.offsetWidth / 2),
+  );
+  cancelAnimationFrame(stripAnimation);
+  const from = strip.scrollLeft;
+  if (behavior !== "smooth" || Math.abs(left - from) < 1) {
+    strip.scrollLeft = left;
+    return;
+  }
+  const start = performance.now();
+  const step = (now) => {
+    const t = Math.min(1, (now - start) / STRIP_SCROLL_MS);
+    strip.scrollLeft = from + (left - from) * (1 - (1 - t) ** 3); // ease-out
+    if (t < 1) stripAnimation = requestAnimationFrame(step);
+  };
+  stripAnimation = requestAnimationFrame(step);
 }
 
 /**
  * Selects color number n (1-based, 0 = none). With highlighting on, only the two affected colors are redrawn.
- * scroll: how the palette strip moves to it ("instant" for a color picked on the picture: no lag to watch).
+ * scroll: how the palette strip moves to it (see scrollPaletteTo).
  */
 export function selectColor(n, scroll = "smooth") {
   const previous = game.selected;
@@ -586,23 +735,26 @@ function openAllColors() {
     const colorBtn = e.target.closest("[data-color]");
     if (colorBtn) {
       closeSheet();
-      selectColor(+colorBtn.dataset.color);
+      pickColor(+colorBtn.dataset.color);
     }
   };
 }
 
 /**
- * Selects the next unfinished color by number (after the finished one, then from 1 again), in the part being
- * colored if any. By number whatever the strip's sorting: by color or by count it looked random.
+ * Selects the next unfinished color after number n in the strip's order (then from its start again), in the
+ * part being colored if any: by number, the next number; by color, the next shade; by count (where a
+ * finished color has moved to the end), the color with the most cells left. 0 if there is none.
  */
-function selectNextColor() {
-  const K = colorCount();
-  const from = Math.max(0, game.selected - 1);
-  for (let step = 1; step <= K; step++) {
-    const k = (from + step) % K;
-    if (remainingOf(k) > 0 && (game.part < 0 || game.partColorCount[k])) return selectColor(k + 1);
+function nextColorAfter(n) {
+  const order = paletteDisplayOrder();
+  const at = order.indexOf(n - 1);
+  for (let step = 1; step <= order.length; step++) {
+    const k = order[(at + step) % order.length];
+    if (remainingOf(k) > 0 && (game.part < 0 || game.partColorCount[k])) return k + 1;
   }
+  return 0;
 }
+const selectNextColor = () => selectColor(nextColorAfter(game.selected));
 
 /* ---------- painting ---------- */
 
@@ -646,15 +798,14 @@ function putCell(i, v) {
   game.buffer.set(i, cellPixel(i));
 }
 
-/** A new paint action: the cells, their new values, and what they had before (to take a tap back). */
-const newStroke = () => ({ cells: [], values: [], old: [] });
+/** A new paint action: the cells and their new values. */
+const newStroke = () => ({ cells: [], values: [] });
 
 /** Paints a cell as part of the current action (recorded for saving and the time-lapse). */
 function paintCell(i, v) {
   if (!inCurrentPart(i) || game.paint[i] === v) return;
   game.stroke.cells.push(i);
   game.stroke.values.push(v);
-  game.stroke.old.push(game.paint[i]);
   putCell(i, v);
 }
 
@@ -664,7 +815,6 @@ export function commitStroke() {
   if (s && s.cells.length) {
     const event = { cells: Int32Array.from(s.cells), values: Uint16Array.from(s.values) };
     game.events.push(event);
-    game.lastStroke = { event, old: Uint16Array.from(s.old) };
     game.unsaved = game.thumbsStale = true;
     countPaintingDay();
   }
@@ -701,6 +851,7 @@ function countPaintingDay() {
 /** Progress pill, swatches, auto-advance to the next color, "finished" sheet. */
 export function updateStatus() {
   updateProgressPill();
+  if (game.touchedColors.size) resortPalette();
   if (game.selected && game.touchedColors.has(game.selected - 1) && remainingOf(game.selected - 1) === 0)
     selectNextColor();
   game.touchedColors.forEach(updateSwatch);
@@ -718,23 +869,94 @@ export function updateStatus() {
     }
     game.statsChanged = true;
     markCanvasChanged();
-    vibrate([80, 40, 80, 40, 300]);
-    launchConfetti();
-    const sheet = openSheet(
-      `<div class="finished">🎉 ${t("fin")}</div>${canvasStatsHtml(game.canvas.stats, game.canvas)}<div class="actions">${actionButton("film", "tlapse", "fin-timelapse")}${actionButton("image", "png", "fin-png")}${actionButton("check", "done", "fin-close")}</div>`,
-    );
-    sheet.querySelector("#fin-timelapse").onclick = () => {
-      closeSheet();
-      openTimelapse();
-    };
-    sheet.querySelector("#fin-png").onclick = () => openPngExport(game.canvas, game.paint);
-    sheet.querySelector("#fin-close").onclick = closeSheet;
+    playFinish();
   }
 }
 
+/* ---------- the end of a picture ---------- */
+
+const FINISH_ZOOM_MS = 1000;
+const FINISH_HOLD_MS = 2000; // confetti and the finished picture, before the sheet
+const finish = { active: false, celebrated: false, raf: 0, timer: 0, to: null, stopConfetti: null };
+const playScreen = $("#screen-play");
+
+/**
+ * The picture is finished: the buttons and the panel step aside and the picture zooms out to fill the
+ * screen; then confetti, a couple of seconds to look at it, and only then the "finished" sheet. A tap on
+ * the picture skips to the sheet.
+ */
+function playFinish() {
+  finish.active = true;
+  finish.celebrated = false;
+  game.hintCell = null;
+  closePartMenu();
+  playScreen.classList.add("finishing");
+  const { width: W, height: H } = game.canvas;
+  const scale = Math.min(screen.width / W, screen.height / H) * 0.94;
+  const to = (finish.to = { x: (screen.width - W * scale) / 2, y: (screen.height - H * scale) / 2, scale });
+  const from = { x: view.x, y: view.y, scale: view.scale };
+  // the cell at the screen's center travels in a straight line to the new center, while the scale changes
+  // by the same ratio every moment (a big zoom does not rush through its first half)
+  const mid = [screen.width / 2, screen.height / 2];
+  const c0 = [(mid[0] - from.x) / from.scale, (mid[1] - from.y) / from.scale];
+  const c1 = [(mid[0] - to.x) / to.scale, (mid[1] - to.y) / to.scale];
+  const start = performance.now();
+  const step = (now) => {
+    if (!finish.active || !game.canvas) return;
+    const t = Math.min(1, (now - start) / FINISH_ZOOM_MS);
+    const e = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; // ease in and out
+    view.scale = from.scale * (to.scale / from.scale) ** e;
+    view.x = mid[0] - (c0[0] + (c1[0] - c0[0]) * e) * view.scale;
+    view.y = mid[1] - (c0[1] + (c1[1] - c0[1]) * e) * view.scale;
+    draw();
+    if (t < 1) finish.raf = requestAnimationFrame(step);
+    else {
+      celebrate();
+      finish.timer = setTimeout(showFinishSheet, FINISH_HOLD_MS);
+    }
+  };
+  finish.raf = requestAnimationFrame(step);
+}
+
+function celebrate() {
+  if (finish.celebrated) return;
+  finish.celebrated = true;
+  vibrate([80, 40, 80, 40, 300]);
+  finish.stopConfetti = launchConfetti();
+}
+
+/** The "finished" sheet (right away when a tap skips the show); the interface comes back when it goes. */
+function showFinishSheet() {
+  if (!finish.active || !game.canvas) return;
+  cancelAnimationFrame(finish.raf);
+  clearTimeout(finish.timer);
+  Object.assign(view, finish.to);
+  requestDraw();
+  celebrate();
+  const sheet = openSheet(
+    `<div class="finished">🎉 ${t("fin")}</div>${canvasStatsHtml(game.canvas.stats, game.canvas)}<div class="actions">${actionButton("film", "tlapse", "fin-timelapse")}${actionButton("image", "png", "fin-png")}${actionButton("check", "done", "fin-close")}</div>`,
+    () => stopFinish(true),
+  );
+  sheet.querySelector("#fin-timelapse").onclick = () => {
+    closeSheet();
+    openTimelapse();
+  };
+  sheet.querySelector("#fin-png").onclick = () => openPngExport(game.canvas, game.paint);
+  sheet.querySelector("#fin-close").onclick = closeSheet;
+}
+
+/** Ends the show and brings the interface back (refit: the picture fits again between the bars). */
+function stopFinish(refit) {
+  if (!finish.active) return;
+  finish.active = false;
+  cancelAnimationFrame(finish.raf);
+  clearTimeout(finish.timer);
+  playScreen.classList.remove("finishing");
+  if (refit && game.canvas) fitView();
+}
+
 /** Paints with the brush, or clears with the eraser, the square of cells around cell [x, y]. */
-function stampBrush([cx, cy]) {
-  const erase = game.tool === "eraser";
+function stampBrush([cx, cy], color = game.selected, erase = game.tool === "eraser") {
   const r = (erase ? game.eraserSize : game.brushSize) >> 1;
   const W = game.canvas.width;
   for (let dy = -r; dy <= r; dy++)
@@ -749,8 +971,8 @@ function stampBrush([cx, cy]) {
       }
       const right = game.canvas.target[i] + 1;
       if (game.paint[i] === right || !inCurrentPart(i)) continue;
-      if (right !== game.selected && !settings.wrong) continue;
-      paintCell(i, game.selected);
+      if (right !== color && !settings.wrong) continue;
+      paintCell(i, color);
     }
   requestDraw();
 }
@@ -849,16 +1071,13 @@ function tapCell([x, y]) {
     keys.sort();
     const cells = new Array(count);
     const values = new Array(count);
-    const old = new Array(count);
     for (let m = 0; m < count; m++) {
       const k = keys[m] % 16777216;
       cells[m] = s.cells[k];
       values[m] = s.values[k];
-      old[m] = s.old[k];
     }
     s.cells = cells;
     s.values = values;
-    s.old = old;
   }
   commitStroke();
 }
@@ -883,7 +1102,7 @@ function showHint() {
   if (game.selected) forEachCellOfColor(game.selected - 1, consider);
   else for (let i = 0; i < cellCount(); i++) consider(i);
   if (best < 0) return;
-  if (!game.selected) selectColor(game.canvas.target[best] + 1);
+  if (!game.selected) pickColor(game.canvas.target[best] + 1);
   game.hintCell = best;
   view.scale = Math.max(view.scale, 24);
   view.x = screen.width / 2 - ((best % W) + 0.5) * view.scale;
@@ -905,13 +1124,35 @@ for (const [iconName, tool] of TOOLS) {
   const b = document.createElement("button");
   b.className = "tool" + (tool === "brush" ? " on" : "");
   b.innerHTML = icon(iconName);
+  b.dataset.tool = tool;
   b.onclick = () => {
     if (tool === "hint") return showHint();
     if (game.tool === tool && (tool === "brush" || tool === "eraser" || tool === "wand")) return openToolOptions();
-    game.tool = tool;
-    $$("#toolbar .tool").forEach((x) => x.classList.toggle("on", x === b));
+    setTool(tool);
   };
   $("#toolbar").append(b);
+}
+
+/**
+ * Takes a tool. With "color with the brush only" (settings.bonly) a color is chosen only while the brush is
+ * out: other tools act without one (no highlight), and the brush gets its color back when taken again (or
+ * color n, when it is taken by picking a color).
+ */
+function setTool(tool, n = 0) {
+  const wasBrush = game.tool === "brush";
+  game.tool = tool;
+  $$("#toolbar .tool").forEach((x) => x.classList.toggle("on", x.dataset.tool === tool));
+  if (!settings.bonly) return n && selectColor(n);
+  if (wasBrush && tool !== "brush") {
+    game.brushColor = game.selected;
+    selectColor(0);
+  } else if (tool === "brush") {
+    let color = n || (wasBrush ? game.selected : game.brushColor);
+    // finished meanwhile (the bucket or the wand did it): the next one, as when the brush finishes a color
+    if (color && !n && !(remainingOf(color - 1) > 0 && (game.part < 0 || game.partColorCount[color - 1])))
+      color = nextColorAfter(color);
+    selectColor(color);
+  }
 }
 
 export function openToolOptions() {
@@ -947,114 +1188,11 @@ export function requestDraw() {
   requestAnimationFrame(() => drawQueued && draw());
 }
 
-/*
- * Lighter frames while the picture moves. A weak phone's GPU may not manage the whole screen at full
- * resolution 60 times a second. While the picture is panned or zoomed, the WebGL canvas then gets fewer
- * pixels (the browser stretches it over the screen, which nobody notices in motion), and the sharp frame
- * follows as soon as it stops. How many fewer is learned on the device, from frame times measured while
- * moving: a step down when frames come too slowly, a step up after a few smooth gestures (settings.mq).
- * Painting keeps full resolution: then the picture stands still and its numbers must stay sharp.
- */
-const MOTION_SCALES = [1, 0.85, 0.7, 0.6, 0.5];
-const MOTION_END_MS = 150; // no movement for this long and for two frames (or the finger lifted): it is over
-const motion = {
-  active: false,
-  moved: false, // since the last frame
-  still: 0, // frames in a row without movement
-  lastMove: 0,
-  lastFrame: 0,
-  average: 0, // frame time while moving (moving average), ms
-  gpu: 0, // time the GPU took for a frame, from drawing to done (moving average), ms
-  gpuSamples: 0,
-  samples: 0,
-  vsync: 16.7, // shortest frame time seen: the display's refresh
-  smooth: 0, // gestures in a row that were smooth
-  wait: 5, // smooth gestures before a sharper step is tried (doubles each time that turns out too slow)
-  tried: false, // the current step is a sharper one being tried
-};
-
-/** The GL canvas size for now: full resolution, or the motion step while the picture moves. */
+/** The GL canvas matches the screen in device pixels. */
 function applyGlSize() {
-  if (!glView) return;
-  const scale = motion.active ? MOTION_SCALES[Math.min(settings.mq | 0, MOTION_SCALES.length - 1)] : 1;
-  glView.resize(Math.round(screen.width * screen.dpr * scale), Math.round(screen.height * screen.dpr * scale));
+  if (glView) glView.resize(Math.round(screen.width * screen.dpr), Math.round(screen.height * screen.dpr));
 }
 
-/** The picture moved (pan, pinch, wheel). */
-function noteMotion() {
-  motion.moved = true;
-  motion.lastMove = performance.now();
-  if (motion.active) return;
-  motion.active = true;
-  motion.still = motion.samples = motion.lastFrame = motion.gpuSamples = 0;
-  if (glView && game.useGl) glView.trackGpu(true);
-  requestAnimationFrame(measureFrame);
-  if (game.useGl && settings.mq) {
-    applyGlSize();
-    drawNow(); // right away: a resized canvas is blank until drawn
-  }
-}
-
-function endMotion() {
-  if (!motion.active) return;
-  motion.active = false;
-  if (glView) glView.trackGpu(false);
-  if (game.useGl && motion.samples >= 5) {
-    // Too slow: frames more than 1.4 refreshes apart (under ~43 fps on a 60 Hz screen) while the GPU is
-    // what holds them up (still busy with a frame well into the next ones; if it is not, fewer pixels would
-    // not help): fewer pixels next time. Smooth for `wait` gestures in a row: a sharper step is tried; if
-    // that is too slow, it goes back and the next try waits twice as long.
-    const step = settings.mq | 0;
-    let next = step;
-    const gpuBound = motion.gpuSamples < 3 || motion.gpu > motion.vsync * 2.5;
-    if (motion.average > motion.vsync * 1.4 && gpuBound) {
-      next = Math.min(MOTION_SCALES.length - 1, step + 1);
-      if (motion.tried) motion.wait = Math.min(80, motion.wait * 2);
-      motion.smooth = 0;
-      motion.tried = false;
-    } else if (motion.average < motion.vsync * 1.15) {
-      if (++motion.smooth >= motion.wait && step > 0) {
-        next = step - 1;
-        motion.smooth = 0;
-        motion.tried = true;
-      }
-    } else motion.smooth = 0;
-    if (next !== step) {
-      settings.mq = next;
-      saveSettings();
-    }
-  }
-  if (game.useGl && glView && glCanvas.width !== Math.round(screen.width * screen.dpr)) {
-    applyGlSize();
-    drawNow();
-  } else if (!game.useGl) drawNow(); // the 2D drawing leaves out the details while moving (see draw2d)
-}
-
-/**
- * Frame time while moving, from the browser's own frame callbacks: they come as fast as the phone manages
- * the frames the moving picture asks for. Also ends the motion once the picture stands still (counted in
- * frames: on a slow phone the moves themselves come one long frame apart).
- */
-function measureFrame(t) {
-  if (!motion.active) return;
-  if (motion.moved) {
-    motion.moved = false;
-    motion.still = 0;
-  } else if (++motion.still >= 2 && performance.now() - motion.lastMove > MOTION_END_MS) return endMotion();
-  const dt = t - motion.lastFrame;
-  if (motion.lastFrame && dt < 1000) {
-    if (dt > 5) motion.vsync = Math.min(motion.vsync, Math.max(6, dt));
-    motion.average = motion.samples ? motion.average * 0.8 + dt * 0.2 : dt;
-    motion.samples++;
-  }
-  if (glView)
-    for (const busy of glView.pollGpu(t)) {
-      motion.gpu = motion.gpuSamples ? motion.gpu * 0.8 + busy * 0.2 : busy;
-      motion.gpuSamples++;
-    }
-  motion.lastFrame = t;
-  requestAnimationFrame(measureFrame);
-}
 /**
  * Draws right now instead of at the next animation frame. A finger touching down is reported between
  * frames; waiting for the next frame would show the first dab of paint one frame late.
@@ -1150,7 +1288,9 @@ let overlayShown = true; // the 2D canvas is visible (opacity) at all
 /** When the swatches and the percentage were last brought up to date while a finger paints. */
 let liveProgressAt = 0;
 const LIVE_PROGRESS_MS = 150;
-const fades = { cell: 0, number: 0, grid: 0, contrastNumbers: false };
+const fades = { cell: 0, number: 0, grid: 0, contrastNumbers: false, silBoost: 1 };
+/** How much stronger the silhouette gets when zoomed in (modes that keep it under the numbers). */
+const SILHOUETTE_BOOST = { light: 1.5, dark: 1.3 };
 
 function draw() {
   drawQueued = false;
@@ -1165,6 +1305,10 @@ function draw() {
   fades.grid = settings.grid ? smoothstep(5, 10, s) : 0;
   // over a silhouette every number picks black or white, whichever reads better on its cell
   fades.contrastNumbers = mode === "b";
+  // where the silhouette stays when zoomed in, it gets more contrast as its cells grow (pale big cells
+  // read as almost flat)
+  const boost = game.theme.dark ? SILHOUETTE_BOOST.dark : SILHOUETTE_BOOST.light;
+  fades.silBoost = settings.sil && mode !== "n" ? 1 + (boost - 1) * smoothstep(4, 16, s) : 1;
   const withGl = !!(game.useGl && glView.ready && drawGl(fades));
   if (glCanvas.hidden === withGl) glCanvas.hidden = !withGl;
   if (game.stroke && game.touchedColors.size && performance.now() - liveProgressAt > LIVE_PROGRESS_MS) {
@@ -1261,22 +1405,20 @@ function drawGl(fades) {
   f.x = view.x;
   f.y = view.y;
   f.scale = view.scale;
-  f.dpr = glCanvas.width / screen.width; // device pixels of the GL canvas (fewer while moving, see motion)
-  f.now = performance.now();
+  f.dpr = glCanvas.width / screen.width; // device pixels per CSS pixel of the GL canvas
   f.theme = game.theme;
   f.cellFade = fades.cell;
   f.gridFade = fades.grid;
   f.numberFade = fades.number;
   f.contrastNumbers = fades.contrastNumbers;
+  f.silBoost = fades.silBoost;
   f.selected = settings.hl ? game.selected : 0;
   return glView.draw(f);
 }
 
 /**
  * Fallback without WebGL: the same picture drawn with the 2D canvas API (slow when many cells are visible:
- * a call per cell). While the picture moves only the picture itself is drawn (its silhouette: one call, and
- * its shapes to find the way by); the cells, grid and numbers follow when it stops. A phone without WebGL 2
- * is a weak one.
+ * a call per cell).
  */
 function draw2d(fades) {
   const { width: W, height: H, target } = game.canvas;
@@ -1310,7 +1452,6 @@ function draw2d(fades) {
     (y1 - y0) * s,
   );
 
-  if (motion.active) return;
   if (fades.cell > 0) {
     for (let y = y0; y < y1; y++)
       for (let x = x0; x < x1; x++) {
@@ -1408,6 +1549,7 @@ const panelColor = { theme: "", rgb: [29, 31, 59] };
 function panelRgb() {
   const theme = document.documentElement.dataset.theme || "";
   if (panelColor.theme !== theme) {
+    // (read once per theme: a computed style is costly to ask for every frame)
     panelColor.theme = theme;
     const hex = getComputedStyle(document.documentElement).getPropertyValue("--panel").trim();
     const full = hex.length === 4 ? "#" + [...hex.slice(1)].map((c) => c + c).join("") : hex;
@@ -1532,6 +1674,10 @@ function drawMinimap() {
   const oy = (nh - region.h * k) / 2;
 
   const changed = game.buffer.take("mini");
+  // nothing painted and the view the same as last time: the minimap on screen is still right
+  const viewKey = `${a},${b},${c},${d},${nw},${nh},${game.selected}`;
+  if (!changed && !cache.full && cache.viewKey === viewKey && cache.background === game.theme.bg) return;
+  cache.viewKey = viewKey;
   if (cache.full || cache.nw !== nw || cache.nh !== nh || cache.background !== game.theme.bg) {
     cache.full = false;
     cache.background = game.theme.bg;
@@ -1586,8 +1732,8 @@ const input = {
   lastTapTime: -1e9, // first tap of a possible double tap: event time, place, cell
   lastTapAt: [0, 0],
   lastTapCell: -1,
-  lastTapEvent: null, // the paint action of that tap, if it painted something
   doubleTap: false, // this touch is the second tap of a double tap
+  heldStart: null, // this touch's first cell, not painted yet: it may be a double tap's first tap (see heldTap)
 };
 /**
  * A finger that stays within TAP_SLOP of where it went down is a tap, and does not move the picture: a
@@ -1682,7 +1828,6 @@ playCanvas.addEventListener(
   (e) => {
     e.preventDefault();
     noteActivity();
-    noteMotion();
     zoomAround(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
     requestDraw();
   },
@@ -1691,11 +1836,13 @@ playCanvas.addEventListener(
 
 playCanvas.addEventListener("pointerdown", (e) => {
   if (!game.canvas) return;
+  if (finish.active) return showFinishSheet(); // a tap during the end of a picture skips to its sheet
   noteActivity();
   playCanvas.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, [e.offsetX, e.offsetY]);
   game.hintCell = null;
   if (pointers.size > 1) {
+    input.heldStart = null; // a pinch, not a tap
     commitStroke();
     input.panning = true;
     input.dragging = true; // the finger left after a pinch moves the picture right away
@@ -1710,17 +1857,23 @@ playCanvas.addEventListener("pointerdown", (e) => {
   input.dragging = false;
   if (game.splitting && e.button < 1) return splitPointerDown(e);
   input.doubleTap = e.button < 1 && doubleTapDown(e);
+  if (!input.doubleTap) flushHeldTap(); // a new touch: the tap waiting for a second one was a single tap
   input.panning = game.tool === "hand" || e.button > 0 || (brushActive() && !settings.slide);
   // One finger moves the picture instead of painting when the brush would do nothing where it starts:
   // no color chosen, outside the picture, an already finished cell, or a cell of another number
   // (for the eraser: a cell with no paint on it).
   const start = brushActive() ? strokeCell(e.offsetX, e.offsetY) : null;
   if (!input.panning && brushActive() && !brushCanStartAt(start)) input.panning = true;
+  input.heldStart = null;
   if (!input.panning && brushActive()) {
     if (!game.stroke) game.stroke = newStroke(); // after a double tap: one action with its cell
     // after a double tap only its own cell is painted: the finger paints on once it really moves (pointermove)
     input.lastCell = input.doubleTap ? null : start;
-    if (!input.doubleTap) {
+    if (input.doubleTap) {
+      // (nothing more: its cell is painted)
+    } else if (mayBeFirstTap(e))
+      input.heldStart = start; // painted once it moves, or later (see heldTap)
+    else {
       stampBrush(start);
       drawNow();
     }
@@ -1730,14 +1883,14 @@ playCanvas.addEventListener("pointerdown", (e) => {
 
 /**
  * Double tap: picks the number of the first tap's cell and paints that cell (brush, bucket, wand; not the hand
- * or the eraser). It acts as soon as the second tap touches, like Android's own double tap, so it feels
- * instant; the finger may then keep going (brush: paints on with the new color once it moves past TAP_SLOP).
- * Only that one cell is painted: what the first tap painted somewhere else (aim assist puts a tap on a cell
- * of the selected color next to the finger) is taken back. A cell that is already done, or outside the part
- * being colored, picks nothing. Leaves game.stroke open.
+ * or the eraser; with "color with the brush only", the brush only). It acts as soon as the second tap touches,
+ * like Android's own double tap, so it feels instant; the finger may then keep going (brush: paints on with
+ * the new color once it moves past TAP_SLOP). Only that one cell is painted: a first tap that would have
+ * painted another cell was held back (see heldTap) and is dropped. A cell that is already done, or outside
+ * the part being colored, picks nothing. Leaves game.stroke open.
  */
 function doubleTapDown(e) {
-  if (!settings.dbl || !DOUBLE_TAP_TOOLS.includes(game.tool)) return false;
+  if (!settings.dbl || !doubleTapTools().includes(game.tool)) return false;
   if (input.lastTapCell < 0 || input.lastTapCell >= cellCount()) return false;
   const c = cellAt(e);
   const sameCell = c && c[1] * game.canvas.width + c[0] === input.lastTapCell;
@@ -1749,34 +1902,59 @@ function doubleTapDown(e) {
   const i = input.lastTapCell;
   const number = game.canvas.target[i] + 1;
   if (game.paint[i] === number || !inCurrentPart(i)) return false;
-  const first = input.lastTapEvent;
-  if (first && !first.cells.includes(i)) takeBack(first);
-  selectColor(number, "instant");
+  dropHeldTap(); // what the first tap would have painted elsewhere never shows
+  selectColor(number);
   game.stroke = newStroke();
   paintCell(i, number);
   drawNow();
   return true;
 }
 
-/** Undoes a paint action that is still the newest one (the first tap of a double tap, see doubleTapDown). */
-function takeBack(event) {
-  const last = game.lastStroke;
-  if (!last || last.event !== event || game.events[game.events.length - 1] !== event) return;
-  const { cells, values } = event;
-  for (let j = cells.length - 1; j >= 0; j--) {
-    const i = cells[j];
-    const right = game.canvas.target[i] + 1;
-    if (values[j] === right && game.paint[i] === right && last.old[j] !== right) {
-      game.canvas.stats.cells--; // that cell was counted as painted
-      if (settings.tot) settings.tot.cells--;
-    }
-    putCell(i, last.old[j]);
-  }
-  // not saved yet (almost always, a tap ago): it simply goes; otherwise a new entry puts the cells back
-  if (game.events.length > game.savedEvents) game.events.pop();
-  else game.events.push({ cells: Int32Array.from(cells).reverse(), values: Uint16Array.from(last.old).reverse() });
-  game.lastStroke = null;
-  game.unsaved = game.thumbsStale = true;
+/** Tools a double tap picks a color with. */
+const doubleTapTools = () => (settings.bonly ? ["brush"] : ["brush", "bucket", "wand"]);
+
+/**
+ * True if a brush touch here may be the first tap of a double tap: the cell under the finger is of another
+ * number, which a second tap would pick. Painting it at once (where aim assist puts it, on a cell of the
+ * selected color beside the finger, or a wrong number) and taking it back when the second tap came made a
+ * cell flash; such a touch waits instead: see heldTap. A touch on a cell of the selected number paints at
+ * once, as always (a double tap there picks nothing new).
+ */
+function mayBeFirstTap(e) {
+  if (!settings.dbl || game.tool !== "brush") return false;
+  const c = cellAt(e);
+  if (!c) return false;
+  const i = c[1] * game.canvas.width + c[0];
+  const number = game.canvas.target[i] + 1;
+  return number !== game.selected && game.paint[i] !== number && inCurrentPart(i);
+}
+
+/**
+ * A brush tap that may be the first half of a double tap (see mayBeFirstTap): its paint waits until no
+ * second tap can come (DOUBLE_TAP_MS after it), or until the next touch shows it was a single tap. If the
+ * second tap comes, it is dropped and never shows.
+ */
+const heldTap = { cell: null, color: 0, timer: 0 };
+function holdTap(cell) {
+  flushHeldTap();
+  heldTap.cell = cell;
+  heldTap.color = game.selected;
+  heldTap.timer = setTimeout(flushHeldTap, DOUBLE_TAP_MS);
+}
+function flushHeldTap() {
+  clearTimeout(heldTap.timer);
+  const cell = heldTap.cell;
+  heldTap.cell = null;
+  if (!cell || !game.canvas) return;
+  const own = !game.stroke; // (a stroke already open takes it in)
+  if (own) game.stroke = newStroke();
+  stampBrush(cell, heldTap.color, false); // a brush tap, whatever tool is out by now
+  if (own) commitStroke();
+  drawNow();
+}
+function dropHeldTap() {
+  clearTimeout(heldTap.timer);
+  heldTap.cell = null;
 }
 
 playCanvas.addEventListener("pointermove", (e) => {
@@ -1790,7 +1968,6 @@ playCanvas.addEventListener("pointermove", (e) => {
     const dist = Math.hypot(a[0] - b[0], a[1] - b[1]);
     const center = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
     if (input.pinchDist) {
-      noteMotion();
       zoomAround(center[0], center[1], dist / input.pinchDist);
       if (settings.two || game.splitting) {
         view.x += center[0] - input.pinchCenter[0];
@@ -1813,56 +1990,74 @@ playCanvas.addEventListener("pointermove", (e) => {
       view.x += now[0] - input.downAt[0];
       view.y += now[1] - input.downAt[1];
     } else return;
-    noteMotion();
     requestDraw();
   } else if (game.stroke && brushActive()) {
-    if (input.doubleTap && input.moved <= TAP_SLOP) return; // a double tap's finger paints only once it moves
-    // walk along the finger's path in steps of about half a cell, so aim assist sees every spot it passed
-    const dx = now[0] - old[0];
-    const dy = now[1] - old[1];
-    const steps = Math.max(1, Math.min(64, Math.ceil(Math.hypot(dx, dy) / Math.max(2, view.scale / 2))));
-    for (let n = 1; n <= steps; n++) {
-      const c = strokeCell(old[0] + (dx * n) / steps, old[1] + (dy * n) / steps, true);
-      if (c && input.lastCell) brushLine(input.lastCell, c);
-      input.lastCell = c || input.lastCell;
+    // a double tap's finger, or one that may be a first tap (see heldTap), paints only once it moves
+    if ((input.doubleTap || input.heldStart) && input.moved <= TAP_SLOP) return;
+    input.heldStart = null; // a stroke after all: brushLine paints its first cell too
+    // The browser hands over one move per frame; the finger's positions in between come with it, so a
+    // fast curve is followed as drawn rather than cut short by straight lines.
+    const points = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+    let from = old;
+    for (const point of points.length ? points : [e]) {
+      const to = [point.offsetX, point.offsetY];
+      brushPath(from, to);
+      from = to;
     }
   }
 });
 
-const DOUBLE_TAP_TOOLS = ["brush", "bucket", "wand"];
+/** Paints along the finger's path from screen point a to b, in steps of about half a cell (aim assist sees every spot). */
+function brushPath(a, b) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const steps = Math.max(1, Math.min(64, Math.ceil(Math.hypot(dx, dy) / Math.max(2, view.scale / 2))));
+  for (let n = 1; n <= steps; n++) {
+    const c = strokeCell(a[0] + (dx * n) / steps, a[1] + (dy * n) / steps, true);
+    if (c && input.lastCell) brushLine(input.lastCell, c);
+    input.lastCell = c || input.lastCell;
+  }
+}
 
 function pointerUp(e) {
   if (!pointers.delete(e.pointerId) || pointers.size) return;
-  endMotion(); // the picture stops with the finger: the sharp frame right away
   if (game.splitting && splitPointerUp()) return;
   const c = cellAt(e);
-  const eventsBefore = game.events.length;
   // a touch the system took away (pointercancel) is no tap
   const isTap = e.type === "pointerup" && input.moved <= TAP_SLOP && !input.multiTouch && c;
   if (input.panning) {
     // brush without "sliding": a tap paints one stamp (a double tap has painted its cell already)
     if (isTap && !input.doubleTap && brushActive() && !settings.slide && (game.selected || game.tool === "eraser")) {
-      if (!game.stroke) game.stroke = newStroke();
-      stampBrush(strokeCell(e.offsetX, e.offsetY) || c);
+      const cell = strokeCell(e.offsetX, e.offsetY) || c;
+      if (mayBeFirstTap(e)) holdTap(cell);
+      else {
+        if (!game.stroke) game.stroke = newStroke();
+        stampBrush(cell);
+      }
     }
     if (game.stroke) {
       commitStroke();
       drawNow();
     }
-  } else if (brushActive()) commitStroke();
-  else if (isTap) tapCell(c);
+  } else if (brushActive()) {
+    if (input.heldStart && isTap) holdTap(input.heldStart);
+    input.heldStart = null;
+    commitStroke();
+  } else if (isTap) tapCell(c);
 
   // a tap that may become the first half of a double tap (the second half acts when it touches: doubleTapDown)
-  if (isTap && !input.doubleTap && settings.dbl && DOUBLE_TAP_TOOLS.includes(game.tool)) {
+  if (isTap && !input.doubleTap && settings.dbl && doubleTapTools().includes(game.tool)) {
     input.lastTapTime = e.timeStamp;
     input.lastTapAt = [e.offsetX, e.offsetY];
     input.lastTapCell = c[1] * game.canvas.width + c[0];
-    // what this tap painted, taken back if a second tap makes it a double tap on another cell
-    input.lastTapEvent = game.events.length > eventsBefore ? game.events[game.events.length - 1] : null;
   }
   input.doubleTap = false;
   input.panning = false;
   input.pinchDist = 0;
+  if (autosaveDue) {
+    autosaveDue = false;
+    setTimeout(autosave, 700); // once the lifted finger's last frames are drawn
+  }
 }
 playCanvas.addEventListener("pointerup", pointerUp);
 playCanvas.addEventListener("pointercancel", pointerUp);
@@ -1882,6 +2077,9 @@ $("#play-panel-toggle").onclick = () => {
   // while the panel was hidden the strip was not scrolled: put the selected color back in the middle
   if (!game.dockHidden && game.selected) scrollPaletteTo(swatches[game.selected - 1], "auto");
 };
+
+/** The custom canvas color (setting) of the same kind, light or dark, as the canvas theme in use. */
+const customCanvasKey = () => (canvasTheme().dark ? "ccd" : "ccl");
 
 /** The eye button cycles: numbers -> silhouette with numbers -> silhouette only -> numbers. */
 const NEXT_MODE = { n: "b", b: "s", s: "n" };
@@ -1905,7 +2103,7 @@ $("#play-more").onclick = () => {
       actionButton("image", "png", "menu-png") +
       `</div>${toggle("sil")}` +
       `<div class="chips nowrap"><select id="menu-sil-tint">${options(["sg", "se", "sb", "sm", "sr", "sv", "cus"], settings.sit, "sit")}</select>${colorButtonHtml("menu-sil-color", settings.sic)}</div>` +
-      `<div class="chips nowrap"><select id="menu-canvas-theme">${options(["cw", "clg", "gl1", "gl2", "cd", "cb", "gd1", "gd2", "cus"], settings.ct, "ct")}</select>${colorButtonHtml("menu-canvas-color", settings.cc)}</div>` +
+      `<div class="chips nowrap"><select id="menu-canvas-theme">${options(CANVAS_THEMES, settings.ct, "ct")}</select>${colorButtonHtml("menu-canvas-color", settings[customCanvasKey()])}</div>` +
       toggle("mini") +
       toggle("oth"),
   );
@@ -1932,20 +2130,24 @@ $("#play-more").onclick = () => {
     });
   sheet.querySelector("#menu-canvas-theme").onchange = (e) => {
     settings.ct = e.target.value;
+    sheet.querySelector("#menu-canvas-color").style.background = settings[customCanvasKey()];
     applyColors();
   };
-  sheet.querySelector("#menu-canvas-color").onclick = (e) =>
+  // the color button sets the custom theme of the same kind (light or dark) as the one in use
+  sheet.querySelector("#menu-canvas-color").onclick = (e) => {
+    const key = customCanvasKey();
     openColorPicker({
-      value: settings.cc,
-      title: t("cc"),
+      value: settings[key],
+      title: t(key),
       onDone: (hex) => {
-        settings.cc = hex;
-        settings.ct = "cus";
-        sheet.querySelector("#menu-canvas-theme").value = "cus";
+        settings[key] = hex;
+        settings.ct = key === "ccd" ? "cusd" : "cusl";
+        sheet.querySelector("#menu-canvas-theme").value = settings.ct;
         e.target.style.background = hex;
         applyColors();
       },
     });
+  };
   sheet.querySelector("#menu-mode").onclick = () => {
     game.canvas.mode = NEXT_MODE[game.canvas.mode] || "b";
     markCanvasChanged();

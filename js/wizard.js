@@ -21,6 +21,7 @@ import {
   applyAdjustments,
   MODES,
   DEFAULT_CLEAN,
+  DEFAULT_BLEND,
   NO_ADJUST,
   normalizeParams,
   kmeansPalette,
@@ -128,7 +129,8 @@ $("#panel-pixel").innerHTML =
   sliderHtml("colors", "cols", 2, 1000, 32) +
   `<div class="chips"><label class="field grow"><span data-i="cn"></span><input id="colors-exact" type="number" min="2" max="1000" value="32"></label></div>` +
   `<button class="chip" id="btn-auto-colors" data-i="autoc"></button>` +
-  sliderHtml("clean", "clean", 0, 10, DEFAULT_CLEAN);
+  sliderHtml("clean", "clean", 0, 10, DEFAULT_CLEAN) +
+  `<div id="blend-field">${sliderHtml("blend", "blend", 0, 3, DEFAULT_BLEND)}</div>`;
 
 $$("#panel-crop .range,#panel-adjust .range,#panel-pixel .range").forEach(initRangeSlider);
 
@@ -215,8 +217,10 @@ export async function startWizard(file, restore = null) {
   $("#wiz-undo").disabled = true;
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
+  setBlend(settings.pbl ?? DEFAULT_BLEND);
   setSlider("colors", DEFAULT_COLORS);
   $("#colors-exact").value = DEFAULT_COLORS;
+  $("#keep-ratio").checked = true; // (a canvas made again sets its own, see applyState)
   setSlider("tol", wiz.tol);
   setSlider("strength", wiz.strength);
   setSlider("feather", wiz.feather);
@@ -240,6 +244,7 @@ function sourceState(params, scale) {
     ratio: wiz.ratio,
     adjust: { ...wiz.adjust },
     params,
+    keepRatio: $("#keep-ratio").checked,
   };
 }
 
@@ -275,9 +280,14 @@ function applyState(st) {
   wiz.colorsSet = true; // a canvas made again keeps its number of colors
   wiz.autoColors = false;
   setSlider("clean", p.clean);
+  setBlend(p.blend);
   wiz.style = p.style;
   wiz.sized = true;
   wiz.sizedRatio = cropRatio();
+  // "keep proportions" as it was; canvases from before it was stored: on if the size has the frame's proportions
+  const r = cropRatio();
+  $("#keep-ratio").checked =
+    st.keepRatio ?? (Math.abs(p.width - p.height * r) <= 1 || Math.abs(p.height - p.width / r) <= 1);
 }
 
 /** The (rotated-before) photo as a JPEG of at most 12 MP, and the factor it was scaled by. */
@@ -295,6 +305,7 @@ async function encodeSourcePhoto() {
 
 export function translateWizard() {
   translatePage();
+  showBlendValue();
   $("#btn-mirror").innerHTML = icon("flip") + `<span>${t("mir")}</span>`;
   $("#btn-flipv").innerHTML = icon("flipv") + `<span>${t("flipv")}</span>`;
   $("#btn-rotate").innerHTML = icon("rot") + `<span>${t("rotb")}</span>`;
@@ -2757,7 +2768,15 @@ function renderStyleList() {
         `<button class="style-row" data-style="${id}"><b data-i="m_${id}">${t("m_" + id)}</b><span data-i="d_${id}">${t("d_" + id)}</span></button>`,
     ).join("");
   $$("#style-list .style-row").forEach((b) => b.classList.toggle("on", b.dataset.style === wiz.style));
+  $("#blend-field").hidden = wiz.style !== "art"; // transition dithering: the art mode's own
 }
+
+/** The transition dithering slider (art mode, 0..3), shown in words. */
+function setBlend(v) {
+  setSlider("blend", v);
+  showBlendValue();
+}
+const showBlendValue = () => ($("#blend").previousElementSibling.textContent = t("tdl_" + $("#blend").value));
 $("#style-list").onclick = (e) => {
   const b = e.target.closest(".style-row");
   if (!b) return;
@@ -2778,6 +2797,7 @@ function pixelParams() {
     colors: Math.max(2, Math.min(+$("#colors").value, width * height)),
     style: wiz.style,
     clean: +$("#clean").value,
+    blend: wiz.style === "art" ? +$("#blend").value : 0,
   };
 }
 
@@ -2819,6 +2839,7 @@ $("#panel-pixel").addEventListener("input", (e) => {
     return schedulePreview();
   }
   if (el.type === "range") el.previousElementSibling.textContent = el.value;
+  if (el.id === "blend") showBlendValue();
   if (el.id === "px-width" && $("#keep-ratio").checked)
     $("#px-height").value = clampSize($("#px-width").value / cropRatio());
   if (el.id === "px-height" && $("#keep-ratio").checked)
@@ -2841,7 +2862,7 @@ let draftTimer = 0;
 let draftAt = 0;
 let previewSeq = 0; // counts schedulePreview calls: a draft started before the last one leaves the rest to it
 let shownParams = null; // params of the last full preview
-const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean]);
+const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend]);
 
 function schedulePreview() {
   previewSeq++;
@@ -3089,6 +3110,7 @@ async function createCanvasFromResult() {
     const id = String(Date.now());
     settings.pm = p.style;
     settings.pcl = p.clean;
+    if (p.style === "art") settings.pbl = p.blend;
     saveSettings();
     const { blob, scale } = await encodeSourcePhoto();
     const state = sourceState(p, scale);

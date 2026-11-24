@@ -3,7 +3,7 @@
 import {
   $,
   icon,
-  PAW_SVG,
+  PAW_PATH,
   openSheet,
   closeSheet,
   actionButton,
@@ -11,6 +11,7 @@ import {
   promptText,
   setBusy,
   toast,
+  createCanvas,
 } from "./ui.js";
 import { t } from "./i18n.js";
 import { settings, saveSettings } from "./settings.js";
@@ -87,13 +88,82 @@ const lazyLoader = new IntersectionObserver(
       const img = item.target;
       lazyLoader.unobserve(img);
       const entry = entriesById.get(img.dataset.thumb);
-      if (entry) thumbsOf(entry).then((rec) => (img.src = urlFor(rec.main)));
+      if (!entry) continue;
+      if (entry.done) img.onload = () => inkStamp(img);
+      thumbsOf(entry).then((rec) => (img.src = urlFor(rec.main)));
     }
   },
   { rootMargin: "300px" },
 );
 
 const lazyImg = (entry) => `<img data-thumb="${entry.id}" alt="">`;
+
+/*
+ * A finished canvas gets a stamp on its picture's corner: a paw in a double ring, in the app's accent ink,
+ * tilted a little (every canvas its own way), with worn edges and gaps in the ink like a real rubber stamp.
+ * The wear comes from SVG noise filters, a few variants so stamps side by side differ. The ink is the dark
+ * accent on a light corner and the light one on a dark corner (see inkStamp).
+ */
+const STAMP_FILTERS = 4;
+document.body.insertAdjacentHTML(
+  "beforeend",
+  `<svg width="0" height="0" style="position:absolute" aria-hidden="true">${[...Array(STAMP_FILTERS).keys()]
+    .map(
+      (n) =>
+        `<filter id="stamp-ink-${n}" x="-8%" y="-8%" width="116%" height="116%">` +
+        // ragged edges: the outline pushed about by fine noise
+        `<feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" seed="${n * 7 + 3}" result="edge"/>` +
+        `<feDisplacementMap in="SourceGraphic" in2="edge" scale="3.2" xChannelSelector="R" yChannelSelector="G" result="ragged"/>` +
+        // patchy ink: coarser noise turned into an alpha mask with some light spots and a few gaps
+        `<feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="3" seed="${n * 11 + 5}" result="ink"/>` +
+        `<feColorMatrix in="ink" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -3.4 0 0 0 2.75" result="mask"/>` +
+        `<feComposite in="ragged" in2="mask" operator="in"/></filter>`,
+    )
+    .join("")}</svg>`,
+);
+/** A number from a canvas id that stays the same every time (the stamp's tilt and wear). */
+function idHash(id) {
+  let h = 2166136261;
+  for (const ch of String(id)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  return h >>> 0;
+}
+const stampHtml = (entry) => {
+  const h = idHash(entry.id);
+  const tilt = -17 + (h % 23); // degrees: -17..5, mostly leaning left like a hand-pressed stamp
+  return (
+    `<i class="stamp" style="--tilt:${tilt}deg"><svg viewBox="0 0 100 100">` +
+    `<g filter="url(#stamp-ink-${(h >> 8) % STAMP_FILTERS})" fill="none" stroke="currentColor">` +
+    `<circle cx="50" cy="50" r="45" stroke-width="6"/><circle cx="50" cy="50" r="36.5" stroke-width="2"/>` +
+    `<path d="${PAW_PATH}" fill="currentColor" stroke="none" transform="translate(50 52) scale(2.35) translate(-16 -16)"/>` +
+    `</g></svg></i>`
+  );
+};
+
+/** Picks the stamp's ink by how light the picture is under it, once the thumbnail has loaded. */
+function inkStamp(img) {
+  const stamp = img.nextElementSibling;
+  if (!stamp || !img.naturalWidth) return;
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+  const side = Math.min(0.33 * w, 0.62 * h); // as in the CSS
+  const probe = createCanvas(8, 8);
+  const ctx = probe.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, w * 0.97 - side, h - w * 0.03 - side, side, side, 0, 0, 8, 8);
+  const d = ctx.getImageData(0, 0, 8, 8).data;
+  // the ink that differs more from what is under it, on average (luma of the two inks: 27 and 203)
+  let dark = 0;
+  let light = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const L = 0.3 * d[i] + 0.59 * d[i + 1] + 0.11 * d[i + 2];
+    dark += Math.abs(L - 27);
+    light += Math.abs(L - 203);
+  }
+  stamp.classList.toggle("light-ink", light > dark);
+}
+
+/** The card's picture: kept in its own proportions inside the card's frame, so the stamp sits on its corner. */
+const cardPicture = (entry) =>
+  `<div class="thumb"><div class="pic" style="--ar:${(entry.width / entry.height || 1).toFixed(4)}">${lazyImg(entry)}${entry.done ? stampHtml(entry) : ""}</div></div>`;
 
 /** "12% · 34/180 colors": progress, then finished colors / all colors. */
 const statsText = (entry) =>
@@ -185,7 +255,7 @@ export async function refreshLibrary() {
     const card = document.createElement("div");
     card.className = "card";
     card.dataset.id = entry.id;
-    card.innerHTML = `${lazyImg(entry)}<b></b><span>${statsText(entry)}</span>${entry.done ? `<i class="paw">${PAW_SVG}</i>` : ""}`;
+    card.innerHTML = `${cardPicture(entry)}<b></b><span>${statsText(entry)}</span>`;
     card.querySelector("b").textContent = entry.name;
     if (!entry.colors && !statsQueue.some((e) => e.id === entry.id)) statsQueue.push(entry);
     card.onclick = () => openCanvasMenu(entry);

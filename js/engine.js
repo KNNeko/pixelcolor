@@ -29,6 +29,8 @@ export const MODES = ["art", "photo", "dither"];
 export const DEFAULT_MODE = "art";
 /** "Cleanliness" slider, 0..10: how hard weak noise, stray dots and tiny islands are removed. */
 export const DEFAULT_CLEAN = 3;
+/** "Transition dithering" slider of the art mode, 0..3 (0 = off): see ditherTransitions. */
+export const DEFAULT_BLEND = 1;
 
 export const NO_ADJUST = { bri: 100, con: 100, sat: 100, tmp: 0, shp: 0, blk: 0, wht: 255, enh: 0 };
 
@@ -51,7 +53,9 @@ export function normalizeParams(p) {
   const style = MODES.includes(p.style) ? p.style : OLD_STYLES[p.style] || DEFAULT_MODE;
   let clean = p.clean;
   if (clean == null) clean = p.denoise == null ? DEFAULT_CLEAN : Math.round(p.denoise * 1.2 + (p.specks || 0) / 4);
-  return { ...p, style, clean: Math.max(0, Math.min(10, clean)) };
+  // transition dithering (art mode, 0..3); canvases made before it existed had none
+  const blend = p.blend == null ? 0 : Math.max(0, Math.min(3, Math.round(p.blend)));
+  return { ...p, style, clean: Math.max(0, Math.min(10, clean)), blend };
 }
 
 /* ---------- helpers ---------- */
@@ -361,6 +365,8 @@ const TEXTURE_MIX = 0.12;
  * on black hair is only a few levels apart). The anti-aliased rim along a plain border stays below it.
  */
 const LINE_MIN_CONTRAST = 32;
+/** ...and the share of it that is enough for a sample joined to a line (hysteresis, see findThinLines). */
+const LINE_LOW = 0.6;
 const lineThreshold = new Uint8Array(256);
 for (let v = 0; v < 256; v++) lineThreshold[v] = Math.round(18 + ((LINE_MIN_CONTRAST - 18) * v) / 255);
 /** Share of a cell covered by a line from which it is drawn as line whatever the thinning says. */
@@ -512,15 +518,41 @@ function findThinLines(rgba, w, h, r) {
     }
   };
   morph(true, Y); // closing: dark features narrower than the window are filled in
+  // Hysteresis: a sample that stands out LINE_LOW of the threshold is line too if it joins one that stands out
+  // fully. A faint line (a gray collar on a white shirt) fades in and out around the threshold along its
+  // length; with one threshold it fell apart into dashes.
+  const faint = [];
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const q = (y + r) * pw + x + r;
       const d = b[q] - Y[q];
-      if (d >= lineThreshold[b[q]]) {
+      const threshold = lineThreshold[b[q]];
+      if (d >= threshold) {
         type[y * w + x] = 1;
         strength[y * w + x] = d;
+      } else if (d >= threshold * LINE_LOW) {
+        strength[y * w + x] = d;
+        faint.push(y * w + x);
       }
     }
+  if (faint.length) {
+    const grow = [];
+    for (let i = 0; i < N; i++) if (type[i] === 1) grow.push(i);
+    while (grow.length) {
+      const p = grow.pop();
+      const px = p % w;
+      const py = (p - px) / w;
+      for (let yy = Math.max(0, py - 1); yy <= Math.min(h - 1, py + 1); yy++)
+        for (let xx = Math.max(0, px - 1); xx <= Math.min(w - 1, px + 1); xx++) {
+          const j = yy * w + xx;
+          if (!type[j] && strength[j]) {
+            type[j] = 1;
+            grow.push(j);
+          }
+        }
+    }
+    for (const i of faint) if (!type[i]) strength[i] = 0;
+  }
   const closed = new Uint8Array(b);
   // Opening: light features narrower than the window are removed. Plain, on the picture itself, it shows every
   // light stripe; fine hatching then shows as both kinds everywhere (`raw`, for the texture test).
@@ -909,6 +941,8 @@ function rasterizeThinLines(rgba, W, H, k) {
       if (piece.length <= 2) for (const j of piece) kind[j] = 0;
     }
   }
+  bridgeLineGaps(kind, count, lineOf, W, H);
+  flattenLineBumps(kind, count, lineOf, share, W, H);
   // a line's color is pooled from the cell and its line neighbours: a cell the line only grazes would get
   // a paler, half-blended color of its own, and the line would flicker between shades along its length
   // samples on a line or touching one: the line's anti-aliased rim and its JPEG halo are neither line nor
@@ -966,6 +1000,157 @@ function rasterizeThinLines(rgba, W, H, k) {
   }
   lightenThinLines(rgba, W, H, k, kind, color, near, lineOf[1]);
   return { kind, color, texture, type, near };
+}
+
+/** 8 neighbours of a cell: E, NE, N, NW, W, SW, S, SE. */
+const NB_X = [1, 1, 0, -1, -1, -1, 0, 1];
+const NB_Y = [0, -1, -1, -1, 0, 1, 1, 1];
+
+/**
+ * Closes one-cell gaps in thin lines. Where a line breaks for a cell (it faded below the threshold there, or
+ * the thinning cut it) and its two ends face each other across the gap, the cell between them joins the line,
+ * if some of its samples are line samples. Ends that do not face each other (two lines that merely come
+ * close) stay apart.
+ * kind: per cell 0 / 1 dark / 2 light line, changed in place; count[t]: line samples per cell; lineOf[t]: the
+ * line each cell belongs to.
+ */
+function bridgeLineGaps(kind, count, lineOf, W, H) {
+  const at = (x, y, t) => x >= 0 && y >= 0 && x < W && y < H && kind[y * W + x] === t;
+  for (const t of [1, 2]) {
+    // pieces (8-connected), and each end: a line cell with exactly one line neighbour, pointing away from it
+    const piece = new Int32Array(W * H).fill(-1);
+    const ends = [];
+    let pieces = 0;
+    const stack = [];
+    for (let c = 0; c < W * H; c++) {
+      if (kind[c] !== t || piece[c] >= 0) continue;
+      piece[c] = pieces;
+      stack.push(c);
+      while (stack.length) {
+        const p = stack.pop();
+        const x = p % W;
+        const y = (p - x) / W;
+        let around = 0;
+        let nx = 0;
+        let ny = 0;
+        for (let d = 0; d < 8; d++) {
+          const xx = x + NB_X[d];
+          const yy = y + NB_Y[d];
+          if (!at(xx, yy, t)) continue;
+          around++;
+          nx = NB_X[d];
+          ny = NB_Y[d];
+          const j = yy * W + xx;
+          if (piece[j] < 0) {
+            piece[j] = pieces;
+            stack.push(j);
+          }
+        }
+        if (around === 1) ends.push([p, -nx, -ny]);
+      }
+      pieces++;
+    }
+    const isEnd = new Uint8Array(W * H);
+    const dirOf = new Int8Array(W * H * 2);
+    for (const [c, dx, dy] of ends) {
+      isEnd[c] = 1;
+      dirOf[c * 2] = dx;
+      dirOf[c * 2 + 1] = dy;
+    }
+    for (const [c, dx, dy] of ends) {
+      if (!isEnd[c]) continue; // joined already from its other side
+      const x = c % W;
+      const y = (c - x) / W;
+      let best = -1;
+      let bestF = -1;
+      let bestScore = 0;
+      for (let oy = -2; oy <= 2; oy++)
+        for (let ox = -2; ox <= 2; ox++) {
+          if (Math.max(Math.abs(ox), Math.abs(oy)) !== 2 || ox * dx + oy * dy < 2) continue;
+          const fx = x + ox;
+          const fy = y + oy;
+          if (!at(fx, fy, t)) continue;
+          const f = fy * W + fx;
+          // the other end of another piece, pointing back
+          if (!isEnd[f] || piece[f] === piece[c] || ox * dirOf[f * 2] + oy * dirOf[f * 2 + 1] > -2) continue;
+          // the gap cell: the middle one, or of the two in between, the one with more line samples
+          const mx = x + Math.sign(ox) * (Math.abs(ox) === 2 ? 1 : 0);
+          const my = y + Math.sign(oy) * (Math.abs(oy) === 2 ? 1 : 0);
+          const candidates =
+            Math.abs(ox) === 1
+              ? [
+                  [mx, my],
+                  [mx + ox, my],
+                ]
+              : Math.abs(oy) === 1
+                ? [
+                    [mx, my],
+                    [mx, my + oy],
+                  ]
+                : [[mx, my]];
+          for (const [gx, gy] of candidates) {
+            const g = gy * W + gx;
+            if (kind[g] || !count[t][g]) continue;
+            const score = count[t][g] * 4 - Math.abs(ox) - Math.abs(oy); // prefer evidence, then straight
+            if (score > bestScore) {
+              bestScore = score;
+              best = g;
+              bestF = f;
+            }
+          }
+        }
+      if (best < 0) continue;
+      kind[best] = t;
+      lineOf[t][best] = lineOf[t][c];
+      isEnd[c] = isEnd[bestF] = 0;
+    }
+  }
+}
+
+/**
+ * Takes the wobble out of thin lines: a line cell sticking out by one cell between two line cells that lie in
+ * one row (or column) moves back into that row, if the line also passes through the cell it moves to. A line
+ * drawn along a cell border otherwise steps back and forth between two rows of cells: a zigzag.
+ */
+function flattenLineBumps(kind, count, lineOf, share, W, H) {
+  for (let round = 0; round < 4; round++)
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        const c = y * W + x;
+        const t = kind[c];
+        if (!t) continue;
+        let around = 0;
+        let a = -1;
+        let b = -1;
+        for (let d = 0; d < 8; d++) {
+          const xx = x + NB_X[d];
+          const yy = y + NB_Y[d];
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H || kind[yy * W + xx] !== t) continue;
+          around++;
+          if (a < 0) a = d;
+          else b = d;
+        }
+        if (around !== 2) continue;
+        const ax = x + NB_X[a];
+        const ay = y + NB_Y[a];
+        const bx = x + NB_X[b];
+        const by = y + NB_Y[b];
+        let px = -1;
+        let py = -1;
+        if (ay === by && ay !== y && Math.abs(ax - bx) === 2) {
+          px = x;
+          py = ay; // a bump above or below a row
+        } else if (ax === bx && ax !== x && Math.abs(ay - by) === 2) {
+          px = ax;
+          py = y; // ...beside a column
+        } else continue;
+        const p = py * W + px;
+        if (kind[p] || !count[t][p]) continue;
+        kind[p] = t;
+        kind[c] = 0;
+        lineOf[t][p] = lineOf[t][c];
+        share[p] = share[c];
+      }
 }
 
 /**
@@ -1939,6 +2124,84 @@ export function ditherRamps(idx, rgba, W, H, pal, K, width, lines = null) {
     }
 }
 
+/*
+ * Art mode, transition dithering: where soft shading passes from one color band to the next, the two colors
+ * interleave in a fine regular pattern (ordered dithering) over a narrow strip, so the step between the
+ * bands reads as a smooth transition, the way pixel artists blend shades. Only between similar colors
+ * (TRANSITION_REACH), only where the picture is soft around the cell (TRANSITION_SOFT), never on thin lines
+ * or cells marked "important".
+ * Each cell takes the second color where its own color lies past the pattern's threshold on the way between
+ * the two: the thresholds come from a 4x4 Bayer matrix squeezed into 0.5 +- width, so only cells close to
+ * halfway mix and the strip stays narrow ("weak") at the lowest setting.
+ */
+const TRANSITION_REACH = 12;
+const TRANSITION_SOFT = 60; // |dR| + |dG| + |dB| between the cells of the 3 x 3 block around a cell
+/** Half-width of the mixed strip (in parts of the way from one color to the next) per setting 0..3. */
+export const TRANSITION_WIDTH = [0, 0.18, 0.28, 0.4];
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+/** See above. strength: 0..3; lines: thin-line and marked cells (left alone), or null. */
+export function ditherTransitions(idx, rgba, W, H, pal, K, strength, lines = null) {
+  const width = TRANSITION_WIDTH[strength] || 0;
+  if (!width) return;
+  const palLab = paletteToLab(pal, K);
+  const lab = new Float32Array(3);
+  const before = new Uint16Array(idx);
+  const reach2 = TRANSITION_REACH * TRANSITION_REACH;
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (lines && lines[i]) continue;
+      // soft around: no edge or detail in the 3 x 3 block
+      let r0 = 255;
+      let r1 = 0;
+      let g0 = 255;
+      let g1 = 0;
+      let b0 = 255;
+      let b1 = 0;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(H - 1, y + 1); yy++)
+        for (let xx = Math.max(0, x - 1); xx <= Math.min(W - 1, x + 1); xx++) {
+          const q = (yy * W + xx) * 4;
+          r0 = Math.min(r0, rgba[q]);
+          r1 = Math.max(r1, rgba[q]);
+          g0 = Math.min(g0, rgba[q + 1]);
+          g1 = Math.max(g1, rgba[q + 1]);
+          b0 = Math.min(b0, rgba[q + 2]);
+          b1 = Math.max(b1, rgba[q + 2]);
+        }
+      if (r1 - r0 + g1 - g0 + b1 - b0 > TRANSITION_SOFT) continue;
+      // the next band: the most similar other color within two cells
+      const a = before[i];
+      let b = -1;
+      let gap2 = reach2;
+      for (let yy = Math.max(0, y - 2); yy <= Math.min(H - 1, y + 2); yy++)
+        for (let xx = Math.max(0, x - 2); xx <= Math.min(W - 1, x + 2); xx++) {
+          const j = yy * W + xx;
+          const c = before[j];
+          if (c === a || (lines && lines[j])) continue;
+          const d0 = palLab[c * 3] - palLab[a * 3];
+          const d1 = palLab[c * 3 + 1] - palLab[a * 3 + 1];
+          const d2 = palLab[c * 3 + 2] - palLab[a * 3 + 2];
+          const d = d0 * d0 + d1 * d1 + d2 * d2;
+          if (d < gap2) {
+            gap2 = d;
+            b = c;
+          }
+        }
+      if (b < 0) continue;
+      // where the cell's own color lies on the way from the lower-numbered color to the other (the same
+      // way round on both sides of the border, so the two sides make one pattern)
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      srgbToLab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], lab, 0);
+      let t = 0;
+      for (let j = 0; j < 3; j++) t += (lab[j] - palLab[lo * 3 + j]) * (palLab[hi * 3 + j] - palLab[lo * 3 + j]);
+      t /= gap2;
+      const threshold = 0.5 + ((BAYER4[(y & 3) * 4 + (x & 3)] + 0.5) / 16 - 0.5) * 2 * width;
+      idx[i] = t > threshold ? hi : lo;
+    }
+}
+
 /** Two palette colors closer than this (Lab distance; ~2.3 is the smallest difference people notice) become one. */
 export const SAME_COLOR = 0.8;
 /** A color used by only a few cells joins its nearest color if that one is within this distance. */
@@ -2110,8 +2373,10 @@ export async function generate(source, params, userAdjust, hooks = noHooks) {
     removeSpecks(idx, W, H, 2 + (clean >> 2), pal, speck, lines, speck * LONE_CELL);
   }
   // soft band borders in gradients; the cleaner the picture is asked to be, the less of it
-  // (not in art mode: drawn pictures have clean color bands, a checker seam along every band reads as noise)
+  // (not in art mode: drawn pictures have clean color bands, a checker seam along every band reads as noise;
+  // there the "transition dithering" setting decides, see ditherTransitions)
   if (!dither && p.style !== "art") ditherRamps(idx, rgba, W, H, pal, K, 0.2 - 0.02 * clean, lines);
+  if (p.style === "art") ditherTransitions(idx, rgba, W, H, pal, K, p.blend, lines);
   cleanPalette(idx, pal, K, clean > 0 ? Math.max(2, Math.min(6, Math.round((W * H) / 50000))) : 0, rgba.focus);
   return { width: W, height: H, idx, pal: finalizePalette(idx, pal, K) };
 }
@@ -2440,6 +2705,8 @@ const AUTO_MAX = 1000;
 const AUTO_STEPS = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 200, 240, 300, 400, 500, 600, 800, 1000];
 const AUTO_REF_FITS = 5;
 const AUTO_EXACTNESS = 0.02;
+/** Share of the colors the average-error rule asks for, per transition dithering setting 0..3 (art mode). */
+const AUTO_BLEND = [1, 0.85, 0.75, 0.66];
 
 /**
  * How much each sampled cell's color error shows. seen: 1 in a smooth area, towards 0 in texture and on edges;
@@ -2538,6 +2805,10 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
   const gray = isGrayPicture(rgba, N); // black and white: stricter (see AUTO_LOW_GRAY)
   const exact = gray ? AUTO_EXACT / 2 : AUTO_EXACT;
   const maxK = Math.max(2, Math.min(AUTO_MAX, Math.floor(N / 12)));
+  // art mode with transition dithering: the steps between shades are blended, so fewer shades look as smooth
+  // (colors that would be missing altogether still count in full: see `complete`)
+  const p = normalizeParams(params);
+  const blendFewer = p.style === "art" ? AUTO_BLEND[p.blend] : 1;
   const judge = async (K, iterations = 4, seed = 7) => {
     hooks.progress(K);
     const fit = await kmeansFit(sample, K, iterations, hooks, seed);
@@ -2573,7 +2844,7 @@ export async function suggestColorCount(source, params, userAdjust, hooks = noHo
     if (target && error <= target && !enough) {
       // between the last two steps, where the error (on log scales) crosses the target
       const t = prevError > error ? Math.log(prevError / target) / Math.log(prevError / error) : 1;
-      enough = Math.exp(Math.log(prevK) + t * (Math.log(K) - Math.log(prevK))) * 1.15;
+      enough = Math.exp(Math.log(prevK) + t * (Math.log(K) - Math.log(prevK))) * 1.15 * blendFewer;
     }
     if (enough && complete) {
       // nothing lost only from a checkpoint above the average's count: where exactly between the two

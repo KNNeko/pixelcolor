@@ -1,7 +1,7 @@
 // Settings screen: one row per setting, plus backup export/import.
 import { $, showScreen, translatePage, syncFullscreen, download, setBusy, yieldToBrowser, toast } from "./ui.js";
 import { t } from "./i18n.js";
-import { settings, saveSettings, applyAppTheme } from "./settings.js";
+import { settings, saveSettings, applyAppTheme, upgradeSettings, CANVAS_THEMES } from "./settings.js";
 import { exportBackup, importBackup, requestPersistence } from "./storage.js";
 import { refreshLibrary, renderSortOptions, clearThumbCache } from "./library.js";
 import { restartAutosave } from "./game.js";
@@ -9,15 +9,16 @@ import { openColorPicker, colorButtonHtml } from "./colorpicker.js";
 import { totalsHtml } from "./stats.js";
 
 /** Picking a custom color also switches its theme select to "custom", so the color is actually used. */
-const COLOR_SELECT = { cc: ["ct", "cus"], sic: ["sit", "cus"] };
+const COLOR_SELECT = { ccl: ["ct", "cusl"], ccd: ["ct", "cusd"], sic: ["sit", "cus"] };
 
 // [key, kind, options]: kind = toggle | select | color; a plain string starts a group (its title's key)
 const ROWS = [
   "g_look",
   ["lang", "select", ["en", "ru"]],
   ["ap", "select", ["sys", "light", "dark"]],
-  ["ct", "select", ["cw", "clg", "gl1", "gl2", "cd", "cb", "gd1", "gd2", "cus"]],
-  ["cc", "color"],
+  ["ct", "select", CANVAS_THEMES],
+  ["ccl", "color"],
+  ["ccd", "color"],
   ["sil", "toggle"],
   ["sit", "select", ["sg", "se", "sb", "sm", "sr", "sv", "cus"]],
   ["sic", "color"],
@@ -29,6 +30,7 @@ const ROWS = [
   ["slide", "toggle"],
   ["two", "toggle"],
   ["dbl", "toggle"],
+  ["bonly", "toggle"],
   ["hl", "toggle"],
   ["aim", "select", [0, 1, 2, 3]],
   ["hide", "toggle"],
@@ -138,6 +140,7 @@ function backupRow() {
       const saved = await importBackup(file);
       if (saved) {
         Object.assign(settings, saved);
+        upgradeSettings(settings);
         if (!saved.tot) settings.tot = null; // a backup from before statistics: count again from the library
         saveSettings();
         applyAppTheme();

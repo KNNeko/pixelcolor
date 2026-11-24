@@ -85,7 +85,8 @@ export const icon = (name) => `<svg class="icon" viewBox="0 0 24 24"><path d="${
 /** Pixel-art paw shown on finished canvases: a 32x32 bitmap packed as hex, turned into one SVG path. */
 const PAW_HEX =
   "000000000000000000000000000000000000000000381c00007c3e00007c3e00007e7e00007e7e00067c3e600f7c3ef01fb81df81f8001f81f8001f80f0000f00f0ff0f0001ff800003ffc00007ffe00007ffe0000ffff0000ffff00007ffe00007ffe00003ffc00001ff800000e700000000000000000000000000000000000";
-export const PAW_SVG = (() => {
+/** The paw as one SVG path in a 32 x 32 box. */
+export const PAW_PATH = (() => {
   const bit = (i) => (parseInt(PAW_HEX[i >> 2], 16) >> (3 - (i & 3))) & 1;
   let path = "";
   for (let y = 0; y < 32; y++) {
@@ -101,7 +102,7 @@ export const PAW_SVG = (() => {
       x = end;
     }
   }
-  return `<svg viewBox="0 0 32 32" shape-rendering="crispEdges" fill="currentColor"><path d="${path}"/></svg>`;
+  return path;
 })();
 
 /* ---------- screens, toast, busy overlay ---------- */
@@ -128,17 +129,31 @@ export const setBusyText = (text) => ($("#busy-text").textContent = text);
 /* ---------- bottom sheet + dialogs ---------- */
 
 /** Opens a bottom sheet with the given HTML and returns the sheet element. Tap outside closes it. */
-export function openSheet(html) {
+/** Called once when the open sheet goes: closed, or replaced by another sheet. */
+let onSheetGone = null;
+function sheetGone() {
+  const done = onSheetGone;
+  onSheetGone = null;
+  if (done) done();
+}
+
+/** Opens a bottom sheet with the given HTML (replacing an open one); onGone: see onSheetGone. */
+export function openSheet(html, onGone = null) {
+  sheetGone();
   const overlay = $("#modal");
   overlay.innerHTML = `<div class="sheet">${html}</div>`;
   overlay.hidden = false;
   overlay.onclick = (e) => {
-    if (e.target === overlay) overlay.hidden = true;
+    if (e.target === overlay) closeSheet();
   };
   overlay.querySelectorAll(".range").forEach(initRangeSlider);
+  onSheetGone = onGone;
   return overlay.firstChild;
 }
-export const closeSheet = () => ($("#modal").hidden = true);
+export function closeSheet() {
+  $("#modal").hidden = true;
+  sheetGone();
+}
 
 /** Big icon+label button used in action grids. */
 export const actionButton = (iconName, labelKey, id, extraClass = "") =>

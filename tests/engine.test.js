@@ -22,6 +22,7 @@ import {
   smoothGradients,
   srgbToLab,
   unifyLines,
+  ditherTransitions,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -585,4 +586,97 @@ test("suggestColorCount: an exact count between its checkpoints, up to 1000", as
   const noise = image(130, 130, () => [random(), random(), random()].map(Math.floor));
   const big = { width: 130, height: 130, colors: 32, style: "photo", clean: 3 };
   assert.equal(await suggestColorCount(noise, big, NO_ADJUST), 1000);
+});
+
+test("pickCellColors: a thin line that fades in and out along its length stays one unbroken line", () => {
+  // 4 samples per cell; a 2-sample dark line on white whose darkness dips well below the line threshold in
+  // places (a faint gray collar line): hysteresis joins the faint parts to the dark ones
+  const k = 4;
+  const W = 24;
+  const H = 8;
+  const src = image(W * k, H * k, (x, y) => {
+    if (y !== 13 && y !== 14) return [245, 245, 245];
+    const cell = (x / k) | 0;
+    const v = cell % 6 === 2 || cell % 6 === 3 ? 222 : 150; // faint stretches: only ~23 levels darker
+    return [v, v, v];
+  });
+  const out = pickCellColors(src.data, W, H, k);
+  const lines = out.lines;
+  for (let x = 1; x < W - 1; x++) {
+    let found = false;
+    for (let y = 0; y < H; y++) if (lines[y * W + x] === 1) found = true;
+    assert.ok(found, `column ${x}: no line`);
+  }
+});
+
+test("pickCellColors: a line running along a cell border does not zigzag between the two rows", () => {
+  // an anti-aliased line about 2 samples wide whose center wobbles a little around the border between rows 3
+  // and 4 (4 samples per cell): before, its cells stepped back and forth between the rows all along it
+  const k = 4;
+  const W = 30;
+  const H = 8;
+  const src = image(W * k, H * k, (x, y) => {
+    const center = 16 + 0.45 * Math.sin(x * 0.9) + 0.2 * Math.sin(x * 2.3); // in samples; 16 = the border
+    const cover = Math.max(0, Math.min(1, 1.1 - Math.abs(y + 0.5 - center)));
+    const v = Math.round(240 * (1 - cover) + 20 * cover);
+    return [v, v, v];
+  });
+  const lines = pickCellColors(src.data, W, H, k).lines;
+  // a bump: a line cell with line cells on both sides in the row next to it, and none between them
+  let bumps = 0;
+  for (let y = 1; y < H - 1; y++)
+    for (let x = 1; x < W - 1; x++) {
+      if (!lines[y * W + x]) continue;
+      for (const dy of [-1, 1])
+        if (lines[(y + dy) * W + x - 1] && lines[(y + dy) * W + x + 1] && !lines[(y + dy) * W + x]) bumps++;
+    }
+  assert.ok(bumps <= 6, `${bumps} bumps`); // (16 before)
+});
+
+test("ditherTransitions mixes two similar shades in a regular pattern along their border, and nothing else", () => {
+  // a soft horizontal gradient from one shade to a similar one, quantized to the two: a hard border in the middle
+  const W = 32;
+  const H = 8;
+  const rgba = new Uint8ClampedArray(W * H * 4);
+  const pal = new Uint8Array([150, 150, 150, 165, 165, 165]);
+  const idx = new Uint16Array(W * H);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const v = 150 + (15 * x) / (W - 1);
+      rgba.set([v, v, v, 255], (y * W + x) * 4);
+      idx[y * W + x] = v < 157.5 ? 0 : 1;
+    }
+  const plain = Uint16Array.from(idx);
+  ditherTransitions(idx, rgba, W, H, pal, 2, 0);
+  assert.deepEqual(idx, plain, "off: nothing changes");
+  ditherTransitions(idx, rgba, W, H, pal, 2, 2);
+  // far from the border nothing changes; next to it both shades appear in every row
+  for (let y = 0; y < H; y++) {
+    assert.equal(idx[y * W], 0);
+    assert.equal(idx[y * W + W - 1], 1);
+    let mixed = 0;
+    for (let x = 12; x < 20; x++) if (idx[y * W + x] !== plain[y * W + x]) mixed++;
+    assert.ok(mixed >= 1, `row ${y}: no mixing`);
+  }
+  // the pattern repeats every 4 rows (ordered dithering, no noise)
+  for (let y = 0; y + 4 < H; y++)
+    for (let x = 0; x < W; x++) assert.equal(idx[y * W + x], idx[(y + 4) * W + x], `${x},${y}`);
+  // a real edge (far apart colors) is left alone
+  const pal2 = new Uint8Array([40, 40, 40, 220, 220, 220]);
+  const edge = new Uint8ClampedArray(W * H * 4);
+  const idx2 = new Uint16Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    const v = i % W < 16 ? 40 : 220;
+    edge.set([v, v, v, 255], i * 4);
+    idx2[i] = v === 40 ? 0 : 1;
+  }
+  const before = Uint16Array.from(idx2);
+  ditherTransitions(idx2, edge, W, H, pal2, 2, 3);
+  assert.deepEqual(idx2, before);
+});
+
+test("normalizeParams: transition dithering is off for canvases made before it existed", () => {
+  assert.equal(normalizeParams({ style: "art", clean: 3 }).blend, 0);
+  assert.equal(normalizeParams({ style: "art", clean: 3, blend: 2 }).blend, 2);
+  assert.equal(normalizeParams({ style: "art", blend: 9 }).blend, 3);
 });

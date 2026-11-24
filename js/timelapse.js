@@ -4,6 +4,7 @@
 // H.264 encoder) and packed into an .mp4 file
 // by mp4-muxer (js/vendor). This works on old Chrome versions that cannot record MP4 with MediaRecorder,
 // and is faster than real time. If WebCodecs is missing, it falls back to MediaRecorder (real time, WebM).
+// Every cell is a square of whole pixels in the video (no smoothing: crisp when a player enlarges it).
 // GIF: at most 256 colors, so the palette is built from the canvas's own colors (exact when it has
 // 255 or fewer, otherwise reduced to the best 255 by weighted k-means) plus white for unpainted cells.
 import { $, toast, setBusy, setBusyText, download, createCanvas, yieldToBrowser } from "./ui.js";
@@ -71,11 +72,27 @@ function outputCanvas(size) {
   return createCanvas(Math.max(2, Math.round(W * s) & ~1), Math.max(2, Math.round(H * s) & ~1));
 }
 
+/**
+ * Video canvas with every cell `scale` x `scale` pixels (the picture in its top-left corner; a video's sides
+ * must be even, so an odd one gets a white line more). scale 0: the old way, about 1080 px, smoothed.
+ */
+function videoCanvas(scale) {
+  if (!scale) return outputCanvas(1080);
+  const { width: W, height: H } = game.canvas;
+  const out = createCanvas((W * scale + 1) & ~1, (H * scale + 1) & ~1);
+  out.picture = [W * scale, H * scale];
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, out.width, out.height);
+  return out;
+}
+
 function drawFrame(out) {
   const ctx = out.getContext("2d");
   ctx.imageSmoothingEnabled = out.width < game.canvas.width;
   replay.buffer.flush();
-  ctx.drawImage(replay.buffer.canvas, 0, 0, out.width, out.height);
+  const [w, h] = out.picture || [out.width, out.height];
+  ctx.drawImage(replay.buffer.canvas, 0, 0, w, h);
 }
 
 const durationMs = () => $("#tl-duration").value * 1000;
@@ -119,34 +136,84 @@ $("#tl-preview").onclick = () => {
 /* ---------- video ---------- */
 
 const FPS = 30;
-const HOLD_LAST_FRAME = 0.8; // seconds the finished picture stays on screen
+const HOLD_LAST_FRAME = 2; // seconds the finished picture stays on screen
+const KEY_FRAME_SECONDS = 4;
+/** The video's long side: at least VIDEO_MIN px where whole pixels per cell allow it, at most VIDEO_LIMIT. */
+const VIDEO_MIN = 1080;
+const VIDEO_LIMIT = 2160;
+const VIDEO_BUDGET = 150e6; // bytes: the bitrate goes down for long videos to stay about this size
 
 /**
- * First video configuration this browser can encode into MP4: H.264 (high -> main -> baseline profile),
- * or VP9 if there is no H.264 encoder. Returns { config, muxerCodec } or null.
+ * Pixels per cell to try, best first. An even number: the video stores color for 2 x 2 pixel blocks, so with
+ * even cells starting on even pixels no block straddles two cells and colors do not bleed into their
+ * neighbours. The smallest even number that makes the video VIDEO_MIN px or more comes first, then smaller
+ * ones (a phone's encoder may not take the bigger frame); then one pixel per cell; 0 = smoothed to ~1080 px.
  */
-async function findVideoConfig(width, height) {
+function videoScales() {
+  const { width: W, height: H } = game.canvas;
+  const longest = Math.max(W, H);
+  const scales = [];
+  for (let s = 2 * Math.ceil(VIDEO_MIN / (2 * longest)); s >= 2; s -= 2) if (longest * s <= VIDEO_LIMIT) scales.push(s);
+  return [...scales, 1, 0];
+}
+
+/** H.264 codec strings for a frame size: profile high / main / baseline at the lowest level that holds it. */
+function avcCodecs(width, height) {
+  const blocks = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const level = blocks <= 3600 ? "1f" : blocks <= 8192 ? "28" : blocks <= 22080 ? "32" : "33";
+  return ["64", "4d", "42"].map((profile) => `avc1.${profile}00${level}`);
+}
+
+/**
+ * The best video this browser can encode into MP4 (see videoScales): H.264 (high -> main -> baseline),
+ * or VP9 if there is no H.264 encoder; the hardware encoder if there is one. Returns
+ * { config, muxerCodec, scale } or null (no WebCodecs).
+ */
+async function findVideoConfig(durationSeconds) {
   if (!window.VideoEncoder) return null;
-  const options = [
-    ["avc1.640028", "avc"],
-    ["avc1.4d0028", "avc"],
-    ["avc1.420028", "avc"],
-    ["avc1.42001f", "avc"],
-    ["vp09.00.40.08", "vp9"],
-  ];
-  for (const [codec, muxerCodec] of options) {
-    const config = { codec, width, height, bitrate: 6e6, framerate: FPS };
-    if (muxerCodec === "avc") config.avc = { format: "avc" };
-    try {
-      if ((await VideoEncoder.isConfigSupported(config)).supported) return { config, muxerCodec };
-    } catch {
-      /* try the next one */
-    }
+  for (const scale of videoScales()) {
+    const out = videoCanvas(scale);
+    const { width, height } = out;
+    // about 6 Mbit/s for 1080 x 1080, following the frame size; less for long videos (VIDEO_BUDGET)
+    const bitrate = Math.round(
+      Math.min(6e6 * Math.sqrt((width * height) / (1080 * 1080)), (VIDEO_BUDGET * 8) / durationSeconds, 12e6),
+    );
+    const options = [
+      ...avcCodecs(width, height).map((codec) => [codec, "avc"]),
+      [width * height <= 2228224 ? "vp09.00.40.08" : "vp09.00.50.08", "vp9"],
+    ];
+    for (const [codec, muxerCodec] of options)
+      for (const hardwareAcceleration of ["prefer-hardware", "no-preference"]) {
+        const config = { codec, width, height, bitrate, framerate: FPS, hardwareAcceleration };
+        if (muxerCodec === "avc") config.avc = { format: "avc" };
+        try {
+          if ((await VideoEncoder.isConfigSupported(config)).supported) return { config, muxerCodec, out };
+        } catch {
+          /* try the next one */
+        }
+      }
   }
   return null;
 }
 
-async function encodeMp4(out, { config, muxerCodec }) {
+/** Lets the browser draw and handle input, without the 4 ms a chain of timers would cost every time. */
+const nextTask = () =>
+  window.scheduler && scheduler.yield
+    ? scheduler.yield()
+    : new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = resolve;
+        channel.port2.postMessage(0);
+      });
+
+/** Waits until the encoder has taken a frame off its queue (or a moment: an encoder that failed takes none). */
+const encoderDequeued = (encoder) =>
+  new Promise((resolve) => {
+    if ("ondequeue" in encoder) encoder.addEventListener("dequeue", resolve, { once: true });
+    setTimeout(resolve, "ondequeue" in encoder ? 100 : 2);
+  });
+
+async function encodeMp4({ config, muxerCodec, out }) {
   const { Muxer, ArrayBufferTarget } = await import("./vendor/mp4-muxer.mjs");
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
@@ -162,17 +229,20 @@ async function encodeMp4(out, { config, muxerCodec }) {
   const moving = Math.round((durationMs() / 1000) * FPS);
   const total = moving + Math.round(HOLD_LAST_FRAME * FPS);
   resetReplay();
+  let slice = performance.now();
   for (let i = 0; i < total; i++) {
     if (failure) throw failure;
     seek(Math.min(1, i / moving));
     drawFrame(out);
     const frame = new VideoFrame(out, { timestamp: Math.round((i * 1e6) / FPS), duration: Math.round(1e6 / FPS) });
-    encoder.encode(frame, { keyFrame: i % (FPS * 2) === 0 });
+    encoder.encode(frame, { keyFrame: i % (FPS * KEY_FRAME_SECONDS) === 0 });
     frame.close();
-    while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 5));
-    if (i % 5 === 0) {
+    while (encoder.encodeQueueSize > 6) await encoderDequeued(encoder);
+    // the page stays responsive (the progress shows) without stopping after every few frames
+    if (performance.now() - slice > 50) {
       showProgress(t("vid"), i / total);
-      await yieldToBrowser();
+      await nextTask();
+      slice = performance.now();
     }
   }
   await encoder.flush();
@@ -215,12 +285,11 @@ async function recordRealtime(out) {
 
 $("#tl-video").onclick = async () => {
   replay.stopped = true;
-  const out = outputCanvas(1080);
   setBusy(true, t("vid") + " 0%");
   await yieldToBrowser();
   try {
-    const found = await findVideoConfig(out.width, out.height);
-    const blob = found ? await encodeMp4(out, found) : await recordRealtime(out);
+    const found = await findVideoConfig(durationMs() / 1000 + HOLD_LAST_FRAME);
+    const blob = found ? await encodeMp4(found) : await recordRealtime(videoCanvas(videoScales()[0]));
     download(blob, "timelapse." + (blob.type.includes("mp4") ? "mp4" : "webm"));
   } catch (e) {
     toast(t("err") + ": " + (e.message || e));
@@ -360,10 +429,13 @@ function gifPalette() {
   return { table, lut };
 }
 
+/** A GIF is many times bigger than a video of the same length: at most this many seconds. */
+const GIF_MAX_SECONDS = 60;
+
 $("#tl-gif").onclick = async () => {
   replay.stopped = true;
   const GIF_FPS = 10;
-  const frames = $("#tl-duration").value * GIF_FPS;
+  const frames = Math.min(GIF_MAX_SECONDS, $("#tl-duration").value) * GIF_FPS;
   const { width: W, height: H } = game.canvas;
   const { width: w, height: h } = outputCanvas(480);
   setBusy(true, "GIF 0%");
@@ -385,7 +457,7 @@ $("#tl-gif").onclick = async () => {
     seek(i / frames);
     for (let o = 0; o < indices.length; o++) indices[o] = lut[replay.values[cellOf[o]]];
     const bytes = [];
-    encodeGifFrame(bytes, indices, w, h, i === frames ? 250 : 100 / GIF_FPS);
+    encodeGifFrame(bytes, indices, w, h, i === frames ? HOLD_LAST_FRAME * 100 + 50 : 100 / GIF_FPS);
     chunks.push(new Uint8Array(bytes));
     if (i % 3 === 0) {
       showProgress("GIF", i / frames);
