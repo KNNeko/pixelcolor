@@ -123,10 +123,6 @@ export const game = {
   highlightPixel: [], // unpainted cell of the selected number
   backgroundPixel: 0,
   partTint: [],
-  // with the silhouette: cells of the picture's white background (see findBackdrop), in a shade of the canvas
-  backdrop: null, // Uint8Array per cell, 1 = background; null until needed
-  backdropOn: false,
-  backdropPixel: 0, // how those cells are drawn
 
   // cells grouped by target color: cells of color k are cellsByColor[colorStart[k] .. colorStart[k+1]-1]
   cellsByColor: null,
@@ -199,12 +195,6 @@ const mixPixel = (c, d, a) => {
  */
 const DARK_SILHOUETTE = 0.62;
 const DARK_HIGHLIGHT = 0.15;
-/**
- * The picture's own white background (see findBackdrop) is drawn as the canvas moved BACKDROP_SHIFT of the
- * way to white (dark canvas) or black (light canvas): plain canvas color, it merged with the screen and
- * the picture's edge was gone.
- */
-const BACKDROP_SHIFT = 0.1;
 /** Silhouette shade of a color with luma L, tinted with the chosen silhouette color (0 = no tint). */
 function tintedShade(L, highlighted) {
   const hex = settings.sit === "cus" ? settings.sic : SILHOUETTE_TINTS[settings.sit];
@@ -252,61 +242,7 @@ export function updateColors() {
     }
   }
   game.partTint = PART_TINTS.map(hexToPixel);
-  game.backdropOn = !!settings.sil;
-  game.backdropPixel = backdropShade(theme);
-  if (game.backdropOn && !game.backdrop) game.backdrop = findBackdrop();
   if (game.useGl) glView.setHighlightColors(game.highlightPixel);
-}
-
-/** The picture's white background on this canvas (see BACKDROP_SHIFT); a gradient's middle color. */
-function backdropShade(theme) {
-  const [a, b] = (theme.gradient || [theme.bg, theme.bg]).map((hex) => parseInt(hex.slice(1), 16));
-  const rgb = [16, 8, 0].map((s) => (((a >> s) & 255) + ((b >> s) & 255)) / 2);
-  const to = 0.3 * rgb[0] + 0.59 * rgb[1] + 0.11 * rgb[2] < 128 ? 255 : 0;
-  const [r, g, bl] = rgb.map((v) => Math.round(v + (to - v) * BACKDROP_SHIFT));
-  return 0xff000000 | (bl << 16) | (g << 8) | r;
-}
-
-/** Near-white colors (luma) a picture's background may be made of (see findBackdrop). */
-const BACKDROP_LUMA = 228;
-/**
- * The picture's white background: near-white cells joined to the picture's edge through near-white cells.
- * The silhouette draws them in a shade of the canvas (see BACKDROP_SHIFT): on a dark canvas they do not
- * glare, on any canvas the picture's edge shows; white inside the figure keeps its light shade. Returns a
- * Uint8Array, 1 = background.
- */
-function findBackdrop() {
-  const { width: W, height: H, target, palette: pal } = game.canvas;
-  const K = pal.length / 3;
-  const light = new Uint8Array(K);
-  for (let k = 0; k < K; k++)
-    light[k] = 0.3 * pal[k * 3] + 0.59 * pal[k * 3 + 1] + 0.11 * pal[k * 3 + 2] >= BACKDROP_LUMA ? 1 : 0;
-  const out = new Uint8Array(W * H);
-  const queue = new Int32Array(W * H);
-  let tail = 0;
-  const visit = (i) => {
-    if (!out[i] && light[target[i]]) {
-      out[i] = 1;
-      queue[tail++] = i;
-    }
-  };
-  for (let x = 0; x < W; x++) {
-    visit(x);
-    visit((H - 1) * W + x);
-  }
-  for (let y = 0; y < H; y++) {
-    visit(y * W);
-    visit(y * W + W - 1);
-  }
-  for (let head = 0; head < tail; head++) {
-    const c = queue[head];
-    const x = c % W;
-    if (x > 0) visit(c - 1);
-    if (x < W - 1) visit(c + 1);
-    if (c >= W) visit(c - W);
-    if (c < W * (H - 1)) visit(c + W);
-  }
-  return out;
 }
 
 /** What a cell looks like on screen right now. */
@@ -322,9 +258,7 @@ export function cellPixel(i) {
     ? game.colorPixel[painted - 1]
     : settings.hl && !game.useGl && target + 1 === game.selected
       ? game.highlightPixel[target]
-      : game.backdropOn && game.backdrop[i]
-        ? game.backdropPixel
-        : game.emptyPixel[target];
+      : game.emptyPixel[target];
   const part = game.canvas.partOf[i];
   if (game.splitting && part) c = mixPixel(c || game.backgroundPixel, game.partTint[part % game.partTint.length], 0.4);
   else if (game.part >= 0 && part !== game.part) c = settings.oth && c ? mixPixel(c, game.backgroundPixel, 0.62) : 0;
@@ -391,7 +325,6 @@ export async function openGame(canvas, events, isNew = false) {
   for (const e of events) for (let k = 0; k < e.cells.length; k++) game.paint[e.cells[k]] = e.values[k];
   game.hintCell = null;
   game.selected = game.brushColor = 0;
-  game.backdrop = null;
   dropHeldTap();
   sortVersion++;
   game.touchedColors.clear();
