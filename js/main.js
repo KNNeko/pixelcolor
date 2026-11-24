@@ -3,7 +3,7 @@ import { $, $$, toast, translatePage, syncFullscreen, initRangeSlider } from "./
 import { t } from "./i18n.js";
 import { applyAppTheme } from "./settings.js";
 import { requestPersistence } from "./storage.js";
-import { refreshLibrary, renderSortOptions } from "./library.js";
+import { refreshLibrary, renderSortOptions, openLastCanvas } from "./library.js";
 import { startWizard, translateWizard, redrawWizard } from "./wizard.js";
 import { game, saveGame, handleResize } from "./game.js";
 import "./settings-screen.js";
@@ -70,8 +70,13 @@ applyAppTheme();
 translatePage();
 translateWizard();
 renderSortOptions();
-refreshLibrary().catch((e) => toast(String(e)));
+const libraryShown = refreshLibrary().catch((e) => toast(String(e)));
 takeSharedImage();
+// the app icon's shortcut (manifest.webmanifest): straight into the canvas painted last
+if (new URLSearchParams(location.search).has("continue")) {
+  history.replaceState(null, "", location.pathname);
+  libraryShown.then(openLastCanvas);
+}
 matchMedia("(prefers-color-scheme:dark)").addEventListener?.("change", applyAppTheme);
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");

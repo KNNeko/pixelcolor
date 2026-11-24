@@ -308,6 +308,13 @@ $("#btn-new-folder").onclick = () =>
 
 /* ---------- canvas actions ---------- */
 
+/** The app icon's shortcut "Continue the last one": the canvas painted most recently, unfinished ones first. */
+export async function openLastCanvas() {
+  const canvases = (await listLibrary()).filter((e) => !e.folder).sort(SORTS.rec);
+  const last = canvases.find((e) => !e.done) || canvases[0];
+  if (last) await openStored(last.id);
+}
+
 async function openStored(id) {
   setBusy(true);
   try {
