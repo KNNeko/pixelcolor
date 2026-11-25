@@ -197,7 +197,7 @@ export async function startWizard(file, restore = null) {
     prevTool: null, // tool to return to after the eyedropper
     editVersion: 0, // bumps on every change to the photo pixels
     step: 1,
-    gray: true, // preview in gray (judge shapes, not colors)
+    gray: settings.pgr !== 0, // preview in gray (judge shapes, not colors); as last time
     adjust: { ...NO_ADJUST },
     style: settings.pm, // the mode and cleanliness used last time
     tool: "crop",
@@ -208,7 +208,7 @@ export async function startWizard(file, restore = null) {
     previewZoom: 1,
     previewX: 0,
     previewY: 0,
-    compare: 0.5, // before/after divider position (0..1 of the preview width)
+    compare: settings.pcmp ?? 0.5, // before/after divider position (0..1 of the preview width); as last time
     drawn: false, // a preview of this picture is on screen (until then its original is shown)
     replaceId: restore?.replaceId || null,
     folderId: restore ? restore.folderId : null,
@@ -219,8 +219,11 @@ export async function startWizard(file, restore = null) {
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
   setBlend(settings.pbl ?? DEFAULT_BLEND);
-  setSlider("colors", DEFAULT_COLORS);
-  $("#colors-exact").value = DEFAULT_COLORS;
+  // the number of colors: the user's own from last time, or "Auto colors" (see goToStep)
+  const colors = settings.pcol > 1 ? settings.pcol : DEFAULT_COLORS;
+  setSlider("colors", colors);
+  $("#colors-exact").value = colors;
+  if (settings.pcol > 1) wiz.colorsSet = true;
   $("#keep-ratio").checked = true; // (a canvas made again sets its own, see applyState)
   setSlider("tol", wiz.tol);
   setSlider("strength", wiz.strength);
@@ -337,10 +340,12 @@ function goToStep(n) {
   } else adjRegions.clear(); // free the preview's pixel copies
   if (n === 3) {
     if (!wiz.sized) {
-      // a new canvas starts at DEFAULT_PIXELS cells in the frame's proportions
+      // a new canvas starts with as many cells as the last one (the first: DEFAULT_PIXELS), in the frame's
+      // proportions
       const r = cropRatio();
-      $("#px-width").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS * r)));
-      $("#px-height").value = Math.max(1, Math.round(Math.sqrt(DEFAULT_PIXELS / r)));
+      const n = settings.pcells || DEFAULT_PIXELS;
+      $("#px-width").value = clampSize(Math.sqrt(n * r));
+      $("#px-height").value = clampSize(Math.sqrt(n / r));
       wiz.sized = true;
       wiz.sizedRatio = r;
     } else if (Math.abs(cropRatio() / wiz.sizedRatio - 1) > 1e-3) {
@@ -2875,6 +2880,7 @@ $("#style-list").onclick = (e) => {
   wiz.style = b.dataset.style;
   renderStyleList();
   schedulePreview();
+  rememberPixelSettings();
 };
 
 /** Settings for the engine, read from the panel. */
@@ -2940,6 +2946,24 @@ $("#panel-pixel").addEventListener("input", (e) => {
   schedulePreview();
 });
 $("#colors-exact").addEventListener("change", (e) => (e.target.value = $("#colors").value));
+$("#panel-pixel").addEventListener("input", () => rememberPixelSettings());
+
+/*
+ * The next picture starts this step with what was used last: the size (as a number of cells, in the new frame's
+ * proportions), the colors ("Auto colors" or the user's own number), mode, cleanliness, transition dithering,
+ * the gray view and the divider. Saved on every change, not only when a canvas is made.
+ */
+function rememberPixelSettings() {
+  const p = pixelParams();
+  settings.pm = p.style;
+  settings.pcl = p.clean;
+  if (p.style === "art") settings.pbl = p.blend;
+  settings.pcells = p.width * p.height;
+  settings.pcol = wiz.autoColors ? 0 : p.colors;
+  settings.pgr = wiz.gray ? 1 : 0;
+  settings.pcmp = wiz.compare ?? 0.5;
+  saveSettings();
+}
 
 let previewTimer = 0;
 const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend]);
@@ -3021,6 +3045,13 @@ async function runPreview() {
   showPreview();
 }
 
+/**
+ * Gray of a color in the gray view: the formula of CSS grayscale(), which grays the original half (Rec. 709
+ * weights). With other weights the two halves differed: red and pink came out up to ~15 levels lighter in the
+ * pixel half, green darker.
+ */
+const grayOf = (r, g, b) => Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+
 /** Puts a result's cells on the preview canvas (no palette strip). */
 function drawCells({ width: W, height: H, idx, pal }) {
   wiz.drawn = true;
@@ -3030,7 +3061,7 @@ function drawCells({ width: W, height: H, idx, pal }) {
     let r = pal[k * 3];
     let g = pal[k * 3 + 1];
     let b = pal[k * 3 + 2];
-    if (wiz.gray) r = g = b = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
+    if (wiz.gray) r = g = b = grayOf(r, g, b);
     colors[k] = 0xff000000 | (b << 16) | (g << 8) | r;
   }
   previewCanvas.width = W;
@@ -3054,8 +3085,8 @@ function showPreview() {
     let r = pal[k * 3];
     let g = pal[k * 3 + 1];
     let b = pal[k * 3 + 2];
-    if (wiz.gray) r = g = b = Math.round(0.3 * r + 0.59 * g + 0.11 * b);
-    strip += `<span style="background:rgb(${r},${g},${b});color:${0.3 * r + 0.59 * g + 0.11 * b > 140 ? "#000" : "#fff"}">${k + 1}<i>${counts[k]}</i></span>`;
+    if (wiz.gray) r = g = b = grayOf(r, g, b);
+    strip += `<span style="background:rgb(${r},${g},${b});color:${grayOf(r, g, b) > 140 ? "#000" : "#fff"}">${k + 1}<i>${counts[k]}</i></span>`;
   }
   drawCells(wiz.result.result);
   $("#palette-strip").innerHTML = strip;
@@ -3107,17 +3138,24 @@ knob.addEventListener("pointermove", (e) => {
   wiz.compare = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
   placeDivider();
 });
-const knobUp = () => (knob.dragging = false);
+const knobUp = () => {
+  if (knob.dragging) rememberPixelSettings();
+  knob.dragging = false;
+};
 knob.addEventListener("pointerup", knobUp);
 knob.addEventListener("pointercancel", knobUp);
 
 $("#preview-gray").onclick = () => {
   wiz.gray = !wiz.gray;
+  rememberPixelSettings();
   if (wiz.result) showPreview();
   else $("#preview-gray").textContent = t(wiz.gray ? "gray" : "color");
 };
 
-$("#btn-auto-colors").onclick = () => autoColors(false);
+$("#btn-auto-colors").onclick = () => {
+  autoColors(false); // (turns "Auto colors" on before it waits for anything)
+  rememberPixelSettings();
+};
 
 /**
  * "Auto colors": picks the number of colors, then shows the preview with it. quiet: the automatic run when a
@@ -3162,10 +3200,7 @@ async function createCanvasFromResult() {
       return setBusy(false);
     }
     const id = String(Date.now());
-    settings.pm = p.style;
-    settings.pcl = p.clean;
-    if (p.style === "art") settings.pbl = p.blend;
-    saveSettings();
+    rememberPixelSettings();
     const { blob, scale } = await encodeSourcePhoto();
     const state = sourceState(p, scale);
     const replaceId = wiz.replaceId;

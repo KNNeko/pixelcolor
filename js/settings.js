@@ -34,6 +34,10 @@ export const DEFAULTS = {
   pm: "art", // pixelization mode used last (art | photo | dither)
   pcl: 3, // pixelization "cleanliness" used last, 0..10
   pbl: 1, // transition dithering of the art mode used last, 0..3
+  pcells: 0, // pixelization: number of cells used last (0: the default size)
+  pcol: 0, // pixelization: number of colors the user set last (0: "Auto colors")
+  pgr: 1, // pixelization: preview in gray
+  pcmp: 0.5, // pixelization: before/after divider position
   tot: null, // lifetime painting statistics (stats.js); null until first counted
 };
 
