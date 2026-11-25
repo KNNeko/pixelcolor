@@ -189,11 +189,10 @@ const mixPixel = (c, d, a) => {
 /**
  * Silhouette on a dark canvas: a color of luma L gets the background's brightness (base) plus a share of the
  * way to white (DARK_SILHOUETTE at white), so dark parts sink into the background and light ones stand out.
- * Its highlight (empty cells of the selected number) goes nearly black, to DARK_HIGHLIGHT of its shade (it went
- * lighter before; a darker one was asked for). On a light canvas it is the other way round (white sinks).
+ * Its highlight (empty cells of the selected number) is plain black (it went lighter before; then nearly
+ * black; black was asked for). On a light canvas it is the other way round (white sinks).
  */
 const DARK_SILHOUETTE = 0.62;
-const DARK_HIGHLIGHT = 0.15;
 /** Silhouette shade of a color with luma L, tinted with the chosen silhouette color (0 = no tint). */
 function tintedShade(L, highlighted) {
   if (settings.sit !== "cus" || !/^#[0-9a-f]{6}$/i.test(settings.sic)) return 0;
@@ -204,7 +203,7 @@ function tintedShade(L, highlighted) {
   if (game.theme.dark) {
     const base = game.theme.base;
     const b = Math.min(1, (L / 255) * DARK_SILHOUETTE);
-    rgb = tint.map((v) => Math.min(255, base + (153 + v * 0.4 - base) * b) * (highlighted ? DARK_HIGHLIGHT : 1));
+    rgb = highlighted ? [0, 0, 0] : tint.map((v) => Math.min(255, base + (153 + v * 0.4 - base) * b));
   } else {
     const a = (255 - L) / 510;
     const e = highlighted ? 1 - 0.6 * (1 - a) : a;
@@ -234,7 +233,7 @@ export function updateColors() {
     if (settings.sil) {
       const shade = theme.dark ? theme.base + (L / 255) * DARK_SILHOUETTE * (255 - theme.base) : 255 - (255 - L) * 0.5;
       game.emptyPixel.push(tintedShade(L, false) || gray(shade));
-      game.highlightPixel.push(tintedShade(L, true) || gray(theme.dark ? shade * DARK_HIGHLIGHT : shade * 0.6));
+      game.highlightPixel.push(theme.dark ? gray(0) : tintedShade(L, true) || gray(shade * 0.6));
     } else {
       game.emptyPixel.push(hexToPixel(theme.cell));
       game.highlightPixel.push(hexToPixel(theme.highlight));

@@ -575,6 +575,21 @@ header b {
 #crop-canvas {
   touch-action: none;
 }
+/* the loupe over the painting finger (see drawLoupe) */
+#wiz-stage #edit-loupe {
+  left: auto;
+  top: auto;
+  width: 128px;
+  height: 128px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 3px 12px #0009;
+  background: #222;
+  pointer-events: none;
+}
+#wiz-stage #edit-loupe[hidden] {
+  display: none;
+}
 #preview-canvas {
   object-fit: contain;
 }

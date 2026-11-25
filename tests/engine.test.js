@@ -19,12 +19,10 @@ import {
   settle,
   cleanPalette,
   ditherRamps,
-  smoothGradients,
   srgbToLab,
   unifyLines,
   ditherTransitions,
   deltaE2000,
-  LOOKALIKE,
 } from "../js/engine.js";
 
 /** RGBA image filled by fn(x, y) -> [r, g, b]. */
@@ -427,22 +425,6 @@ test("pickCellColors: an anti-aliased border between two flat areas gets no in-b
     }
 });
 
-test("smoothGradients flattens noise inside a soft gradient but leaves a border alone", () => {
-  const W = 20;
-  const H = 6;
-  const noise = (x, y) => ((x * 7 + y * 13) % 5) - 2;
-  const src = image(W, H, (x, y) => (x < 10 ? [100 + x * 2 + noise(x, y), 120, 140] : [230, 60, 60]));
-  const out = smoothGradients(src.data, W, H, 36);
-  // inside the gradient: the noise is averaged away (neighbouring cells differ by about the slope only)
-  for (let x = 3; x < 6; x++) {
-    const d = out[(2 * W + x + 1) * 4] - out[(2 * W + x) * 4];
-    assert.ok(d >= 0 && d <= 4, `cells ${x}-${x + 1}: ${d}`);
-  }
-  // near the border nothing is mixed
-  assert.equal(out[(2 * W + 12) * 4], 230);
-  assert.ok(out[(2 * W + 9) * 4] < 130);
-});
-
 /** "Important" marks for a W x H source: 255 where fn(x, y) is true. */
 function marks(width, height, fn) {
   const data = new Uint8Array(width * height);
@@ -708,45 +690,81 @@ test("deltaE2000 gives the published CIEDE2000 values", () => {
   for (const [a, b, want] of pairs) assert.ok(Math.abs(deltaE2000(a, 0, b, 0) - want) < 1e-4, `${a} ${b}`);
 });
 
-test("merge look-alike colors: no two palette colors look alike, the picture stays close", async () => {
-  // a soft two-way gradient: plenty of shades a step apart
-  const src = image(120, 90, (x, y) => [150 + x * 0.6, 120 + y * 0.5, 160 - x * 0.3]);
-  const params = { width: 60, height: 45, colors: 120, style: "art", clean: 3 };
-  const plain = await generate(src, params, NO_ADJUST);
-  const merged = await generate(src, { ...params, merge: 1 }, NO_ADJUST);
-  const K = merged.pal.length / 3;
-  assert.ok(K < plain.pal.length / 3, `${K} colors after merging, ${plain.pal.length / 3} before`);
-  const lab = new Float32Array(K * 3);
-  for (let k = 0; k < K; k++) srgbToLab(merged.pal[k * 3], merged.pal[k * 3 + 1], merged.pal[k * 3 + 2], lab, k * 3);
-  for (let a = 0; a < K; a++)
-    for (let b = a + 1; b < K; b++) assert.ok(deltaE2000(lab, a * 3, lab, b * 3) >= LOOKALIKE * 0.999, `${a} ${b}`);
-  // each cell within a small step of where it was
-  let worst = 0;
-  const p = new Float32Array(3);
-  const q = new Float32Array(3);
-  for (let i = 0; i < merged.idx.length; i++) {
-    srgbToLab(...merged.pal.subarray(merged.idx[i] * 3, merged.idx[i] * 3 + 3), p, 0);
-    srgbToLab(...plain.pal.subarray(plain.idx[i] * 3, plain.idx[i] * 3 + 3), q, 0);
-    worst = Math.max(worst, Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]));
-  }
-  assert.ok(worst < 6, `a cell moved by ${worst}`);
-  assert.equal(normalizeParams({ width: 1, height: 1 }).merge, 0); // canvases made before: off
-});
-
 test("the clean-up smoothing keeps a small highlight on a plain area", () => {
   // a 1-cell and a 2 x 2 highlight on skin, a little brighter than noise
   const src = image(12, 12, (x, y) =>
     (x === 3 && y === 3) || (x >= 7 && x <= 8 && y >= 7 && y <= 8) ? [250, 214, 196] : [232, 196, 178],
   );
   for (const clean of [3, 6, 9]) {
-    const flat = smoothFlat(src.data, 12, 12, clean);
-    const grad = smoothGradients(src.data, 12, 12, 24 + 4 * clean, null, 14 + 2 * clean);
-    for (const out of [flat, grad])
-      for (const [x, y] of [
-        [3, 3],
-        [7, 7],
-        [8, 8],
-      ])
-        assert.ok(out[(y * 12 + x) * 4] > 245, `clean ${clean}, cell ${x},${y}: ${out[(y * 12 + x) * 4]}`);
+    const out = smoothFlat(src.data, 12, 12, clean);
+    for (const [x, y] of [
+      [3, 3],
+      [7, 7],
+      [8, 8],
+    ])
+      assert.ok(out[(y * 12 + x) * 4] > 245, `clean ${clean}, cell ${x},${y}: ${out[(y * 12 + x) * 4]}`);
   }
+});
+
+test("removeSpecks with mixing: a speck next to a region of its color stays, a stray one goes", () => {
+  // left third color 0, the rest color 1; at x = 5 a lone 0 two cells from the 0 region (the mixing at the
+  // border of two shades), at x = 10 a lone 0 far from it
+  const W = 12;
+  const H = 5;
+  const idx = new Uint16Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) idx[y * W + x] = x < 4 ? 0 : 1;
+  idx[2 * W + 5] = 0;
+  idx[2 * W + 10] = 0;
+  const pal = new Uint8Array([200, 150, 140, 204, 154, 144]);
+  const mixed = idx.slice();
+  removeSpecks(mixed, W, H, 2, pal, 6, null, 6, true);
+  assert.equal(mixed[2 * W + 5], 0);
+  assert.equal(mixed[2 * W + 10], 1);
+  const plain = idx.slice();
+  removeSpecks(plain, W, H, 2, pal, 6);
+  assert.equal(plain[2 * W + 5], 1);
+});
+
+test("art mode: a light clean-up keeps the shading of a noisy gradient, it only tidies stray cells", async () => {
+  // skin shading with grain. The clean-up used to smooth the cells before choosing the colors: at any level
+  // above 0 the ragged mixing at the borders of the shades was gone and the gradient fell into flat bands
+  const W = 90;
+  const H = 60;
+  const grain = (x, y) => (((x * 73 + y * 151) % 17) - 8) * 0.9;
+  const src = image(W, H, (x, y) => {
+    const t = (x + y * 0.4) / 1.3 + grain(x, y);
+    return [200 + t * 0.4, 150 + t * 0.6, 135 + t * 0.55];
+  });
+  const params = { width: W, height: H, colors: 12, style: "art", blend: 0 };
+  const lone = (r) => {
+    let n = 0;
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let same = 0;
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            const yy = y + dy;
+            if ((dx || dy) && xx >= 0 && yy >= 0 && xx < W && yy < H && r.idx[yy * W + xx] === r.idx[y * W + x]) same++;
+          }
+        if (!same) n++;
+      }
+    return n;
+  };
+  const lab = (r, i, out) => srgbToLab(r.pal[r.idx[i] * 3], r.pal[r.idx[i] * 3 + 1], r.pal[r.idx[i] * 3 + 2], out, 0);
+  const raw = await generate(src, { ...params, clean: 0 }, NO_ADJUST);
+  // the lowest level changes only a few cells (it used to change half of them)
+  const light = await generate(src, { ...params, clean: 1 }, NO_ADJUST);
+  const p = new Float32Array(3);
+  const q = new Float32Array(3);
+  let close = 0;
+  for (let i = 0; i < W * H; i++) {
+    lab(raw, i, p);
+    lab(light, i, q);
+    if (Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) < 1) close++;
+  }
+  assert.ok(close > 0.9 * W * H, `${close} of ${W * H} cells as before`);
+  // the default level: far fewer lone cells, but the mixing is still there (flat bands would have none at all)
+  const cleaned = await generate(src, { ...params, clean: 3 }, NO_ADJUST);
+  assert.ok(lone(cleaned) < lone(raw) / 3 && lone(cleaned) > 0, `${lone(raw)} -> ${lone(cleaned)}`);
 });

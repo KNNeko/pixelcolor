@@ -34,7 +34,6 @@ export const DEFAULTS = {
   pm: "art", // pixelization mode used last (art | photo | dither)
   pcl: 3, // pixelization "cleanliness" used last, 0..10
   pbl: 1, // transition dithering of the art mode used last, 0..3
-  pmg: 1, // "merge look-alike colors" used last
   tot: null, // lifetime painting statistics (stats.js); null until first counted
 };
 
@@ -121,7 +120,7 @@ export function canvasTheme() {
         cell: "#2a2a2a",
         number: "#c8c8c8",
         grid: "rgba(255,255,255,.12)",
-        highlight: "#0e0e0e",
+        highlight: "#000000",
       }
     : { bg, gradient, dark, base, cell: "#ffffff", number: "#2b2b3a", grid: "rgba(0,0,0,.22)", highlight: "#a4a8b6" };
 }

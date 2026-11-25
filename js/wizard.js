@@ -22,7 +22,6 @@ import {
   MODES,
   DEFAULT_CLEAN,
   DEFAULT_BLEND,
-  DEFAULT_MERGE,
   NO_ADJUST,
   normalizeParams,
   kmeansPalette,
@@ -131,8 +130,7 @@ $("#panel-pixel").innerHTML =
   `<div class="chips"><label class="field grow"><span data-i="cn"></span><input id="colors-exact" type="number" min="2" max="1000" value="32"></label></div>` +
   `<button class="chip" id="btn-auto-colors" data-i="autoc"></button>` +
   sliderHtml("clean", "clean", 0, 10, DEFAULT_CLEAN) +
-  `<div id="blend-field">${sliderHtml("blend", "blend", 0, 3, DEFAULT_BLEND)}</div>` +
-  `<div class="inline-row"><span data-i="merge"></span><label class="toggle"><input id="px-merge" type="checkbox" checked><i></i></label></div>`;
+  `<div id="blend-field">${sliderHtml("blend", "blend", 0, 3, DEFAULT_BLEND)}</div>`;
 
 $$("#panel-crop .range,#panel-adjust .range,#panel-pixel .range").forEach(initRangeSlider);
 
@@ -211,6 +209,7 @@ export async function startWizard(file, restore = null) {
     previewX: 0,
     previewY: 0,
     compare: 0.5, // before/after divider position (0..1 of the preview width)
+    drawn: false, // a preview of this picture is on screen (until then its original is shown)
     replaceId: restore?.replaceId || null,
     folderId: restore ? restore.folderId : null,
   };
@@ -220,7 +219,6 @@ export async function startWizard(file, restore = null) {
   ADJUSTMENTS.forEach(([key, , , v]) => setSlider("adj-" + key, v));
   setSlider("clean", settings.pcl);
   setBlend(settings.pbl ?? DEFAULT_BLEND);
-  $("#px-merge").checked = !!(settings.pmg ?? DEFAULT_MERGE);
   setSlider("colors", DEFAULT_COLORS);
   $("#colors-exact").value = DEFAULT_COLORS;
   $("#keep-ratio").checked = true; // (a canvas made again sets its own, see applyState)
@@ -284,7 +282,6 @@ function applyState(st) {
   wiz.autoColors = false;
   setSlider("clean", p.clean);
   setBlend(p.blend);
-  $("#px-merge").checked = !!p.merge;
   wiz.style = p.style;
   wiz.sized = true;
   wiz.sizedRatio = cropRatio();
@@ -370,12 +367,16 @@ function goToStep(n) {
       wiz.colorsSet = true;
       wiz.autoColors = true;
     }
-    if (wiz.autoColors && autoKey(pixelParams()) !== wiz.autoKey) {
-      // first time here, or the picture changed since the count (the crop, an edit, an adjustment): count it
-      // again, after a rough draft to look at on a big canvas
+    // until its first preview is ready, a picture shows its original (later, the last preview stays up while
+    // the next one is made: what changed shows the moment it comes)
+    if (!wiz.drawn) {
       const p = pixelParams();
-      if (p.width * p.height >= DRAFT_FROM) runDraft(() => autoColors(true));
-      else autoColors(true);
+      drawOriginal(p.width, p.height);
+      placeDivider();
+    }
+    if (wiz.autoColors && autoKey(pixelParams()) !== wiz.autoKey) {
+      // first time here, or the picture changed since the count (the crop, an edit, an adjustment): count again
+      autoColors(true);
     } else runPreview();
   }
 }
@@ -384,9 +385,16 @@ function goToStep(n) {
  * "Auto colors" follows the picture: while the number of colors is its count (wiz.autoColors: from a new
  * picture's first visit to this step, or the button, until the user moves the colors slider or types a
  * number), a change of size, style or cleanliness, or of the picture itself, counts it again. autoKey: what
- * the count depends on; wiz.autoKey: what it was counted for.
+ * the count depends on (in art mode not the cleanliness: it only cleans the finished cells); wiz.autoKey: what
+ * it was counted for.
  */
-const autoKey = (p) => JSON.stringify([exceptColors(p), wiz.rect, wiz.editVersion, wiz.adjust]);
+const autoKey = (p) =>
+  JSON.stringify([
+    exceptColors({ ...p, clean: p.style === "art" ? 0 : p.clean }),
+    wiz.rect,
+    wiz.editVersion,
+    wiz.adjust,
+  ]);
 
 $("#wiz-back").onclick = () => {
   if (wiz.step > 1) return goToStep(wiz.step - 1);
@@ -737,7 +745,10 @@ function cropGeometry() {
 }
 
 function drawCrop() {
-  if (wiz.step !== 1 || !photo) return;
+  if (wiz.step !== 1 || !photo) {
+    loupe.hidden = true;
+    return;
+  }
   const g = cropGeometry();
   const dpr = devicePixelRatio || 1;
   if (cropCanvas.width !== Math.round(g.w * dpr) || cropCanvas.height !== Math.round(g.h * dpr)) {
@@ -782,8 +793,11 @@ function drawCrop() {
     x.lineWidth = 1;
     x.strokeRect(X, Y, RW, RH);
     x.globalAlpha = 1;
+    drawBrushRing(x);
+    drawLoupe();
     return;
   }
+  loupe.hidden = true;
   // frame, rule-of-thirds lines, corner handles
   x.strokeStyle = "#fff";
   x.lineWidth = 1.5;
@@ -1943,6 +1957,70 @@ function shapeEdit(a, b) {
   };
 }
 
+/* ---------- brush ring and loupe ----------
+   While a finger paints with a brush tool, a thin black ring shows the brush around it, and a loupe above the
+   finger shows that spot magnified (the finger itself hides it). The eyedropper gets the loupe too. */
+const RING_TOOLS = new Set(["brush", "rest", "blur", "flat", "mark"]);
+const LOUPE_TOOLS = new Set([...RING_TOOLS, "pick"]);
+const LOUPE_SIZE = 128; // CSS px, as in style.css
+const LOUPE_ZOOM = 2.5;
+const LOUPE_GAP = 56; // CSS px between the finger and the loupe
+const loupe = $("#edit-loupe");
+let brushAt = null; // [x, y] screen point of the finger painting with a ring or loupe tool, or null
+
+function drawBrushRing(x) {
+  if (!brushAt || !RING_TOOLS.has(wiz.tool)) return;
+  const r = wiz.brushSize / 2;
+  x.lineWidth = 1;
+  // a faint light rim outside the black ring keeps it visible on dark parts of the picture
+  x.strokeStyle = "rgba(255,255,255,.55)";
+  x.beginPath();
+  x.arc(brushAt[0], brushAt[1], r + 1, 0, 7);
+  x.stroke();
+  x.strokeStyle = "#000";
+  x.beginPath();
+  x.arc(brushAt[0], brushAt[1], r, 0, 7);
+  x.stroke();
+}
+
+function drawLoupe() {
+  const on = !!brushAt && LOUPE_TOOLS.has(wiz.tool);
+  loupe.hidden = !on;
+  if (!on) return;
+  const dpr = devicePixelRatio || 1;
+  const n = Math.round(LOUPE_SIZE * dpr);
+  if (loupe.width !== n) loupe.width = loupe.height = n;
+  const c = loupe.getContext("2d");
+  const [x, y] = brushAt;
+  const span = LOUPE_SIZE / LOUPE_ZOOM; // CSS px of the picture it shows
+  c.fillStyle = "#222";
+  c.fillRect(0, 0, n, n);
+  c.drawImage(cropCanvas, (x - span / 2) * dpr, (y - span / 2) * dpr, span * dpr, span * dpr, 0, 0, n, n);
+  if (wiz.tool === "pick") {
+    // the eyedropper's spot: a small cross in the middle
+    const m = n / 2;
+    const a = 7 * dpr;
+    c.lineWidth = 3 * dpr;
+    c.strokeStyle = "#fff";
+    c.beginPath();
+    c.moveTo(m - a, m);
+    c.lineTo(m + a, m);
+    c.moveTo(m, m - a);
+    c.lineTo(m, m + a);
+    c.stroke();
+    c.lineWidth = 1 * dpr;
+    c.strokeStyle = "#000";
+    c.stroke();
+  }
+  // above the finger; below it where there is no room above
+  const W = cropCanvas.clientWidth;
+  const H = cropCanvas.clientHeight;
+  let top = y - LOUPE_GAP - LOUPE_SIZE;
+  if (top < 4) top = y + LOUPE_GAP;
+  loupe.style.left = Math.max(4, Math.min(W - LOUPE_SIZE - 4, x - LOUPE_SIZE / 2)) + "px";
+  loupe.style.top = Math.max(4, Math.min(H - LOUPE_SIZE - 4, top)) + "px";
+}
+
 const editPointers = new Map();
 let activeStroke = null; // edit being drawn with the finger
 let strokeSource = null; // picture the clone/blur stroke copies from (the photo as it was when it started)
@@ -2004,13 +2082,17 @@ cropCanvas.addEventListener(
         photoChanged();
         $("#wiz-undo").disabled = !history.length;
       }
-      pendingStroke = activeStroke = strokeSource = editDraft = tapStart = lassoDraft = stampPlace = null;
+      pendingStroke = activeStroke = strokeSource = editDraft = tapStart = lassoDraft = stampPlace = brushAt = null;
       editPinch = 0;
       return drawCrop();
     }
     tapStart = [e.offsetX, e.offsetY];
+    if (LOUPE_TOOLS.has(tool)) brushAt = [e.offsetX, e.offsetY];
     const p = pointerToPhoto(e);
-    if (tool === "pick") return pickColor(e);
+    if (tool === "pick") {
+      pickColor(e);
+      return drawCrop();
+    }
     if (tool === "shape") {
       editDraft = { start: p, end: null };
       return;
@@ -2043,6 +2125,7 @@ cropCanvas.addEventListener(
     else if (tool === "mark") op = { kind: "mark", erase: wiz.markErase, radius, points: photoToSource(...p) };
     if (!op) return;
     pendingStroke = { op, points: [p], t: e.timeStamp, at: [e.offsetX, e.offsetY] };
+    drawCrop(); // the ring and the loupe show at once
   },
   true,
 );
@@ -2081,6 +2164,7 @@ cropCanvas.addEventListener(
     const now = [e.offsetX, e.offsetY];
     editPointers.set(e.pointerId, now);
     if (tapStart && Math.hypot(now[0] - tapStart[0], now[1] - tapStart[1]) > 10) tapStart = null;
+    if (brushAt && editPointers.size === 1) brushAt = now;
     if (editPointers.size > 1) {
       const [a, b] = [...editPointers.values()];
       const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -2107,14 +2191,17 @@ cropCanvas.addEventListener(
       wiz.panX += now[0] - old[0];
       wiz.panY += now[1] - old[1];
       drawCrop();
-    } else if (tool === "pick") pickColor(e);
-    else if (tool === "shape" && editDraft) {
+    } else if (tool === "pick") {
+      pickColor(e);
+      drawCrop();
+    } else if (tool === "shape" && editDraft) {
       editDraft.end = pointerToPhoto(e);
       drawCrop();
     } else if (pendingStroke) {
       pendingStroke.points.push(pointerToPhoto(e));
       const moved = Math.hypot(now[0] - pendingStroke.at[0], now[1] - pendingStroke.at[1]);
       if (moved >= STROKE_SLOP && e.timeStamp - pendingStroke.t >= STROKE_DELAY) beginStroke(e.timeStamp);
+      else drawCrop(); // (the ring follows the finger)
     } else if (activeStroke) {
       const q = pointerToPhoto(e);
       strokeSegment(activeStroke, lastPoint, q);
@@ -2136,6 +2223,7 @@ const editPointerUp = (e) => {
   if (single) finishEdit(e);
   if (!editPointers.size) {
     pendingStroke = activeStroke = editDraft = tapStart = strokeSource = lassoDraft = stampPlace = stampPreview = null;
+    brushAt = null;
     editPinch = 0;
     drawCrop();
   }
@@ -2802,7 +2890,6 @@ function pixelParams() {
     style: wiz.style,
     clean: +$("#clean").value,
     blend: wiz.style === "art" ? +$("#blend").value : 0,
-    merge: $("#px-merge").checked ? 1 : 0,
   };
 }
 
@@ -2855,55 +2942,18 @@ $("#panel-pixel").addEventListener("input", (e) => {
 $("#colors-exact").addEventListener("change", (e) => (e.target.value = $("#colors").value));
 
 let previewTimer = 0;
-/*
- * Draft: when anything but the number of colors changes on a canvas of DRAFT_FROM cells or more, a rough
- * version at about DRAFT_CELLS cells comes first (a few times a second while a slider moves), then the real
- * one. Changing only the colors needs no draft: the worker keeps the prepared cells, that is quick.
- */
-const DRAFT_FROM = 80000;
-const DRAFT_CELLS = 20000;
-const DRAFT_COLORS = 48; // enough for a rough look, and a small palette is quick to find
-let draftTimer = 0;
-let draftAt = 0;
-let previewSeq = 0; // counts schedulePreview calls: a draft started before the last one leaves the rest to it
-let shownParams = null; // params of the last full preview
-const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend, p.merge]);
+const exceptColors = (p) => JSON.stringify([p.width, p.height, p.style, p.clean, p.blend]);
 
+/*
+ * A change makes a new preview after a short pause. There is no rough draft in between: the last preview
+ * stays on screen until the new one is ready, so what the change did shows at once.
+ */
 function schedulePreview() {
-  previewSeq++;
   clearTimeout(previewTimer);
-  clearTimeout(draftTimer);
   const p = pixelParams();
-  const onlyColors = shownParams && exceptColors(p) === exceptColors(shownParams);
   // the colors follow "Auto colors" (see autoKey): the real preview comes after counting them again
   const next = wiz.autoColors && autoKey(p) !== wiz.autoKey ? () => autoColors(true) : runPreview;
-  if (!onlyColors && p.width * p.height >= DRAFT_FROM) {
-    draftTimer = setTimeout(() => runDraft(next), Math.max(0, 250 - (performance.now() - draftAt)));
-    return;
-  }
   previewTimer = setTimeout(next, p.width * p.height > 1e6 ? 900 : 450);
-}
-
-async function runDraft(next = runPreview) {
-  if (wiz.step !== 3 || wiz.creating) return;
-  const seq = previewSeq;
-  draftAt = performance.now();
-  const p = pixelParams();
-  const f = Math.sqrt(DRAFT_CELLS / (p.width * p.height));
-  const W = Math.max(1, Math.round(p.width * f));
-  const H = Math.max(1, Math.round(p.height * f));
-  const d = { ...p, width: W, height: H, colors: Math.max(2, Math.min(p.colors, DRAFT_COLORS)) };
-  $("#preview-info").textContent = "…";
-  let result;
-  try {
-    result = await runJob("generate", d);
-  } catch {
-    result = null;
-  }
-  if (!result) return; // a newer draft or preview took over
-  drawCells(result);
-  // the real one right after it, unless something changed meanwhile (then what that planned comes instead)
-  if (seq === previewSeq) previewTimer = setTimeout(next, 30);
 }
 
 /* ---------- worker client ---------- */
@@ -2938,7 +2988,6 @@ function runJob(type, params, onProgress) {
       mask: source.mask,
     });
     sentSourceKey = source.key;
-    shownParams = null; // another picture: the first preview gets a draft again
   }
   const id = ++lastJob;
   for (const [oldId, job] of jobs) {
@@ -2969,12 +3018,12 @@ async function runPreview() {
   if (big) setBusy(false);
   if (!result) return; // replaced by a newer preview
   wiz.result = { key: resultKey(p), result };
-  shownParams = p;
   showPreview();
 }
 
-/** Puts a result's cells on the preview canvas (no palette strip: also used for drafts). */
+/** Puts a result's cells on the preview canvas (no palette strip). */
 function drawCells({ width: W, height: H, idx, pal }) {
+  wiz.drawn = true;
   const K = pal.length / 3;
   const colors = new Uint32Array(K);
   for (let k = 0; k < K; k++) {
@@ -3037,12 +3086,13 @@ function drawOriginal(W, H) {
 }
 
 function placeDivider() {
-  const x = Math.round((wiz.compare ?? 0.5) * previewWrap.clientWidth);
+  // before the picture's first preview: its original, whole; then the divider (none while a new one is made)
+  const whole = !wiz.drawn;
+  const x = whole ? previewWrap.clientWidth : Math.round((wiz.compare ?? 0.5) * previewWrap.clientWidth);
   $("#compare-clip").style.width = x + "px";
   $("#compare-line").style.left = x + "px";
-  const hide = !wiz.result;
-  $("#compare-clip").hidden = hide;
-  $("#compare-line").hidden = hide;
+  $("#compare-clip").hidden = !whole && !wiz.result;
+  $("#compare-line").hidden = whole || !wiz.result;
 }
 
 const knob = $("#compare-knob");
@@ -3101,7 +3151,6 @@ async function autoColors(quiet) {
 async function createCanvasFromResult() {
   // a preview scheduled by the last edit must not start (it would cancel this job)
   clearTimeout(previewTimer);
-  clearTimeout(draftTimer);
   wiz.creating = true;
   setBusy(true);
   await yieldToBrowser();
@@ -3116,7 +3165,6 @@ async function createCanvasFromResult() {
     settings.pm = p.style;
     settings.pcl = p.clean;
     if (p.style === "art") settings.pbl = p.blend;
-    settings.pmg = p.merge;
     saveSettings();
     const { blob, scale } = await encodeSourcePhoto();
     const state = sourceState(p, scale);
